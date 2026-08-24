@@ -53,6 +53,7 @@ from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi0_ttt.configuration_pi0_ttt import PI0TTTConfig
 from .pi05.configuration_pi05 import PI05Config
+from .pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
 from .pretrained import PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
@@ -132,6 +133,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .pi05.modeling_pi05 import PI05Policy
 
         return PI05Policy
+    elif name == "pi05_ttt":
+        from .pi05_ttt.modeling_pi05_ttt import PI05TTTPolicy
+
+        return PI05TTTPolicy
     elif name == "gaussian_actor":
         from .gaussian_actor.modeling_gaussian_actor import GaussianActorPolicy
 
@@ -198,6 +203,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI0TTTConfig(**kwargs)
     elif policy_type == "pi05":
         return PI05Config(**kwargs)
+    elif policy_type == "pi05_ttt":
+        return PI05TTTConfig(**kwargs)
     elif policy_type == "gaussian_actor":
         return GaussianActorConfig(**kwargs)
     elif policy_type == "smolvla":

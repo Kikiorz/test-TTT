@@ -20,6 +20,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 
 import dataclasses
 import logging
+import os
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -52,6 +53,11 @@ from lerobot.policies.pi0_ttt.sequence import (
     SEQUENCE_SHAPE_KEY,
     ContiguousSequenceDataset,
     sequence_collate_fn,
+)
+from lerobot.policies.pi05_ttt.configuration_pi05_ttt import PI05TTTConfig
+from lerobot.policies.pi05_ttt.sequence import (
+    TailPreservingSequenceDataset,
+    sequence_collate_fn as pi05_ttt_sequence_collate_fn,
 )
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
@@ -207,9 +213,13 @@ def update_policy_tbptt(
     lr_scheduler=None,
     lock=None,
 ) -> tuple[MetricsTracker, dict]:
-    """Update PI0-TTT over one sequence while truncating gradients between segments."""
-    if accelerator.num_processes != 1:
-        raise ValueError("pi0_ttt TBPTT currently supports exactly one accelerator process")
+    """Update a TTT policy over one sequence while truncating gradients between segments.
+
+    Each accelerator process owns an independent trajectory window and its local fast state. The
+    persistent PI0-TTT parameters are synchronized once, after all TBPTT segments have contributed
+    gradients and before clipping/stepping the optimizer. This preserves trajectory-local memory while
+    implementing data parallel training for the outer parameters.
+    """
 
     start_time = time.perf_counter()
     policy.train()
@@ -255,6 +265,31 @@ def update_policy_tbptt(
         }
         num_segments += 1
 
+    if accelerator.num_processes > 1:
+        trainable_parameters = [parameter for parameter in policy.parameters() if parameter.requires_grad]
+        gradient_presence = torch.tensor(
+            [parameter.grad is not None for parameter in trainable_parameters],
+            dtype=torch.int32,
+            device=accelerator.device,
+        )
+        gradient_presence = accelerator.reduce(gradient_presence, reduction="sum")
+        inconsistent = (gradient_presence != 0) & (gradient_presence != accelerator.num_processes)
+        if inconsistent.any().item():
+            inconsistent_indices = inconsistent.nonzero(as_tuple=False).flatten().cpu().tolist()
+            raise RuntimeError(
+                "TTT policy produced inconsistent gradients across data-parallel workers for "
+                f"trainable parameter indices {inconsistent_indices}"
+            )
+
+        for parameter, presence_count in zip(trainable_parameters, gradient_presence.tolist(), strict=True):
+            if presence_count == 0:
+                continue
+            reduced_gradient = accelerator.reduce(parameter.grad, reduction="mean")
+            parameter.grad.copy_(reduced_gradient)
+
+        total_loss = accelerator.reduce(total_loss, reduction="mean")
+        loss_per_dim = accelerator.reduce(loss_per_dim, reduction="mean")
+
     if grad_clip_norm > 0:
         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
     else:
@@ -264,6 +299,30 @@ def update_policy_tbptt(
 
     with lock if lock is not None else nullcontext():
         optimizer.step()
+
+    if accelerator.num_processes > 1 and os.environ.get("LEROBOT_VERIFY_DDP_SYNC") == "1":
+        max_parameter_difference = torch.zeros((), device=accelerator.device)
+        for parameter in policy.parameters():
+            if not parameter.requires_grad:
+                continue
+            rank_zero_parameter = parameter.detach().clone()
+            torch.distributed.broadcast(rank_zero_parameter, src=0)
+            max_parameter_difference = torch.maximum(
+                max_parameter_difference,
+                (parameter.detach() - rank_zero_parameter).abs().max(),
+            )
+        torch.distributed.all_reduce(
+            max_parameter_difference,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        if max_parameter_difference.item() != 0:
+            raise RuntimeError(
+                "TTT policy data-parallel replicas diverged after optimizer step: "
+                f"max parameter difference={max_parameter_difference.item()}"
+            )
+        if accelerator.is_main_process:
+            logging.info("Verified TTT data-parallel replicas are identical after optimizer step")
+
     optimizer.zero_grad()
 
     if lr_scheduler is not None:
@@ -327,15 +386,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     init_logging(accelerator=accelerator)
 
     is_pi0_ttt = isinstance(cfg.policy, PI0TTTConfig)
-    if is_pi0_ttt:
-        if accelerator.num_processes != 1:
-            raise ValueError("pi0_ttt TBPTT currently supports single-process training only")
+    is_pi05_ttt = isinstance(cfg.policy, PI05TTTConfig)
+    is_sequence_ttt = is_pi0_ttt or is_pi05_ttt
+    if is_sequence_ttt:
         if cfg.sample_weighting is not None:
-            raise ValueError("pi0_ttt TBPTT does not support sample weighting yet")
+            raise ValueError("TTT sequence training does not support sample weighting yet")
         if cfg.peft is not None:
-            raise ValueError("pi0_ttt TBPTT does not support PEFT yet")
+            raise ValueError("TTT sequence training does not support PEFT yet")
         if cfg.dataset.streaming:
-            raise ValueError("pi0_ttt TBPTT requires a map-style dataset; streaming is not supported")
+            raise ValueError("TTT sequence training requires a map-style dataset; streaming is not supported")
+    if is_pi05_ttt and cfg.batch_size != 1:
+        raise ValueError("pi05_ttt tail-preserving sequences require per-device batch_size=1")
 
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
@@ -522,7 +583,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if is_pi0_ttt:
+    if is_pi05_ttt:
+        dataloader_dataset = TailPreservingSequenceDataset(
+            dataset,
+            sequence_length=active_cfg.sequence_length,
+            sequence_stride=active_cfg.sequence_stride,
+        )
+        shuffle = True
+        sampler = None
+        collate_fn = pi05_ttt_sequence_collate_fn
+    elif is_pi0_ttt:
         dataloader_dataset = ContiguousSequenceDataset(
             dataset,
             sequence_length=active_cfg.sequence_length,
@@ -563,11 +633,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
     )
 
-    # Prepare everything with accelerator
+    # TTT policies call a custom sequence-segment method on the unwrapped policy so fast state can be
+    # carried across TBPTT segments. In multi-process mode, wrapping that policy in DDP would bypass
+    # DDP's forward bookkeeping. Prepare the optimizer/dataloader/scheduler only and synchronize the
+    # outer gradients explicitly in update_policy_tbptt instead.
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
+    if is_sequence_ttt and accelerator.num_processes > 1:
+        optimizer, dataloader, lr_scheduler = accelerator.prepare(optimizer, dataloader, lr_scheduler)
+    else:
+        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler
+        )
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -608,7 +684,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         start_time = time.perf_counter()
         batch = next(dl_iter)
         sequence_shape = None
-        if is_pi0_ttt:
+        if is_sequence_ttt:
             sequence_shape = tuple(int(value) for value in batch.pop(SEQUENCE_SHAPE_KEY))
         for cam_key in dataset.meta.camera_keys:
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
@@ -616,7 +692,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        if is_pi0_ttt:
+        if is_sequence_ttt:
             train_tracker, output_dict = update_policy_tbptt(
                 train_tracker,
                 policy,
