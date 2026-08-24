@@ -55,6 +55,46 @@ def test_stage_one_gate_is_fixed_at_effective_point_zero_five() -> None:
     torch.testing.assert_close(layer.effective_gate, torch.full((8,), 0.05), rtol=0, atol=1e-7)
 
 
+def test_gate_zero_is_an_exact_residual_bypass_even_when_memory_updates() -> None:
+    torch.manual_seed(0)
+    layer = TTTMLPLayer(dim=8, hidden_dim=16, effective_gate_init=0.05, second_order=False)
+    with torch.no_grad():
+        layer.gate.zero_()
+
+    inputs = torch.randn(1, 3, 2, 8)
+    outputs, state = layer(inputs, update=True, create_graph=False)
+
+    assert torch.equal(outputs, inputs)
+    assert state.position.tolist() == [2]
+
+
+def test_fast_state_carries_across_detached_tbptt_segments() -> None:
+    torch.manual_seed(1)
+    layer = TTTMLPLayer(dim=8, hidden_dim=16, effective_gate_init=0.05, second_order=False)
+    inputs = torch.randn(1, 6, 2, 8)
+
+    joint_outputs, joint_state = layer(inputs, update=True, create_graph=False)
+    first_outputs, first_state = layer(inputs[:, :3], update=True, create_graph=False)
+    second_outputs, split_state = layer(
+        inputs[:, 3:],
+        state=first_state.detach(),
+        update=True,
+        create_graph=False,
+    )
+
+    torch.testing.assert_close(
+        torch.cat([first_outputs, second_outputs], dim=1),
+        joint_outputs,
+        rtol=0,
+        atol=0,
+    )
+    for split_tensor, joint_tensor in zip(
+        split_state.tensors(), joint_state.tensors(), strict=True
+    ):
+        torch.testing.assert_close(split_tensor, joint_tensor, rtol=0, atol=0)
+    assert split_state.position.tolist() == joint_state.position.tolist() == [5]
+
+
 def test_stage_config_controls_gate_and_action_head_trainability() -> None:
     pretrain = PI05TTTConfig(ttt_training_stage="ttt_only")
     posttrain = PI05TTTConfig(ttt_training_stage="action_head")
