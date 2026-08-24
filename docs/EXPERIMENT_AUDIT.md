@@ -16,6 +16,10 @@ This is **not** a complete LIBERO-LONG score. A full suite score requires all
 
 ## Controlled result on this task
 
+The table below belongs to the archived implementations. In particular, its
+DiT-TTT rows used `policy/DiT_TTT/policy.py`, not the later paper reconstruction
+in `robottt_policy.py`. The new architecture has no closed-loop result yet.
+
 | Family and mode | Success on official init states 0-19 |
 |---|---:|
 | DP baseline | 20/20 |
@@ -37,7 +41,7 @@ No direct answer leakage was found in the runtime path:
   current and two preceding frames;
 - inference never reads demonstration actions, future frames or expert labels;
 - `env.check_success()` is used only to stop and score a rollout;
-- TTT online writes are observation-only and happen once per decision;
+- the archived TTT online writes are observation-only and happen once per decision;
 - DP and DiT state/action normalization uses training episodes only;
 - 35 demonstrations are divided by episode into 31 training and 4 validation
   episodes using seed 42.
@@ -68,4 +72,3 @@ single-task 20-rollout experiment.
 Before making a paper claim, evaluate all 10 tasks with matched seeds, select
 checkpoints without closed-loop test feedback, and add an explicit held-out
 initial-configuration or perturbation split.
-

@@ -38,21 +38,41 @@ Two ResNet-18 encoders and the 8-D robot state create nine context tokens from
 three observation steps. Eight noisy 7-D action tokens are trained using flow
 matching with Beta(1.5, 1.0) time sampling and sampled using four Euler steps.
 
-## DiT-TTT
+## Paper RoboTTT reconstruction for DiT
 
-DiT-TTT attaches one independent fast memory after every official DiT block.
-The newest observation token creates all 12 residuals once per environment
-decision. Every flow-integration step reuses those residuals. Consequently the
-number of writes is independent of the number of integration steps.
+`PaperRoboTTTPolicy` follows the architecture stated in RoboTTT rather than the
+earlier observation-summary residual approximation:
+
+```text
+for each DiT layer l:
+    X_l = Attention_l([16 register tokens, state token, noisy action tokens], VL tokens)
+    (O_ttt, W_l,t) = TTT_KVB_l(X_l, W_l,t-1)  # two-layer GeLU fast MLP
+    X_l = X_l + tanh(alpha_l) * O_ttt         # channel-wise alpha_l
+    X_l = X_l + FFN_l(norm(X_l))
+```
+
+TTT is inserted after attention and before the block FFN. Vision tokens stay on
+the cross-attention path; TTT receives their information indirectly through the
+register/state/action attention outputs. There is one independent fast state
+per DiT layer. RoPE uses theta 10000, the base inner rate is 0.1, and alpha is
+initialized to 0.001.
+
+The pre-existing `DiTTTPolicy` in `policy/DiT_TTT/policy.py` is retained only to
+reproduce the completed experiment. It precomputes one observation-derived
+residual per layer and is not an exact reconstruction of the paper architecture.
 
 ## Required invariants
 
-1. `gate0` output equals the corresponding baseline exactly.
-2. A decision performs exactly one observation-only write per memory.
-3. Action targets influence the outer policy loss only.
+1. `gate0` equals the matched register-token backbone exactly.
+2. There is one TTT layer and one fast state per DiT layer.
+3. Register, proprioception and noisy-action tokens pass through TTT; VL tokens do not enter it directly.
 4. Fast state persists throughout an episode and resets between episodes.
 5. TBPTT detaches gradients without resetting the numerical fast state.
+6. Denoising evaluations start from the same `W_(t-1)` and commit one `W_t` per environment decision.
 
-`policy/DiT_TTT/test_invariants.py` checks the first three structural
-properties for the DiT family.
+`policy/DiT_TTT/test_robottt_invariants.py` checks these structural properties.
 
+No clean future action is exposed at deployment. During training the current
+action appears through the standard flow-matching noisy sample
+`A_t^tau = tau A_t + (1-tau) epsilon`; this is sequence action forcing from the
+paper, not an extra expert-action input to the deployed policy.

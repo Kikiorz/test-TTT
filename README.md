@@ -7,8 +7,8 @@ controlled policy families:
 - a flow-matching action policy built around NVIDIA Isaac-GR00T's official
   `gr00t.model.modules.dit.DiT`;
 - DP-TTT, which adds one observation-written fast memory to DP conditioning;
-- DiT-TTT, which adds one observation-written fast memory after every DiT
-  block.
+- a paper-reconstructed RoboTTT-DiT path with one TTT-KVB layer after the
+  attention operation of every DiT block.
 
 This repository contains **algorithm code only**. It intentionally excludes
 datasets, preprocessing products, checkpoints, videos, simulator assets,
@@ -26,15 +26,21 @@ configs/
 └── libero_long.yaml
 docs/
 ├── ALGORITHM.md
-└── EXPERIMENT_AUDIT.md
+├── EXPERIMENT_AUDIT.md
+└── PAPER_MAPPING.md
 ```
 
 The modules keep the import layout used by the validated experiment. Add
 `policy/` to `PYTHONPATH` before importing `DP_TTT`, `DiT` or `DiT_TTT`.
 
+`policy/DiT_TTT/robottt_policy.py` is the current paper-based implementation.
+`policy/DiT_TTT/policy.py` is retained as the legacy implementation that
+produced the archived LIBERO result; those old results must not be attributed
+to the new architecture.
+
 ## Causal deployment contract
 
-At environment decision `t`:
+For DP-TTT and the legacy DiT-TTT path, at environment decision `t`:
 
 1. read `W_(t-1)` and construct the action-policy residual;
 2. sample the complete action chunk using that fixed residual;
@@ -46,9 +52,14 @@ outer diffusion/flow-matching objective; actions, rewards, success predicates
 and future observations never enter the online write. Denoising or flow
 integration reuses one residual and therefore cannot perform repeated writes.
 
+The paper RoboTTT path instead runs TTT on the current register, state and noisy
+action tokens after each layer's attention operation. All denoising evaluations
+start from the same `W_(t-1)`; only the final candidate `W_t` is committed, so
+recurrent time advances once per environment decision.
+
 ## Training schedule
 
-The validated schedule uses full-episode fast-state lifetime with TBPTT=64:
+The archived legacy schedule uses full-episode fast-state lifetime with TBPTT=64:
 
 1. 100 epochs: freeze the base policy, force `gate=0.5`, train TTT only;
 2. 20 epochs: release the gate and jointly tune TTT plus the action model at a
@@ -58,6 +69,12 @@ The validated schedule uses full-episode fast-state lifetime with TBPTT=64:
 Required closed-loop controls are `gate0`, `frozen` and `online`. `gate0` must
 be numerically identical to the family baseline before interpreting any TTT
 result.
+
+RoboTTT itself uses a different recipe: sequence-model-only pretraining followed
+by all-parameter post-training, independently sampled flow noise per action
+chunk, and TBPTT with numerical fast weights carried across segment boundaries.
+The paper reports 30K pretraining steps and 20K post-training steps; small-bench
+runs must state explicitly when those budgets are scaled down.
 
 ## External dependencies
 
@@ -70,5 +87,6 @@ result.
 The full GR00T model is not used: only its standard DiT action-head module is
 the architectural dependency. See [`docs/ALGORITHM.md`](docs/ALGORITHM.md) for
 the exact interfaces and [`docs/EXPERIMENT_AUDIT.md`](docs/EXPERIMENT_AUDIT.md)
-for the current evidence and its limitations.
-
+for the current evidence and its limitations. The direct paper-to-code mapping
+and all reconstruction choices are recorded in
+[`docs/PAPER_MAPPING.md`](docs/PAPER_MAPPING.md).
