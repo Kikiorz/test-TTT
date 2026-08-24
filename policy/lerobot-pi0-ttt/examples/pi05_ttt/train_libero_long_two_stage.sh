@@ -14,7 +14,8 @@ PHASE2_STEPS="${PHASE2_STEPS:-5000}"
 SAVE_FREQ="${SAVE_FREQ:-1000}"
 SEED="${SEED:-1000}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
-TBPTT_SEGMENT_LENGTH="${TBPTT_SEGMENT_LENGTH:-8}"
+PHASE1_TBPTT_SEGMENT_LENGTH="${PHASE1_TBPTT_SEGMENT_LENGTH:-8}"
+PHASE2_TBPTT_SEGMENT_LENGTH="${PHASE2_TBPTT_SEGMENT_LENGTH:-4}"
 
 if (( NUM_PROCESSES != 4 )); then
   echo "The formal PI0.5-TTT recipe requires NUM_PROCESSES=4" >&2
@@ -49,6 +50,7 @@ run_stage() {
   local scheduler_decay_lr="$4"
   local steps="$5"
   local output_dir="$6"
+  local tbptt_segment_length="$7"
 
   "${LAUNCH[@]}" lerobot.scripts.lerobot_train \
     --dataset.repo_id=lerobot/libero \
@@ -61,7 +63,7 @@ run_stage() {
     --policy.n_action_steps=10 \
     --policy.sequence_length=256 \
     --policy.sequence_stride=256 \
-    --policy.tbptt_segment_length="${TBPTT_SEGMENT_LENGTH}" \
+    --policy.tbptt_segment_length="${tbptt_segment_length}" \
     --policy.ttt_hidden_dim=4096 \
     --policy.ttt_layer_indices='[14,15,16,17]' \
     --policy.ttt_base_inner_lr=0.1 \
@@ -87,7 +89,8 @@ run_stage() {
     --output_dir="${output_dir}"
 }
 
-run_stage "${MODEL_ROOT}" ttt_only 2e-5 2e-6 "${PHASE1_STEPS}" "${PHASE1_OUTPUT}"
+run_stage "${MODEL_ROOT}" ttt_only 2e-5 2e-6 "${PHASE1_STEPS}" "${PHASE1_OUTPUT}" \
+  "${PHASE1_TBPTT_SEGMENT_LENGTH}"
 
 PHASE1_CHECKPOINT="${PHASE1_OUTPUT}/checkpoints/$(printf '%06d' "${PHASE1_STEPS}")/pretrained_model"
 if [[ ! -f "${PHASE1_CHECKPOINT}/model.safetensors" ]]; then
@@ -95,4 +98,5 @@ if [[ ! -f "${PHASE1_CHECKPOINT}/model.safetensors" ]]; then
   exit 3
 fi
 
-run_stage "${PHASE1_CHECKPOINT}" action_head 5e-5 5e-6 "${PHASE2_STEPS}" "${PHASE2_OUTPUT}"
+run_stage "${PHASE1_CHECKPOINT}" action_head 5e-5 5e-6 "${PHASE2_STEPS}" "${PHASE2_OUTPUT}" \
+  "${PHASE2_TBPTT_SEGMENT_LENGTH}"

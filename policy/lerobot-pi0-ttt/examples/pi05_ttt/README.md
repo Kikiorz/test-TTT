@@ -19,7 +19,9 @@ non-divisible tail is a shorter sequence, so no episode frame is discarded.
 
 Both stages instantiate the large PI0.5 transformer weights in bfloat16. TTT fast weights and the
 action/time projections remain float32. This is required for the second-stage action-head optimizer to
-fit on 32 GiB cards; it does not change the 256-frame context or the four-process data-parallel recipe.
+fit on 32 GiB cards. Stage 1 backpropagates through 8-frame segments; the larger stage-2 action-head
+graph uses 4-frame segments. In both cases the fast state is detached only at segment boundaries and
+continues through the full sequence, so this does not change the 256-frame context or four-GPU recipe.
 
 Stage 1 runs 5,000 optimizer steps with the PI0.5 backbone frozen. The effective gate is fixed at exactly
 `0.05` (`raw gate = atanh(0.05)`), while the remaining TTT parameters train. Stage 2 loads that checkpoint,

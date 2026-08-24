@@ -35,7 +35,7 @@ class PI05TTTConfig(PI05Config):
 
     sequence_length: int = 256
     sequence_stride: int = 256
-    tbptt_segment_length: int = 8
+    tbptt_segment_length: int = 4
 
     ttt_hidden_dim: int = 4096
     ttt_base_inner_lr: float = 0.1
