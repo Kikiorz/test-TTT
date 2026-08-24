@@ -17,6 +17,10 @@ The formal recipe uses all 379 LIBERO-Long trajectories, four data-parallel GPUs
 and maximum context 256. Windows advance by 256 frames. A short episode is kept whole, and the final
 non-divisible tail is a shorter sequence, so no episode frame is discarded.
 
+Both stages instantiate the large PI0.5 transformer weights in bfloat16. TTT fast weights and the
+action/time projections remain float32. This is required for the second-stage action-head optimizer to
+fit on 32 GiB cards; it does not change the 256-frame context or the four-process data-parallel recipe.
+
 Stage 1 runs 5,000 optimizer steps with the PI0.5 backbone frozen. The effective gate is fixed at exactly
 `0.05` (`raw gate = atanh(0.05)`), while the remaining TTT parameters train. Stage 2 loads that checkpoint,
 unfreezes the gate and PI0.5 action head (Gemma action expert plus action/time projections), and trains

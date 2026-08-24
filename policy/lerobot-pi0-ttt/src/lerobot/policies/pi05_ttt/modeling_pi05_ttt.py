@@ -489,7 +489,6 @@ class PI05TTTPytorch(PI05Pytorch):
 _CHECKPOINT_BASE_FIELDS = {
     "paligemma_variant",
     "action_expert_variant",
-    "dtype",
     "n_obs_steps",
     "chunk_size",
     "max_state_dim",

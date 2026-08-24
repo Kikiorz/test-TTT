@@ -57,6 +57,7 @@ run_stage() {
     --dataset.video_backend=pyav \
     --policy.type=pi05_ttt \
     --policy.pretrained_path="${pretrained_path}" \
+    --policy.dtype=bfloat16 \
     --policy.n_action_steps=10 \
     --policy.sequence_length=256 \
     --policy.sequence_stride=256 \
