@@ -60,12 +60,13 @@ def main() -> None:
     else:
         raise AssertionError("strict paper mode accepted a non-16-layer DiT")
 
-    strict_model = RoboTTTPolicy(
-        ToyBase(num_layers=16), num_register_tokens=16, fast_hidden_dim=32
-    )
-    if len(strict_model.ttt_layers) != 16:
-        raise AssertionError("strict paper mode did not create 16 TTT layers")
-    del strict_model
+    try:
+        RoboTTTPolicy(ToyBase(num_layers=16), num_register_tokens=16, fast_hidden_dim=32)
+    except ValueError as error:
+        if "538M-parameter" not in str(error):
+            raise
+    else:
+        raise AssertionError("strict paper mode accepted a toy-scale 16-layer DiT")
 
     model = RoboTTTPolicy(
         base,
@@ -179,6 +180,20 @@ def main() -> None:
     if torch.equal(q_before, model.ttt_layers[0].q_proj.weight.detach()):
         raise AssertionError("outer optimizer step did not update a TTT projection")
 
+    # A masked timestep is pure causal context: it advances fast weights while
+    # providing exactly zero outer action loss, as used for video context and
+    # DAgger failure trajectories in paper Sec. 3.3.
+    context_only_loss, context_only_state, _ = model.flow_matching_loss_from_context(
+        context, actions, torch.zeros_like(mask), None, create_graph=True
+    )
+    if float(context_only_loss.detach()) != 0.0:
+        raise AssertionError("masked context timestep contributed outer action loss")
+    if any(
+        torch.equal(before, after)
+        for before, after in zip(model.ttt_layers[0].initial_state(batch, context.device)[:4], context_only_state[0][:4])
+    ):
+        raise AssertionError("masked context timestep did not update every fast tensor")
+
     torch.manual_seed(19)
     taus = sample_sequence_action_forcing_taus(
         100_000, device=torch.device("cpu"), dtype=torch.float32
@@ -204,6 +219,7 @@ def main() -> None:
             "inner_loss": metrics["inner_loss"],
             "second_order_gradients_finite": True,
             "outer_optimizer_step_updates_ttt": True,
+            "masked_context_updates_fast_weights_without_outer_loss": True,
         }
     )
 

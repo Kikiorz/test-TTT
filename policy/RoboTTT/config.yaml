@@ -5,7 +5,10 @@ architecture:
   external_action_head_module: gr00t.model.modules.dit.DiT
   benchmark_visual_adapter: internal_resnet18
   dit_layers: 16
+  reported_dit_parameters: 538000000
   ttt_layers: 16
+  reported_ttt_parameters_per_layer_approx: 9500000
+  reported_total_parameters: 690000000
   placement: after_attention_before_ffn
   register_tokens: 16
   token_stream: [register, proprioception, noisy_action]
@@ -26,12 +29,17 @@ flow_matching:
 training:
   tbptt: 64  # local compute choice; paper does not disclose segment length
   pretrain:
+    gpus: 16
+    per_device_batch_at_or_below_4k: 4
+    per_device_batch_above_4k: 1
     optimizer_steps: 30000
     trainable: [register_tokens, ttt_layers]
     context_schedule: [128, 256, 512, 1024, 2048, 4096, 8192]
     scheduler: WSD
     peak_lr: 2.0e-5
   posttrain:
+    gpus: 8
+    per_device_batch: 1
     optimizer_steps: 20000
     trainable: all_parameters
     context_length: 1000
@@ -50,4 +58,6 @@ under_specified_reconstruction_choices:
   - optimizer_betas
   - rope_position_layout
   - multi_denoise_fast_state_commit_rule
-
+  - pretrain_context_intermediate_schedule
+  - wsd_warmup_stable_decay_fractions
+  - qkv_bias_and_inner_lr_parameterization

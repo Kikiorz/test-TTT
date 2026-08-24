@@ -25,7 +25,7 @@ def episode_decisions(
     stride: int,
     obs_steps: int,
     horizon: int,
-) -> list[tuple[list[int], list[int], list[bool]]]:
+) -> list[tuple[int, list[int], list[int], list[bool]]]:
     decisions = []
     for current in range(start, end, stride):
         observation_indices = [
@@ -34,7 +34,7 @@ def episode_decisions(
         ]
         action_indices = [min(end - 1, current + offset) for offset in range(horizon)]
         action_mask = [current + offset < end for offset in range(horizon)]
-        decisions.append((observation_indices, action_indices, action_mask))
+        decisions.append((current, observation_indices, action_indices, action_mask))
     return decisions
 
 

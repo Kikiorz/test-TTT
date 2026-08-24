@@ -38,16 +38,28 @@ third-party dependency, not a sibling-policy dependency.
 - Sequence-only pretraining, then full-model post-training.
 
 `strict_paper_action_head=True` is the default and rejects action heads that do
-not have 16 layers or policies that do not use 16 registers. The included
-LIBERO adapter still uses the repository's ResNet feature encoder rather than
-the unpublished GR00T N1.7 Eagle stack, so it must be described as a benchmark
-adapter, not an exact reproduction of NVIDIA's full model.
+not have 16 layers, 16 registers, the reported roughly 538M-parameter DiT
+scale, and roughly 10M parameters per TTT layer. The included LIBERO adapter
+uses ResNet features rather than the unpublished GR00T N1.7 Eagle stack, so a
+small benchmark must pass `--allow-architecture-approximation` and be described
+as a scale/encoder adapter, not an exact reproduction of NVIDIA's full model.
+
+For the reported hardware and batch schedule, run pretraining and post-training
+as separate jobs: 16 GPUs for pretraining (per-device batch 4 through 4K,
+then 1 above 4K), followed by 8 GPUs for post-training (per-device batch 1)
+using `--stage posttrain --resume-robottt <pretrain-checkpoint>`. A single
+`--stage both` job is a convenience mode and cannot reproduce that GPU split.
+
+Setting a cache-level `outer_loss_mask[t]=false` turns timestep `t` into pure
+context: it still updates fast weights but contributes no action imitation
+loss. This is the paper's mechanism for in-context video and DAgger Distillation.
 
 ## Publicly under-specified choices
 
 The paper does not disclose the fast-MLP hidden width, optimizer beta values,
-or how a single recurrent state is committed across multiple flow-denoising
-evaluations at one robot timestep. We therefore use `d -> d -> d`, AdamW
-betas `(0.9, 0.95)`, and start every denoising evaluation from the same
-`W_(t-1)` while committing only the last candidate `W_t`. These choices are
-explicitly tagged in checkpoints and are not presented as official source.
+QKV bias convention, learned-rate parameterization, WSD phase fractions, the
+intermediate context schedule, or how one recurrent state is committed across
+multiple flow-denoising evaluations at one robot timestep. We use `d -> d -> d`,
+AdamW betas `(0.9, 0.95)`, bias-free QKV, an exponential positive rate
+multiplier, a documented WSD split, and commit only the final denoising
+candidate. These are reconstruction choices, not official source details.

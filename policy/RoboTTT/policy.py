@@ -11,6 +11,8 @@ from RoboTTT.layer import FastState, RoboTTTKVBLayer
 
 
 LayerFastStates = Tuple[FastState, ...]
+PAPER_DIT_PARAMETER_COUNT = 538_000_000
+PAPER_TTT_PARAMETER_COUNT_PER_LAYER = 9_500_000
 
 
 def sample_sequence_action_forcing_taus(
@@ -87,6 +89,22 @@ class RoboTTTPolicy(nn.Module):
             )
             for _ in range(base_policy.config.num_layers)
         )
+        if self.strict_paper_action_head:
+            dit_parameters = sum(parameter.numel() for parameter in base_policy.dit.parameters())
+            ttt_parameters = sum(parameter.numel() for parameter in self.ttt_layers[0].parameters())
+            if not 0.9 * PAPER_DIT_PARAMETER_COUNT <= dit_parameters <= 1.1 * PAPER_DIT_PARAMETER_COUNT:
+                raise ValueError(
+                    "RoboTTT's paper backbone has a 538M-parameter DiT action head; "
+                    f"received {dit_parameters:,} parameters. Set "
+                    "strict_paper_action_head=False only for a clearly labelled "
+                    "scale ablation."
+                )
+            if not 0.7 * PAPER_TTT_PARAMETER_COUNT_PER_LAYER <= ttt_parameters <= 1.3 * PAPER_TTT_PARAMETER_COUNT_PER_LAYER:
+                raise ValueError(
+                    "RoboTTT reports roughly 10M parameters per TTT layer; "
+                    f"received {ttt_parameters:,}. Supply the matching hidden width "
+                    "or label the model as a scale ablation."
+                )
         self._deployment_state: Optional[LayerFastStates] = None
         self._deployment_mode = "online"
 
@@ -113,6 +131,20 @@ class RoboTTTPolicy(nn.Module):
 
     def inner_lr_values(self) -> torch.Tensor:
         return torch.stack([layer.positive_inner_lr() for layer in self.ttt_layers])
+
+    def parameter_report(self) -> dict[str, int]:
+        return {
+            "base_policy": sum(parameter.numel() for parameter in self.base_policy.parameters()),
+            "dit_action_head": sum(
+                parameter.numel() for parameter in self.base_policy.dit.parameters()
+            ),
+            "ttt_total": sum(parameter.numel() for parameter in self.ttt_layers.parameters()),
+            "ttt_per_layer": sum(
+                parameter.numel() for parameter in self.ttt_layers[0].parameters()
+            ),
+            "register_tokens": self.register_tokens.numel(),
+            "full_model": sum(parameter.numel() for parameter in self.parameters()),
+        }
 
     def configure_stage(self, stage: str, *, encoded_vl_adapter: bool = False) -> None:
         for parameter in self.parameters():

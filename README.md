@@ -77,8 +77,9 @@ RoboTTT itself uses a different recipe: sequence-model-only pretraining followed
 by all-parameter post-training, independently sampled flow noise per action
 chunk, and TBPTT with numerical fast weights carried across segment boundaries.
 The new trainer defaults to the paper's 30K pretraining and 20K post-training
-optimizer steps. Strict action-head mode requires 16 DiT layers and 16 register
-tokens; any smaller bench requires an explicit approximation flag and label.
+optimizer steps and its disclosed per-device batch schedule. Strict action-head
+mode also checks 16 DiT layers, 16 registers, and the reported parameter scale;
+any smaller bench requires an explicit approximation flag and label.
 
 ## External dependencies
 

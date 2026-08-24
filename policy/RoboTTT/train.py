@@ -29,6 +29,14 @@ PAPER_POSTTRAIN_CONTEXT = 1_000
 PAPER_PRETRAIN_CONTEXT_SCHEDULE = (128, 256, 512, 1_024, 2_048, 4_096, 8_192)
 
 
+def paper_per_device_batch(stage: str, context_length: int) -> int:
+    if stage == "paper_sequence_pretrain":
+        return 4 if context_length <= 4_096 else 1
+    if stage == "paper_posttrain":
+        return 1
+    raise ValueError(stage)
+
+
 def context_length_for_step(step: int, total_steps: int, schedule: tuple[int, ...]) -> int:
     index = min(len(schedule) - 1, step * len(schedule) // max(1, total_steps))
     return schedule[index]
@@ -107,8 +115,9 @@ class SegmentStream:
         )
 
 
-def save(path, model, optimizer, scheduler, stage, stage_step, global_step, args):
+def save(path, model, optimizer, scheduler, stage, stage_step, global_step, args, world_size):
     temporary = path.with_suffix(path.suffix + ".partial")
+    reported_world_size = 16 if stage == "paper_sequence_pretrain" else 8
     torch.save(
         {
             "model": model.state_dict(),
@@ -118,16 +127,29 @@ def save(path, model, optimizer, scheduler, stage, stage_step, global_step, args
             "stage_step": stage_step,
             "global_step": global_step,
             "architecture": "robottt_public_paper_reconstruction_v2",
-            "paper_exact_components": {
+            "paper_disclosed_components_implemented": {
                 "sequence_action_forcing": True,
                 "tbptt_fast_state_carry": True,
                 "per_layer_ttt": True,
                 "register_tokens": 16,
+                "per_device_batch_schedule": True,
+                "masked_context_without_outer_loss": True,
             },
+            "parameter_report": model.parameter_report(),
+            "architecture_approximation": bool(args.allow_architecture_approximation),
+            "actual_world_size": world_size,
+            "paper_reported_world_size": reported_world_size,
+            "paper_reported_world_size_matched": world_size == reported_world_size,
             "unpublished_components_not_reproduced": [
                 "gr00t_n1_7_eagle_weights",
                 "nvidia_pretraining_data_mixture",
                 "multi_denoise_fast_state_commit_rule",
+                "fast_mlp_hidden_width",
+                "optimizer_betas",
+                "qkv_bias_convention",
+                "inner_lr_parameterization",
+                "wsd_phase_fractions",
+                "intermediate_context_schedule",
             ],
             "args": vars(args),
         },
@@ -140,7 +162,7 @@ def train_stage(
     model,
     optimizer,
     scheduler,
-    stream,
+    streams,
     frame_tokens,
     actions,
     device,
@@ -153,6 +175,7 @@ def train_stage(
     args,
     rank,
     world_size,
+    outer_loss_mask,
 ):
     for stage_step in range(1, total_steps + 1):
         context_length = (
@@ -162,30 +185,45 @@ def train_stage(
             if stage == "paper_sequence_pretrain"
             else PAPER_POSTTRAIN_CONTEXT
         )
-        segment, fast_state = stream.next(context_length)
+        per_device_batch = paper_per_device_batch(stage, context_length)
+        active_streams = streams[:per_device_batch]
         started = time.time()
         optimizer.zero_grad(set_to_none=True)
-        losses, inner_losses = [], []
-        for observation_indices, action_indices, action_mask in segment:
-            raw_tokens = frame_tokens[observation_indices].to(
-                device=device, dtype=torch.float32
-            ).unsqueeze(0)
-            context = model.base_policy.assemble_context(raw_tokens)
-            targets = actions[action_indices].to(device=device, dtype=torch.float32).unsqueeze(0)
-            mask = torch.tensor(action_mask, device=device, dtype=torch.bool).unsqueeze(0)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss, fast_state, metrics = model.flow_matching_loss_from_context(
-                    context, targets, mask, fast_state, create_graph=True
-                )
-            losses.append(loss)
-            inner_losses.append(metrics["inner_loss"])
-        segment_loss = torch.stack(losses).mean()
+        batch_losses, inner_losses, segment_lengths = [], [], []
+        next_states = []
+        for stream in active_streams:
+            segment, fast_state = stream.next(context_length)
+            losses = []
+            for current, observation_indices, action_indices, action_mask in segment:
+                raw_tokens = frame_tokens[observation_indices].to(
+                    device=device, dtype=torch.float32
+                ).unsqueeze(0)
+                context = model.base_policy.assemble_context(raw_tokens)
+                targets = actions[action_indices].to(
+                    device=device, dtype=torch.float32
+                ).unsqueeze(0)
+                mask = torch.tensor(action_mask, device=device, dtype=torch.bool).unsqueeze(0)
+                if outer_loss_mask is not None and not bool(outer_loss_mask[current]):
+                    # Paper Sec. 3.3: this timestep remains causal context and
+                    # updates fast weights, but supplies no imitation target.
+                    mask.zero_()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss, fast_state, metrics = model.flow_matching_loss_from_context(
+                        context, targets, mask, fast_state, create_graph=True
+                    )
+                losses.append(loss)
+                inner_losses.append(metrics["inner_loss"])
+            batch_losses.append(torch.stack(losses).mean())
+            segment_lengths.append(len(segment))
+            next_states.append(fast_state)
+        segment_loss = torch.stack(batch_losses).mean()
         segment_loss.backward()
         sync_gradients(model, world_size)
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable(model.parameters()), 1.0)
         optimizer.step()
         scheduler.step()
-        stream.commit(fast_state)
+        for stream, fast_state in zip(active_streams, next_states):
+            stream.commit(fast_state)
         global_step += 1
 
         values = torch.tensor(
@@ -203,7 +241,9 @@ def train_stage(
                 "stage_step": stage_step,
                 "global_step": global_step,
                 "context_length": context_length,
-                "tbptt_segment_length": len(segment),
+                "tbptt_segment_length_mean": float(np.mean(segment_lengths)),
+                "per_device_batch": per_device_batch,
+                "global_batch": per_device_batch * world_size,
                 "flow_loss": float(values[0]),
                 "inner_loss": float(values[1]),
                 "gate_mean": float(gates.mean()),
@@ -227,6 +267,7 @@ def train_stage(
                     stage_step,
                     global_step,
                     args,
+                    world_size,
                 )
     return global_step
 
@@ -245,6 +286,17 @@ def main():
     parser.add_argument("--register-tokens", type=int, default=16)
     parser.add_argument("--fast-hidden-dim", type=int, default=None)
     parser.add_argument("--allow-architecture-approximation", action="store_true")
+    parser.add_argument(
+        "--stage",
+        choices=("both", "pretrain", "posttrain"),
+        default="both",
+        help="Use separate pretrain/posttrain jobs to reproduce the paper's 16/8-GPU split.",
+    )
+    parser.add_argument(
+        "--resume-robottt",
+        default=None,
+        help="RoboTTT pretraining checkpoint required by a standalone posttrain job.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -282,32 +334,45 @@ def main():
         fast_hidden_dim=args.fast_hidden_dim,
         strict_paper_action_head=not args.allow_architecture_approximation,
     ).to(device)
+    global_step = 0
+    if args.resume_robottt is not None:
+        resume = torch.load(args.resume_robottt, map_location="cpu", weights_only=False)
+        model.load_state_dict(resume["model"], strict=True)
+        global_step = int(resume.get("global_step", 0))
+    if args.stage == "posttrain" and args.resume_robottt is None:
+        raise ValueError("standalone posttrain requires --resume-robottt")
     if world_size > 1:
         for parameter in model.parameters():
             dist.broadcast(parameter.data, src=0)
         for buffer in model.buffers():
             dist.broadcast(buffer.data, src=0)
 
-    global_step = 0
-    stages = (
-        ("paper_sequence_pretrain", args.pretrain_steps),
-        ("paper_posttrain", args.posttrain_steps),
-    )
+    stages = {
+        "both": (
+            ("paper_sequence_pretrain", args.pretrain_steps),
+            ("paper_posttrain", args.posttrain_steps),
+        ),
+        "pretrain": (("paper_sequence_pretrain", args.pretrain_steps),),
+        "posttrain": (("paper_posttrain", args.posttrain_steps),),
+    }[args.stage]
     for stage_index, (stage, total_steps) in enumerate(stages):
         optimizer, scheduler = configure_stage(model, stage, total_steps)
-        stream = SegmentStream(
-            sequences,
-            episode_ids,
-            args.tbptt,
-            rank,
-            world_size,
-            args.seed + stage_index * 1_000_003,
-        )
+        streams = [
+            SegmentStream(
+                sequences,
+                episode_ids,
+                args.tbptt,
+                rank,
+                world_size,
+                args.seed + stage_index * 1_000_003 + stream_index * 97_409,
+            )
+            for stream_index in range(4)
+        ]
         global_step = train_stage(
             model,
             optimizer,
             scheduler,
-            stream,
+            streams,
             cache["frame_tokens"],
             cache["actions"],
             device,
@@ -320,12 +385,15 @@ def main():
             args,
             rank,
             world_size,
+            cache.get("outer_loss_mask"),
         )
     if rank == 0:
         torch.save(
             {
                 "model": model.state_dict(),
                 "architecture": "robottt_public_paper_reconstruction_v2",
+                "parameter_report": model.parameter_report(),
+                "architecture_approximation": bool(args.allow_architecture_approximation),
                 "args": vars(args),
                 "global_step": global_step,
             },
