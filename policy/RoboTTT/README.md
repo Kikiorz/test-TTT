@@ -1,8 +1,25 @@
 # RoboTTT policy
 
-This directory is the clean-room reconstruction of NVIDIA RoboTTT from the
-public paper. It is deliberately separate from `policy/DiT_TTT`, which is the
-legacy experimental policy that produced the archived LIBERO result.
+This directory is a standalone clean-room reconstruction of NVIDIA RoboTTT
+from the public paper. You can delete every sibling directory under `policy/`
+without breaking this package. It does not import `DP`, `DP_TTT`, `DiT`, or
+`DiT_TTT`.
+
+## Standalone layout
+
+- `backbone.py`: package-local LIBERO adapter and official Isaac-GR00T DiT.
+- `layer.py`: recurrent TTT-KVB fast-weight layer.
+- `policy.py`: 16-layer RoboTTT action head and rollout state semantics.
+- `train.py`: 30K pretrain plus 20K post-train entrypoint.
+- `training_utils.py`: checkpoint and contiguous-trajectory utilities.
+- `config.yaml`: complete disclosed/reconstructed configuration boundary.
+- `PAPER_MAPPING.md`: paper-to-code audit and under-specified choices.
+- `test_invariants.py`: causal, gate-zero, update-count, and meta-gradient tests.
+- `test_isolation.py`: rejects imports from every legacy policy package.
+
+Required external libraries are PyTorch, torchvision, NumPy, and NVIDIA
+Isaac-GR00T (for `gr00t.model.modules.dit.DiT`). The GR00T source is an explicit
+third-party dependency, not a sibling-policy dependency.
 
 ## Public-paper contract
 

@@ -1,4 +1,4 @@
-"""Small-benchmark data utilities kept separate from the legacy DiT-TTT code.
+"""Small-benchmark data utilities owned by the standalone RoboTTT package.
 
 These utilities adapt cached LIBERO features to the RoboTTT action head. They
 are not part of the paper architecture and are intentionally isolated here.
@@ -9,12 +9,12 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from DiT.model import DiTConfig, LiberoGR00TDiT
+from RoboTTT.backbone import LiberoRoboTTTBackbone, RoboTTTBackboneConfig
 
 
-def load_baseline(path: str, device: torch.device) -> LiberoGR00TDiT:
+def load_baseline(path: str, device: torch.device) -> LiberoRoboTTTBackbone:
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    model = LiberoGR00TDiT(DiTConfig(**payload["config"]))
+    model = LiberoRoboTTTBackbone(RoboTTTBackboneConfig(**payload["config"]))
     model.load_state_dict(payload["ema_model"], strict=True)
     return model.to(device).eval()
 

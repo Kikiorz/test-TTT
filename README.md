@@ -32,13 +32,14 @@ docs/
 └── PAPER_MAPPING.md
 ```
 
-The modules keep the import layout used by the validated experiment. Add
-`policy/` to `PYTHONPATH` before importing `DP_TTT`, `DiT`, `DiT_TTT` or
-`RoboTTT`.
+For standalone RoboTTT use, install the repository or add `policy/` to
+`PYTHONPATH`, then import `RoboTTT`. It is the only installable package and
+contains its own backbone adapter, config, trainer, paper mapping, and
+isolation tests; it does not import any sibling policy.
 
-`policy/RoboTTT` is the paper-based implementation. `policy/DiT_TTT` is retained
-unchanged as the legacy implementation that produced the archived LIBERO
-result; those old results must not be attributed to RoboTTT.
+The other policy directories are retained as source-only experiment history
+and may be removed without changing RoboTTT. `policy/DiT_TTT` produced the
+archived LIBERO result, which must not be attributed to RoboTTT.
 
 ## Causal deployment contract
 
@@ -89,7 +90,7 @@ tokens; any smaller bench requires an explicit approximation flag and label.
 
 The full GR00T model is not used: only its standard DiT action-head module is
 the architectural dependency. See [`docs/ALGORITHM.md`](docs/ALGORITHM.md) for
-the exact interfaces and [`docs/EXPERIMENT_AUDIT.md`](docs/EXPERIMENT_AUDIT.md)
-for the current evidence and its limitations. The direct paper-to-code mapping
-and all reconstruction choices are recorded in
-[`docs/PAPER_MAPPING.md`](docs/PAPER_MAPPING.md).
+the historical interfaces and [`docs/EXPERIMENT_AUDIT.md`](docs/EXPERIMENT_AUDIT.md)
+for the current evidence and its limitations. The authoritative paper-to-code
+mapping and reconstruction choices live beside the implementation in
+[`policy/RoboTTT/PAPER_MAPPING.md`](policy/RoboTTT/PAPER_MAPPING.md).

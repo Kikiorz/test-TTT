@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from DiT.model import LiberoGR00TDiT
+from RoboTTT.backbone import LiberoRoboTTTBackbone
 from RoboTTT.layer import FastState, RoboTTTKVBLayer
 
 
@@ -48,7 +48,7 @@ class RoboTTTPolicy(nn.Module):
 
     def __init__(
         self,
-        base_policy: LiberoGR00TDiT,
+        base_policy: LiberoRoboTTTBackbone,
         *,
         num_register_tokens: int = 16,
         fast_hidden_dim: Optional[int] = None,
