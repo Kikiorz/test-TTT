@@ -1,7 +1,5 @@
-"""Causal test-time memory for the controlled GR00T-DiT policy."""
+"""Legacy DiT-TTT policy retained for archived experiment reproducibility."""
 
 from .policy import DiTTTPolicy
-from .robottt_layer import RoboTTTKVBLayer
-from .robottt_policy import PaperRoboTTTPolicy
 
-__all__ = ["DiTTTPolicy", "PaperRoboTTTPolicy", "RoboTTTKVBLayer"]
+__all__ = ["DiTTTPolicy"]

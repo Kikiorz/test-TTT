@@ -17,8 +17,9 @@ This is **not** a complete LIBERO-LONG score. A full suite score requires all
 ## Controlled result on this task
 
 The table below belongs to the archived implementations. In particular, its
-DiT-TTT rows used `policy/DiT_TTT/policy.py`, not the later paper reconstruction
-in `robottt_policy.py`. The new architecture has no closed-loop result yet.
+DiT-TTT rows used `policy/DiT_TTT/policy.py`, not the separate public-paper
+reconstruction in `policy/RoboTTT`. The new architecture has no closed-loop
+result yet.
 
 | Family and mode | Success on official init states 0-19 |
 |---|---:|

@@ -40,11 +40,14 @@ class RoboTTTKVBLayer(nn.Module):
         if dim % 2:
             raise ValueError("RoboTTT RoPE requires an even token dimension")
         self.dim = int(dim)
-        self.fast_hidden_dim = int(fast_hidden_dim or 4 * dim)
+        # The paper specifies a two-layer MLP but not a hidden expansion ratio.
+        # Using d -> d -> d is the least-assumptive interpretation and is also
+        # consistent with the reported roughly 10M parameters per layer at the
+        # unpublished GR00T N1.7 width. Any other width is an explicit ablation.
+        self.fast_hidden_dim = int(fast_hidden_dim or dim)
         self.base_inner_lr = float(base_inner_lr)
         self.rope_theta = float(rope_theta)
 
-        self.input_norm = nn.LayerNorm(dim)
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
@@ -135,10 +138,11 @@ class RoboTTTKVBLayer(nn.Module):
                 value + 0.0 * base.unsqueeze(0) for value, base in zip(weights, bases)
             )
 
-        normalized = self.input_norm(attention_tokens)
-        queries = self._rope(self.q_proj(normalized), position)
-        keys = self._rope(self.k_proj(normalized), position)
-        values = self.v_proj(normalized)
+        # No extra normalization is inserted here: it is not specified by the
+        # paper, and the input is already the attention residual stream.
+        queries = self._rope(self.q_proj(attention_tokens), position)
+        keys = self._rope(self.k_proj(attention_tokens), position)
+        values = self.v_proj(attention_tokens)
 
         if update_fast:
             with torch.enable_grad():

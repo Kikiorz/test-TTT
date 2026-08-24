@@ -22,16 +22,8 @@ dit:
   timestep_buckets: 1000
 
 dit_ttt:
-  implementation: paper_reconstruction
-  placement: after_attention_before_ffn_per_dit_layer
-  register_tokens: 16
-  token_stream: [register, proprioception, noisy_action]
-  vl_tokens_enter_ttt_directly: false
-  fast_model: two_layer_gelu_mlp
-  fast_hidden_dim: 2048
-  initial_inner_lr: 0.1
-  initial_gate_alpha: 0.001
-  rope_theta: 10000
+  implementation: legacy_observation_residual
+  result_boundary: archived_libero_experiments_only
 
 training:
   seed: 42

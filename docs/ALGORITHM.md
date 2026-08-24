@@ -38,10 +38,10 @@ Two ResNet-18 encoders and the 8-D robot state create nine context tokens from
 three observation steps. Eight noisy 7-D action tokens are trained using flow
 matching with Beta(1.5, 1.0) time sampling and sampled using four Euler steps.
 
-## Paper RoboTTT reconstruction for DiT
+## Public-paper RoboTTT reconstruction
 
-`PaperRoboTTTPolicy` follows the architecture stated in RoboTTT rather than the
-earlier observation-summary residual approximation:
+`policy/RoboTTT/RoboTTTPolicy` follows RoboTTT's update-then-apply architecture
+rather than the earlier observation-summary residual approximation:
 
 ```text
 for each DiT layer l:
@@ -61,6 +61,11 @@ The pre-existing `DiTTTPolicy` in `policy/DiT_TTT/policy.py` is retained only to
 reproduce the completed experiment. It precomputes one observation-derived
 residual per layer and is not an exact reconstruction of the paper architecture.
 
+Sequence action forcing samples a separate Gaussian noise tensor and
+`tau_t = 0.999 * (1-u_t)`, `u_t ~ Beta(1.5, 1)`, for every robot timestep.
+Pretraining is 30K optimizer steps with a WSD schedule peaking at `2e-5`;
+post-training is 20K optimizer steps with a cosine schedule peaking at `5e-5`.
+
 ## Required invariants
 
 1. `gate0` equals the matched register-token backbone exactly.
@@ -70,7 +75,8 @@ residual per layer and is not an exact reconstruction of the paper architecture.
 5. TBPTT detaches gradients without resetting the numerical fast state.
 6. Denoising evaluations start from the same `W_(t-1)` and commit one `W_t` per environment decision.
 
-`policy/DiT_TTT/test_robottt_invariants.py` checks these structural properties.
+`policy/RoboTTT/test_invariants.py` checks these structural properties plus the
+strict 16-layer/16-register contract and the exact tau distribution.
 
 No clean future action is exposed at deployment. During training the current
 action appears through the standard flow-matching noisy sample

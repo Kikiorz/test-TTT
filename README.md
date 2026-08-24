@@ -7,8 +7,8 @@ controlled policy families:
 - a flow-matching action policy built around NVIDIA Isaac-GR00T's official
   `gr00t.model.modules.dit.DiT`;
 - DP-TTT, which adds one observation-written fast memory to DP conditioning;
-- a paper-reconstructed RoboTTT-DiT path with one TTT-KVB layer after the
-  attention operation of every DiT block.
+- a separate public-paper RoboTTT reconstruction with one TTT-KVB layer after
+  the attention operation of every DiT block.
 
 This repository contains **algorithm code only**. It intentionally excludes
 datasets, preprocessing products, checkpoints, videos, simulator assets,
@@ -21,9 +21,11 @@ policy/
 ├── DP/          # dependency contract for the standard DP baseline
 ├── DP_TTT/      # causal fast memory, DP wrapper and staged trainer
 ├── DiT/         # GR00T-DiT flow-matching action policy
-└── DiT_TTT/     # per-layer TTT wrapper, staged trainer and invariants
+├── DiT_TTT/     # legacy experimental policy; archived-result boundary
+└── RoboTTT/     # clean public-paper reconstruction, trainer and invariants
 configs/
-└── libero_long.yaml
+├── libero_long.yaml
+└── robottt_paper.yaml
 docs/
 ├── ALGORITHM.md
 ├── EXPERIMENT_AUDIT.md
@@ -31,12 +33,12 @@ docs/
 ```
 
 The modules keep the import layout used by the validated experiment. Add
-`policy/` to `PYTHONPATH` before importing `DP_TTT`, `DiT` or `DiT_TTT`.
+`policy/` to `PYTHONPATH` before importing `DP_TTT`, `DiT`, `DiT_TTT` or
+`RoboTTT`.
 
-`policy/DiT_TTT/robottt_policy.py` is the current paper-based implementation.
-`policy/DiT_TTT/policy.py` is retained as the legacy implementation that
-produced the archived LIBERO result; those old results must not be attributed
-to the new architecture.
+`policy/RoboTTT` is the paper-based implementation. `policy/DiT_TTT` is retained
+unchanged as the legacy implementation that produced the archived LIBERO
+result; those old results must not be attributed to RoboTTT.
 
 ## Causal deployment contract
 
@@ -73,8 +75,9 @@ result.
 RoboTTT itself uses a different recipe: sequence-model-only pretraining followed
 by all-parameter post-training, independently sampled flow noise per action
 chunk, and TBPTT with numerical fast weights carried across segment boundaries.
-The paper reports 30K pretraining steps and 20K post-training steps; small-bench
-runs must state explicitly when those budgets are scaled down.
+The new trainer defaults to the paper's 30K pretraining and 20K post-training
+optimizer steps. Strict action-head mode requires 16 DiT layers and 16 register
+tokens; any smaller bench requires an explicit approximation flag and label.
 
 ## External dependencies
 

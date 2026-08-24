@@ -1,0 +1,51 @@
+implementation: robottt_public_paper_reconstruction_v2
+policy_package: RoboTTT
+
+architecture:
+  backbone: GR00T_N1.7
+  dit_layers: 16
+  ttt_layers: 16
+  placement: after_attention_before_ffn
+  register_tokens: 16
+  token_stream: [register, proprioception, noisy_action]
+  vl_tokens_enter_ttt_directly: false
+  fast_model: two_layer_gelu_mlp
+  fast_hidden_ratio: 1.0  # paper does not disclose this value
+  base_inner_lr: 0.1
+  learned_inner_lr_multiplier: true
+  gate: tanh_per_channel
+  initial_gate_alpha: 0.001
+  rope_theta: 10000
+
+flow_matching:
+  distribution: tau=0.999*(1-u),u~Beta(1.5,1)
+  independent_tau_per_action_chunk: true
+  independent_noise_per_action_chunk: true
+
+training:
+  tbptt: 64  # local compute choice; paper does not disclose segment length
+  pretrain:
+    optimizer_steps: 30000
+    trainable: [register_tokens, ttt_layers]
+    context_schedule: [128, 256, 512, 1024, 2048, 4096, 8192]
+    scheduler: WSD
+    peak_lr: 2.0e-5
+  posttrain:
+    optimizer_steps: 20000
+    trainable: all_parameters
+    context_length: 1000
+    scheduler: cosine
+    peak_lr: 5.0e-5
+  optimizer: AdamW
+  weight_decay: 1.0e-5
+
+deployment:
+  reset_fast_weights_from: learned_W0
+  fast_state_lifetime: rollout
+  controls: [gate0, frozen, online]
+
+under_specified_reconstruction_choices:
+  - fast_hidden_ratio
+  - optimizer_betas
+  - rope_position_layout
+  - multi_denoise_fast_state_commit_rule

@@ -7,13 +7,33 @@ from torch import nn
 from torch.nn import functional as F
 
 from DiT.model import LiberoGR00TDiT
-from DiT_TTT.robottt_layer import FastState, RoboTTTKVBLayer
+from RoboTTT.layer import FastState, RoboTTTKVBLayer
 
 
 LayerFastStates = Tuple[FastState, ...]
 
 
-class PaperRoboTTTPolicy(nn.Module):
+def sample_sequence_action_forcing_taus(
+    batch_size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Sample the exact RoboTTT sequence-action-forcing time distribution.
+
+    Equation (5) uses tau = s * (1 - u), u ~ Beta(1.5, 1), s = 0.999.
+    Every call represents one robot timestep, so separate calls along a
+    trajectory produce independent noise levels and independent Gaussian noise.
+    """
+    beta = torch.distributions.Beta(
+        torch.tensor(1.5, device=device),
+        torch.tensor(1.0, device=device),
+    )
+    u = beta.sample((batch_size,)).to(dtype)
+    return 0.999 * (1.0 - u)
+
+
+class RoboTTTPolicy(nn.Module):
     """RoboTTT architecture reconstructed from Jiang et al. (2026).
 
     In every DiT block, current-step register, proprioception and noisy-action
@@ -35,11 +55,26 @@ class PaperRoboTTTPolicy(nn.Module):
         base_inner_lr: float = 0.1,
         init_gate_alpha: float = 0.001,
         rope_theta: float = 10_000.0,
+        strict_paper_action_head: bool = True,
     ) -> None:
         super().__init__()
         self.base_policy = base_policy
         dim = base_policy.config.hidden_dim
         self.num_register_tokens = int(num_register_tokens)
+        self.strict_paper_action_head = bool(strict_paper_action_head)
+        if self.strict_paper_action_head:
+            if base_policy.config.num_layers != 16:
+                raise ValueError(
+                    "RoboTTT uses the 16-layer GR00T N1.7 DiT action head; "
+                    f"received {base_policy.config.num_layers} layers. Set "
+                    "strict_paper_action_head=False only for a clearly labelled "
+                    "architecture ablation."
+                )
+            if self.num_register_tokens != 16:
+                raise ValueError(
+                    "RoboTTT uses exactly 16 learned register tokens; received "
+                    f"{self.num_register_tokens}."
+                )
         self.register_tokens = nn.Parameter(torch.empty(self.num_register_tokens, dim))
         nn.init.normal_(self.register_tokens, std=0.02)
         self.ttt_layers = nn.ModuleList(
@@ -79,7 +114,7 @@ class PaperRoboTTTPolicy(nn.Module):
     def inner_lr_values(self) -> torch.Tensor:
         return torch.stack([layer.positive_inner_lr() for layer in self.ttt_layers])
 
-    def configure_stage(self, stage: str) -> None:
+    def configure_stage(self, stage: str, *, encoded_vl_adapter: bool = False) -> None:
         for parameter in self.parameters():
             parameter.requires_grad_(False)
         if stage == "paper_sequence_pretrain":
@@ -90,6 +125,20 @@ class PaperRoboTTTPolicy(nn.Module):
             self.train()
             for parameter in self.parameters():
                 parameter.requires_grad_(True)
+            if encoded_vl_adapter:
+                # The small LIBERO cache stores already-encoded observation
+                # tokens. These modules are not in its computation graph and
+                # therefore cannot be post-trained. The full paper recipe does
+                # not take this branch: it fine-tunes every parameter.
+                for module_name in (
+                    "static_encoder",
+                    "wrist_encoder",
+                    "image_projector",
+                    "state_projector",
+                ):
+                    module = getattr(self.base_policy, module_name, None)
+                    if module is not None:
+                        module.requires_grad_(False)
         else:
             raise ValueError(stage)
 
@@ -99,7 +148,10 @@ class PaperRoboTTTPolicy(nn.Module):
         if context.ndim != 3 or context.shape[1] != expected:
             raise ValueError(f"expected [B,{expected},D], got {tuple(context.shape)}")
         frames = context.view(context.shape[0], base.config.obs_steps, 3, context.shape[-1])
-        vision_tokens = frames[:, :, :2].flatten(1, 2)
+        # One RoboTTT sequence timestep contains the current multi-camera
+        # observation. Earlier environment frames belong in the recurrent fast
+        # weights, not in a hand-concatenated short-history window.
+        vision_tokens = frames[:, -1, :2]
         proprioception_token = frames[:, -1, 2:3]
         return vision_tokens, proprioception_token
 
@@ -199,12 +251,10 @@ class PaperRoboTTTPolicy(nn.Module):
         base = self.base_policy
         normalized_actions = (actions - base.action_mean) / base.action_std
         noise = torch.randn_like(normalized_actions)
-        beta = torch.distributions.Beta(
-            torch.tensor(1.5, device=actions.device),
-            torch.tensor(1.0, device=actions.device),
-        )
         # Sequence action forcing: each robot timestep samples its own tau/noise.
-        tau = beta.sample((actions.shape[0],)).to(actions.dtype).mul_(0.999)
+        tau = sample_sequence_action_forcing_taus(
+            actions.shape[0], device=actions.device, dtype=actions.dtype
+        )
         noisy_actions = (1.0 - tau[:, None, None]) * noise + tau[:, None, None] * normalized_actions
         target_velocity = normalized_actions - noise
         timestep = (tau * base.config.timestep_buckets).long()
