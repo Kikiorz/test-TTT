@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Training data and simulator artifacts
+data/
+datasets/
+cache/
+caches/
+*.mmap
+*.parquet
+*.hdf5
+*.zarr/
+
+# Model and evaluation artifacts
+checkpoints/
+outputs/
+results/
+videos/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.mp4
+*.jsonl
+
+# Credentials and local configuration
+.env
+*.pem
+*.key
+*token*
+
+# Editors and operating systems
+.DS_Store
+._*
+.idea/
+.vscode/
+

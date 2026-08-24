@@ -1,0 +1,48 @@
+observation:
+  history_steps: 3
+  cameras: 2
+  image_size: [256, 256]
+  state_dim: 8
+
+action:
+  dim: 7
+  horizon: 8
+  execute_steps: 6
+
+dp_ttt:
+  memory_dim: 256
+  fast_hidden_dim: 256
+  initial_inner_lr: 0.05
+
+dit:
+  hidden_dim: 512
+  layers: 12
+  attention_heads: 8
+  flow_integration_steps: 4
+  timestep_buckets: 1000
+
+dit_ttt:
+  memories: per_dit_layer
+  memory_dim: 64
+  fast_hidden_dim: 64
+  initial_inner_lr: 0.05
+
+training:
+  seed: 42
+  decision_stride: 6
+  tbptt: 64
+  stages:
+    - name: fixed_gate_ttt
+      epochs: 100
+      fixed_gate: 0.5
+      ttt_lr: 3.0e-4
+    - name: joint
+      epochs: 20
+      ttt_lr: 2.0e-4
+      base_action_lr: 1.0e-5
+    - name: ttt_calibration
+      epochs: 10
+      ttt_lr: 1.0e-4
+
+deployment_modes: [gate0, frozen, online]
+
