@@ -38,11 +38,20 @@ class SmolVLAMikasaPolicy:
 
     chunk_size = 1
 
-    def __init__(self, policy, preprocessor, postprocessor, *, device: torch.device):
+    def __init__(
+        self,
+        policy,
+        preprocessor,
+        postprocessor,
+        *,
+        device: torch.device,
+        reset_memory_every_step: bool = False,
+    ):
         self.policy = policy
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
         self.device = device
+        self.reset_memory_every_step = bool(reset_memory_every_step)
 
     def reset(self) -> None:
         self.policy.reset()
@@ -87,6 +96,13 @@ class SmolVLAMikasaPolicy:
 
     @torch.inference_mode()
     def forward(self, obs: Mapping[str, Any]) -> torch.Tensor:
+        if self.reset_memory_every_step:
+            # Diagnostic ablation: retain the same checkpoint, observation,
+            # flow denoising and within-step update-then-apply computation,
+            # but remove only the recurrent fast-weight state carried between
+            # physical environment steps.  The canonical/main evaluation
+            # leaves this disabled.
+            self.policy.reset()
         # ``run_episode`` supplies the language instruction through the wrapped
         # env.  It is copied by ``set_task`` immediately before each episode.
         raw = self._make_policy_observation(obs)
@@ -185,6 +201,7 @@ def _load_policy(args: argparse.Namespace):
         preprocessor,
         postprocessor,
         device=torch.device(args.device),
+        reset_memory_every_step=args.reset_memory_every_step,
     )
 
 
@@ -248,6 +265,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "requested_tasks": [task.env_id for task in tasks],
             "benchmark_commit": benchmark_revision,
             "wrapper_chain": "apply_mikasa_vla_wrappers(include_overlays=False)",
+            "reset_memory_every_step": bool(args.reset_memory_every_step),
             # The adapter executes one action at a time so recurrent TTT state
             # is updated at every environment step.  SmolVLA still predicts
             # its native 50-action flow chunk internally.
@@ -296,6 +314,14 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable/disable the deployable learned write gate; default auto-detects the checkpoint config",
+    )
+    parser.add_argument(
+        "--reset-memory-every-step",
+        action="store_true",
+        help=(
+            "Diagnostic only: clear recurrent fast weights before every environment step. "
+            "The default keeps canonical episode-persistent memory."
+        ),
     )
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
