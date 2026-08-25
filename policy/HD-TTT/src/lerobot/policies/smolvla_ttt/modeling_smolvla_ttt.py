@@ -88,6 +88,7 @@ _CHECKPOINT_ARCHITECTURE_FIELDS = {
     "hd_attribution_threshold",
     "hd_attribution_topk",
     "hd_counterfactual_margin",
+    "hd_phase_mode",
     "hd_write_gate_weight",
     "hd_write_gate_init",
     "hd_learned_write_gate",
@@ -115,6 +116,7 @@ def _restore_checkpoint_model_fields(
         "hd_attribution_threshold",
         "hd_attribution_topk",
         "hd_counterfactual_margin",
+        "hd_phase_mode",
         "hd_write_gate_weight",
         "hd_write_gate_init",
         "hd_learned_write_gate",
@@ -994,7 +996,9 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             metrics["hd_hca"] = float(hca.detach().item())
 
         # The deployable writer objective is computed directly inside each
-        # TTT layer.  It is intentionally returned as an un-gated [B,T] loss
+        # TTT layer.  It is a stop-gradient-target local K/V reconstruction
+        # (the value projection is the target, not a second predictor) and is
+        # intentionally returned as an un-gated [B,T] loss
         # and weighted here by hindsight ``hd_write_gate`` plus the physical
         # writer-valid mask (which includes labeled history warm-up frames).
         # This removes the need for unavailable/offline ``hd_local_*`` labels.
@@ -1301,13 +1305,32 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             labeled_time = self._reshape_hd_field(
                 batch["hd_time"], sequence_shape, name="hd_time"
             ).to(device=actions.device, dtype=torch.float32)
-            time = labeled_time.reshape(-1)
-            if time.shape[0] != actions.shape[0]:
+            labeled_time = labeled_time.reshape(-1)
+            if labeled_time.shape[0] != actions.shape[0]:
                 raise ValueError(
-                    f"hd_time has {time.shape[0]} values but flattened action batch has {actions.shape[0]}"
+                    f"hd_time has {labeled_time.shape[0]} values but flattened action batch has {actions.shape[0]}"
                 )
+            if hd_enabled and getattr(self.config, "hd_phase_mode", "random") == "deployment":
+                # Do not silently trust a random-phase artifact under a
+                # deployment-causal configuration.  The explicit check makes
+                # phase matching a reproducible contract rather than a comment
+                # in the label-generation command.
+                if not torch.allclose(labeled_time, torch.ones_like(labeled_time), atol=1e-6, rtol=0):
+                    raise ValueError(
+                        "hd_phase_mode='deployment' requires hd_time=1 labels; "
+                        "regenerate the artifact with --phase-mode deployment"
+                    )
+                time = torch.ones_like(labeled_time)
+            else:
+                time = labeled_time
         if time is None:
-            time = self.model.sample_time(actions.shape[0], actions.device)
+            if hd_enabled and getattr(self.config, "hd_phase_mode", "random") == "deployment":
+                # Match the first deployment denoise exactly: the interaction
+                # written to fast weights is projected from pure Gaussian
+                # action noise, not from the future expert action chunk.
+                time = torch.ones(actions.shape[0], device=actions.device, dtype=torch.float32)
+            else:
+                time = self.model.sample_time(actions.shape[0], actions.device)
 
         hd_write_gate = self._reshape_hd_field(
             batch.get("hd_write_gate"), sequence_shape, name="hd_write_gate"
@@ -1398,10 +1421,15 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     sequence_shape=sequence_shape,
                     fast_states=grounding_initial_states,
                     create_graph=False,
-                    write_gate=None if learned_write_gate else hd_write_gate,
+                    # The hindsight teacher's true branch is the ordinary
+                    # all-write replay.  Do not accidentally apply the
+                    # learned/label gate here: grounding should train the
+                    # reader/action path, not compare a gated student branch
+                    # against an all-write teacher target.
+                    write_gate=None,
                     detach_writer=True,
                     return_velocity=True,
-                    use_learned_write_gate=learned_write_gate,
+                    use_learned_write_gate=False,
                 )
                 wrong_initial_states = self._clone_fast_states(
                     initial_fast_states,
@@ -1423,7 +1451,10 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     write_gate=wrong_gate,
                     detach_writer=True,
                     return_velocity=True,
-                    use_learned_write_gate=learned_write_gate,
+                    # ``wrong_gate`` is the explicit offline intervention;
+                    # multiplying it by the learned online gate would create
+                    # a different counterfactual from the teacher artifact.
+                    use_learned_write_gate=False,
                 )
             hd_aux_loss, hd_metrics = self._hd_auxiliary_losses(
                 batch,

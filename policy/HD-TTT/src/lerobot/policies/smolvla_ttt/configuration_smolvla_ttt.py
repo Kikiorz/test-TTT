@@ -117,7 +117,7 @@ class SmolVLATTTConfig(PreTrainedConfig):
     # Number of preceding episode frames replayed before each sampled target
     # window.  Warm-up frames advance fast weights and are masked from action,
     # HCA, and grounding targets; labeled HD sequences retain them for the
-    # separate local-writer/gate objective through ``hd_writer_valid``.
+    # separate local-writer objective through ``hd_writer_valid``.
     ttt_history_warmup_length: int | None = 0
     # Optional episode-balanced subsampling for very long demonstrations.
     # ``None`` keeps every tail-preserving window (the default, rigorous
@@ -154,6 +154,11 @@ class SmolVLATTTConfig(PreTrainedConfig):
     hd_attribution_threshold: float = 0.0
     hd_attribution_topk: int = 8
     hd_counterfactual_margin: float = 0.05
+    # ``random`` preserves ordinary flow-matching training. ``deployment``
+    # makes the writer see the same first-denoise distribution as deployment:
+    # a pure Gaussian action chunk (t=1), with no teacher-forced future action
+    # chunk in the interaction that is written to fast weights.
+    hd_phase_mode: str = "random"
     # Hindsight labels supervise a local, causal predictor of whether the
     # current interaction should be written to fast weights.  The predictor
     # is enabled only when ``hd_ttt_enabled`` is true; ordinary SmolVLA/TTT
@@ -226,6 +231,8 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("hd_event_block_size must be positive")
         if self.hd_attribution_topk < 0:
             raise ValueError("hd_attribution_topk must be non-negative")
+        if self.hd_phase_mode not in {"random", "deployment"}:
+            raise ValueError("hd_phase_mode must be 'random' or 'deployment'")
         if self.compile_model:
             raise ValueError(
                 "smolvla_ttt does not support torch.compile because its inner loop uses autograd.grad"

@@ -253,9 +253,20 @@ def _fixed_noise_time(
     chunk_size: int,
     action_dim: int,
     seed: int,
+    phase_mode: str = "random",
     device: torch.device,
 ) -> tuple[Tensor, Tensor]:
-    """Generate reproducible flow-matching noise/time on CPU then transfer."""
+    """Generate reproducible flow-matching noise/time on CPU then transfer.
+
+    ``deployment`` is deliberately phase-matched to the first online denoise:
+    the writer sees a pure Gaussian action chunk at ``t=1``.  The ordinary
+    ``random`` mode is retained for base flow-matching diagnostics, but it
+    mixes the future expert action chunk into the writer and must not be used
+    for a strict deployment-causal HD claim.
+    """
+
+    if phase_mode not in {"random", "deployment"}:
+        raise ValueError("phase_mode must be 'random' or 'deployment'")
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed) & ((1 << 63) - 1))
@@ -265,9 +276,12 @@ def _fixed_noise_time(
         dtype=torch.float32,
         device="cpu",
     )
-    # Keep away from both interpolation endpoints while remaining fixed.
-    time = torch.rand((length,), generator=generator, dtype=torch.float32, device="cpu")
-    time = time.mul(0.998).add(0.001)
+    if phase_mode == "deployment":
+        time = torch.ones((length,), dtype=torch.float32, device="cpu")
+    else:
+        # Keep away from both interpolation endpoints while remaining fixed.
+        time = torch.rand((length,), generator=generator, dtype=torch.float32, device="cpu")
+        time = time.mul(0.998).add(0.001)
     return noise.to(device=device), time.to(device=device)
 
 
@@ -365,12 +379,40 @@ def _flow_losses(
     return error
 
 
-def _event_candidates(length: int, block_size: int, max_events: int) -> list[tuple[int, int]]:
+def _event_candidates(
+    length: int,
+    block_size: int,
+    max_events: int,
+    *,
+    global_offset: int = 0,
+    global_start_min: int | None = None,
+    global_end_max: int | None = None,
+) -> list[tuple[int, int]]:
     if block_size <= 0:
         raise ValueError("event-block-size must be positive")
     if max_events < 0:
         raise ValueError("max-events must be non-negative")
-    events = [(start, min(start + block_size, length)) for start in range(0, length, block_size)]
+    events = []
+    # Start at the first local position whose *episode-global* index is on the
+    # event grid.  Using ``range(0, ...)`` and then filtering would silently
+    # drop every event when a replay context starts off-grid.
+    first_start = (-global_offset) % block_size
+    for start in range(first_start, length, block_size):
+        global_start = global_offset + start
+        global_end = global_start + block_size
+        # Keep intervention blocks on the episode-global event grid.  A local
+        # replay must not silently redefine an event merely because its
+        # warm-up context starts in the middle of a block.
+        if global_start % block_size != 0:
+            continue
+        end = min(start + block_size, length)
+        if global_end > global_offset + length:
+            continue
+        if global_start_min is not None and global_start < global_start_min:
+            continue
+        if global_end_max is not None and global_end > global_end_max:
+            continue
+        events.append((start, end))
     # Events with no future cannot receive causal credit and need no replay.
     events = [event for event in events if event[1] < length]
     # ``max_events=0`` means no sampling cap: generate every causal block.
@@ -394,6 +436,10 @@ def _episode_labels(
     max_events: int,
     attribution_threshold: float,
     frame_batch_size: int,
+    future_mask: Tensor | None = None,
+    global_offset: int = 0,
+    event_global_start_min: int | None = None,
+    event_global_end_max: int | None = None,
 ) -> dict[str, Any]:
     """Compute full teacher, causal interventions, and frame-aligned labels."""
 
@@ -412,14 +458,27 @@ def _episode_labels(
     )
     full_loss = _flow_losses(full_velocity, noise, actions, action_is_pad, active_dim)
     length = int(full_velocity.shape[0])
-    events = _event_candidates(length, event_block_size, max_events)
+    if future_mask is not None:
+        future_mask = future_mask.detach().cpu().bool()
+        if future_mask.shape != (length,):
+            raise ValueError(f"future_mask must have shape [{length}], got {tuple(future_mask.shape)}")
+    events = _event_candidates(
+        length,
+        event_block_size,
+        max_events,
+        global_offset=global_offset,
+        global_start_min=event_global_start_min,
+        global_end_max=event_global_end_max,
+    )
     credit_rows: list[Tensor] = []
     best_wrong: Tensor | None = None
     best_gate = torch.ones(length, dtype=torch.float32)
     best_score = float("-inf")
     best_event: tuple[int, int] | None = None
+    best_event_index = -1
+    selection_scores: list[float] = []
 
-    for event_start, event_end in events:
+    for event_index, (event_start, event_end) in enumerate(events):
         gate = torch.ones(length, dtype=torch.float32, device=noise.device)
         gate[event_start:event_end] = 0.0
         wrong_velocity = _run_replay(
@@ -434,31 +493,56 @@ def _episode_labels(
         row = (wrong_loss - full_loss).clamp_min(0.0)
         causal = torch.zeros(length, dtype=torch.bool)
         causal[event_end:] = True
+        if future_mask is not None:
+            causal &= future_mask
         row = torch.where(causal, row, torch.zeros_like(row))
         if attribution_threshold > 0:
             row = torch.where(row >= attribution_threshold, row, torch.zeros_like(row))
         credit_rows.append(row)
 
-        score = float(row.sum().item())
-        if best_wrong is None or score > best_score:
+        # Normalize by the number of eligible future frames.  Otherwise an
+        # early event wins simply because it has a longer future horizon,
+        # even when its per-frame intervention effect is identical.
+        eligible_count = int(causal.sum().item())
+        score = float(row.sum().item()) / max(eligible_count, 1) if eligible_count else float("-inf")
+        selection_scores.append(score)
+        if eligible_count > 0 and (best_wrong is None or score > best_score):
             best_score = score
             best_wrong = wrong_velocity
             best_gate = gate.detach().cpu()
             best_event = (event_start, event_end)
+            best_event_index = event_index
 
     if credit_rows:
         credits = torch.stack(credit_rows, dim=0)
-        rho_raw = credits.amax(dim=0)
+        # ``hd_attribution`` retains all-event max credit for HCA/write
+        # utility, while ``hd_rho`` is restricted to the selected branch used
+        # by the stored counterfactual velocity.  Keeping these distinct avoids
+        # mixing a per-future event with an episode-global wrong branch in the
+        # grounding direction target.
+        rho_hca_raw = credits.amax(dim=0)
+        rho_grounding_raw = (
+            credits[best_event_index]
+            if 0 <= best_event_index < credits.shape[0]
+            else torch.zeros(length, dtype=credits.dtype)
+        )
         event_u_raw = credits.amax(dim=1)
     else:
         credits = torch.zeros((0, length), dtype=torch.float32)
-        rho_raw = torch.zeros(length, dtype=torch.float32)
+        rho_hca_raw = torch.zeros(length, dtype=torch.float32)
+        rho_grounding_raw = torch.zeros(length, dtype=torch.float32)
         event_u_raw = torch.zeros(0, dtype=torch.float32)
 
     # Normalize independently per episode.  A no-dependency episode remains
     # exactly zero instead of producing NaNs or an arbitrary write signal.
-    rho_scale = rho_raw.max().clamp_min(1e-8)
-    rho = rho_raw / rho_scale if float(rho_raw.max()) > 0 else rho_raw
+    rho_hca_scale = rho_hca_raw.max().clamp_min(1e-8)
+    rho_grounding_scale = rho_grounding_raw.max().clamp_min(1e-8)
+    rho_hca = rho_hca_raw / rho_hca_scale if float(rho_hca_raw.max()) > 0 else rho_hca_raw
+    rho_grounding = (
+        rho_grounding_raw / rho_grounding_scale
+        if float(rho_grounding_raw.max()) > 0
+        else rho_grounding_raw
+    )
     if event_u_raw.numel() and float(event_u_raw.max()) > 0:
         event_u = event_u_raw / event_u_raw.max().clamp_min(1e-8)
     else:
@@ -486,13 +570,15 @@ def _episode_labels(
         "hd_teacher_wrong_velocity": best_wrong.float(),
         "hd_noise": noise.detach().cpu().float(),
         "hd_time": time.detach().cpu().float(),
-        "hd_attribution": rho.float(),
-        "hd_rho": rho.float(),
+        "hd_attribution": rho_hca.float(),
+        "hd_rho": rho_grounding.float(),
         "hd_write_gate": write_gate.float(),
         "hd_write_gate_observed": write_gate_observed.float(),
         "hd_counterfactual_write_gate": best_gate.float(),
         "hd_C": credits.float(),
         "hd_event_u": event_u.float(),
+        "hd_attribution_aggregation": "all_event_max_for_hca_selected_event_for_grounding",
+        "hd_event_selection_scores": torch.tensor(selection_scores, dtype=torch.float32),
         "hd_event_starts": torch.tensor([event[0] for event in events], dtype=torch.int64),
         "hd_event_ends": torch.tensor([event[1] for event in events], dtype=torch.int64),
         "hd_selected_event": torch.tensor(
@@ -556,6 +642,18 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
                     )
                 episodes_detail[key] = episode_detail
 
+    phase_modes = {
+        str(metadata.get("phase_mode"))
+        for metadata in shard_metadata
+        if metadata.get("phase_mode") is not None
+    }
+    if len(phase_modes) > 1:
+        raise ValueError(
+            "Cannot merge hindsight shards generated with different phase modes: "
+            f"{sorted(phase_modes)}"
+        )
+    merged_phase_mode = next(iter(phase_modes), "unknown")
+
     columns = {
         key: torch.cat([payload[key].detach().cpu() for payload in payloads], dim=0)
         for key in required
@@ -582,6 +680,7 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         "num_frames": int(sorted_indices.numel()),
         "shard_metadata": shard_metadata,
         "episodes_detail": episodes_detail,
+        "phase_mode": merged_phase_mode,
         "fixed_phase": {
             "noise_column": "hd_noise",
             "time_column": "hd_time",
@@ -683,6 +782,7 @@ def _build_shard(args: argparse.Namespace) -> None:
             chunk_size=int(policy.config.chunk_size),
             action_dim=action_dim,
             seed=args.seed + episode * 1_000_003,
+            phase_mode=args.phase_mode,
             device=device,
         )
         labels = _episode_labels(
@@ -732,6 +832,12 @@ def _build_shard(args: argparse.Namespace) -> None:
         "episode_end": args.episode_end,
         "episodes": selected,
         "seed": args.seed,
+        "phase_mode": args.phase_mode,
+        "writer_observation": (
+            "pure_gaussian_action_noise_at_t1"
+            if args.phase_mode == "deployment"
+            else "random_flow_interpolation_with_expert_action_chunk"
+        ),
         "event_block_size": args.event_block_size,
         "max_events": args.max_events,
         "event_sampling": "all_causal_blocks" if args.max_events == 0 else "uniform",
@@ -775,6 +881,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--attribution-threshold", type=float, default=0.0)
     parser.add_argument("--frame-batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1729)
+    parser.add_argument(
+        "--phase-mode",
+        choices=("random", "deployment"),
+        default="random",
+        help=(
+            "Flow phase used for hindsight replay. 'deployment' uses t=1 and "
+            "pure Gaussian action noise so the writer cannot see future expert actions."
+        ),
+    )
     parser.add_argument("--task", default=None, help="Override dataset language instruction")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--video-backend", default="pyav", choices=("pyav", "torchcodec", "video_reader"))

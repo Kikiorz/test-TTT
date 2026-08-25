@@ -113,6 +113,59 @@ def test_labels_survive_sequence_collation_and_processor_transition(tmp_path) ->
     torch.testing.assert_close(round_trip["hd_rho"], batch["hd_rho"])
 
 
+def test_window_keyed_labels_preserve_the_exact_replay_context(tmp_path) -> None:
+    dataset = _EpisodeDataset([6])
+    path = tmp_path / "window_labels.pt"
+    source_indices = torch.tensor([1, 2, 3], dtype=torch.int64)
+    torch.save(
+        {
+            "windows": [
+                {
+                    "target_global_index": 2,
+                    "history_start_source": 1,
+                    "source_indices": source_indices,
+                    "length": 3,
+                    "labels": {
+                        "hd_write_gate": torch.tensor([0.2, 0.3, 0.4]),
+                        "hd_counterfactual_write_gate": torch.tensor([0.0, 1.0, 1.0]),
+                        "hd_writer_valid": torch.ones(3, dtype=torch.bool),
+                    },
+                }
+            ],
+            "metadata": {
+                "window_local": True,
+                "window_keyed": True,
+                "sequence_length": 2,
+                "sequence_stride": 2,
+                "context_length": 1,
+                "max_windows_per_episode": None,
+                "phase_mode": "deployment",
+            },
+        },
+        path,
+    )
+    labeled = HindsightLabelDataset(dataset, path)
+    assert labeled.hd_window_keyed
+    sequences = TailPreservingSequenceDataset(
+        labeled,
+        sequence_length=2,
+        sequence_stride=2,
+        history_warmup_length=1,
+    )
+    samples = sequences[1]
+    assert [sample["observation.state"].item() for sample in samples] == [1, 2, 3]
+    # The warm-up row keeps the window-specific counterfactual gate instead of
+    # inheriting the gate from its own target window.
+    torch.testing.assert_close(
+        torch.stack([sample["hd_counterfactual_write_gate"] for sample in samples]),
+        torch.tensor([0.0, 1.0, 1.0]),
+    )
+    torch.testing.assert_close(
+        torch.stack([sample["hd_write_gate"] for sample in samples]),
+        torch.tensor([0.2, 0.3, 0.4]),
+    )
+
+
 def test_strict_mode_reports_uncovered_frames(tmp_path) -> None:
     dataset = _EpisodeDataset([3])
     path = tmp_path / "labels.pt"

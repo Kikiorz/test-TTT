@@ -101,7 +101,62 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             "remove it for baseline/PI0 training"
         )
     logging.info("Loading HD-TTT hindsight labels from %s", label_path)
-    return HindsightLabelDataset(dataset, label_path, strict=True)
+    labeled_dataset = HindsightLabelDataset(dataset, label_path, strict=True)
+    policy_cfg = cfg.policy
+    if not bool(getattr(policy_cfg, "hd_ttt_enabled", False)):
+        raise ValueError(
+            "dataset.hd_label_path requires policy.hd_ttt_enabled=true; "
+            "remove the label path for a clean TTT/base run"
+        )
+
+    # A hindsight artifact is tied to the exact recurrent/window protocol
+    # used to generate it.  Fail at startup rather than silently training a
+    # different state distribution (especially important for long episodes).
+    metadata = labeled_dataset.label_metadata
+    if metadata:
+        expected_phase = getattr(policy_cfg, "hd_phase_mode", "random")
+        artifact_phase = metadata.get("phase_mode")
+        if artifact_phase is not None and str(artifact_phase) != str(expected_phase):
+            raise ValueError(
+                "HD label phase mismatch: artifact uses "
+                f"{artifact_phase!r}, policy.hd_phase_mode={expected_phase!r}"
+            )
+        checks = {
+            "sequence_length": getattr(policy_cfg, "sequence_length", None),
+            "sequence_stride": getattr(policy_cfg, "sequence_stride", None),
+            "event_block_size": getattr(policy_cfg, "hd_event_block_size", None),
+        }
+        if labeled_dataset.hd_window_local:
+            # ``None`` is meaningful here (full-history replay or no cap), so
+            # it is an exact value rather than a wildcard.
+            checks["context_length"] = getattr(policy_cfg, "ttt_history_warmup_length", None)
+            checks["max_windows_per_episode"] = getattr(
+                policy_cfg, "max_windows_per_episode", None
+            )
+        mismatches = {
+            key: (metadata.get(key), expected)
+            for key, expected in checks.items()
+            if key in metadata and metadata.get(key) != expected
+        }
+        if mismatches:
+            raise ValueError(f"HD label/window contract mismatch: {mismatches}")
+        if (
+            labeled_dataset.hd_window_local
+            and not labeled_dataset.hd_window_keyed
+            and getattr(policy_cfg, "sequence_stride", None)
+            != getattr(policy_cfg, "sequence_length", None)
+        ):
+            raise ValueError(
+                "window-local HD labels require sequence_stride == sequence_length; "
+                "use a window-keyed artifact for overlapping windows"
+            )
+        logging.info(
+            "HD label contract: phase=%s, window_local=%s, teacher=%s",
+            artifact_phase,
+            labeled_dataset.hd_window_local,
+            metadata.get("checkpoint", "unknown"),
+        )
+    return labeled_dataset
 
 
 def update_policy(

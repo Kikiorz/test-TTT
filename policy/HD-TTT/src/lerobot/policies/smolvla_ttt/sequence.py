@@ -26,7 +26,8 @@ SEQUENCE_SHAPE_KEY = "_lerobot_sequence_shape"
 # Complementary frame mask for training-only HD writer objectives.  Unlike
 # ``action_is_pad`` it remains true on replayed history frames: those frames
 # have no imitation target in the current window, but their causal interaction
-# still must train the local K/V objective and the deployable write gate.
+# still must train the local K/V objective.  Window-local counterfactual gate
+# supervision is masked separately through ``hd_write_gate_observed``.
 HD_WRITER_VALID_KEY = "hd_writer_valid"
 
 
@@ -98,6 +99,13 @@ class TailPreservingSequenceDataset(Dataset):
         self.history_warmup_length = (
             None if history_warmup_length is None else int(history_warmup_length)
         )
+        # Window-local hindsight labels are generated from exactly the
+        # preceding context used by this sampler.  Their warm-up rows remain
+        # valid for the instantaneous local K/V objective; only the
+        # counterfactual/gate labels are reset below for legacy frame-local
+        # artifacts.
+        self.hd_window_local = bool(getattr(dataset, "hd_window_local", False))
+        self.hd_window_keyed = bool(getattr(dataset, "hd_window_keyed", False))
         self.window_specs: list[tuple[int, int]] = []
         self.history_specs: list[tuple[int, int]] = []
 
@@ -154,6 +162,17 @@ class TailPreservingSequenceDataset(Dataset):
         history_start, target_start = self.history_specs[index]
         if target_start != start_index:
             raise RuntimeError("Internal history/target window bookkeeping is inconsistent")
+        window_labels = None
+        get_window_labels = getattr(self.dataset, "get_window_labels", None)
+        if callable(get_window_labels):
+            window_labels = get_window_labels(
+                start_index,
+                history_start,
+                # ``window_length`` is the target suffix length; the
+                # window-keyed artifact stores the complete replay context,
+                # including its history warm-up prefix.
+                start_index + window_length - history_start,
+            )
         samples: list[dict[str, Any]] = []
         for absolute_index in range(history_start, start_index + window_length):
             sample = dict(self.dataset[absolute_index])
@@ -162,13 +181,35 @@ class TailPreservingSequenceDataset(Dataset):
             # writer interaction, including the history prefix below.  The
             # target action remains masked independently via action_is_pad.
             if any(isinstance(key, str) and key.startswith("hd_") for key in sample):
-                sample[HD_WRITER_VALID_KEY] = torch.tensor(True, dtype=torch.bool)
+                existing_writer_valid = sample.get(HD_WRITER_VALID_KEY)
+                if isinstance(existing_writer_valid, torch.Tensor):
+                    sample[HD_WRITER_VALID_KEY] = existing_writer_valid.bool()
+                else:
+                    sample[HD_WRITER_VALID_KEY] = torch.tensor(True, dtype=torch.bool)
             # The warm-up is intentionally part of the recurrent computation,
             # but it must not contribute an imitation/HCA/grounding target.
             # Reusing LeRobot's action padding convention masks those action
-            # losses.  ``hd_writer_valid`` above keeps the separate local
-            # writer/gate objective alive for labeled history frames.
+            # losses.  The separate local writer objective remains active on
+            # warm-up rows; ``hd_write_gate_observed`` masks their unavailable
+            # hindsight gate target.
             if absolute_index < target_start:
+                if self.hd_window_local and not self.hd_window_keyed:
+                    sample[HD_WRITER_VALID_KEY] = torch.tensor(True, dtype=torch.bool)
+                    # A frame-local artifact cannot encode a full replay
+                    # context.  Reset its warm-up intervention to the
+                    # ordinary all-write branch; window-keyed artifacts carry
+                    # an exact gate vector and bypass this path.
+                    for gate_key in ("hd_write_gate", "hd_counterfactual_write_gate"):
+                        gate_value = sample.get(gate_key)
+                        if isinstance(gate_value, torch.Tensor):
+                            sample[gate_key] = torch.ones_like(gate_value)
+                    observed_value = sample.get("hd_write_gate_observed")
+                    if isinstance(observed_value, torch.Tensor):
+                        sample["hd_write_gate_observed"] = torch.zeros_like(observed_value)
+                    for attribution_key in ("hd_attribution", "hd_rho"):
+                        attribution_value = sample.get(attribution_key)
+                        if isinstance(attribution_value, torch.Tensor):
+                            sample[attribution_key] = torch.zeros_like(attribution_value)
                 action_is_pad = sample.get("action_is_pad")
                 if isinstance(action_is_pad, torch.Tensor):
                     sample["action_is_pad"] = torch.ones_like(action_is_pad, dtype=torch.bool)
@@ -176,6 +217,13 @@ class TailPreservingSequenceDataset(Dataset):
                     sample["action_is_pad"] = torch.ones(
                         sample[ACTION].shape[:-1], dtype=torch.bool
                     )
+            # Window-keyed artifacts are authoritative.  Apply them after the
+            # warm-up action mask so their full counterfactual gate vector is
+            # preserved exactly for the replay branch, including history rows.
+            if window_labels is not None:
+                overlay = window_labels.get(absolute_index)
+                if overlay is not None:
+                    sample.update(overlay)
             samples.append(sample)
         return samples
 

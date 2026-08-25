@@ -2,11 +2,10 @@
 
 # Reproducible MIKASA HD-TTT training recipe.
 #
-# The default recipe is episode-balanced: four evenly spaced 64-frame windows
-# per long episode and 150 passes over the 250 demonstrations.  This keeps the
-# recurrent update causal while covering the beginning, middle, and terminal
-# phases of the Long task. Set MAX_WINDOWS_PER_EPISODE=none to use every
-# tail-preserving window (the strict full-coverage setting; more expensive).
+# The default recipe uses every tail-preserving window and 150 passes over the
+# demonstrations.  This is the strict setting required by window-keyed HD
+# labels; set MAX_WINDOWS_PER_EPISODE to a positive value only for an explicit
+# episode-balanced speed ablation.
 
 set -euo pipefail
 
@@ -22,7 +21,7 @@ EPOCHS="${EPOCHS:-150}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-64}"
 SEQUENCE_STRIDE="${SEQUENCE_STRIDE:-64}"
-MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-4}"
+MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-none}"
 TBPTT_SEGMENT_LENGTH="${TBPTT_SEGMENT_LENGTH:-32}"
 HISTORY_WARMUP_LENGTH="${HISTORY_WARMUP_LENGTH:-64}"
 if [[ "${HISTORY_WARMUP_LENGTH}" == "full" ]]; then
@@ -37,6 +36,7 @@ RESIZE="${RESIZE:-[224,224]}"
 TRAINING_STAGE="${TRAINING_STAGE:-ttt_only}"
 HD_ENABLED="${HD_ENABLED:-false}"
 HD_LEARNED_GATE="${HD_LEARNED_GATE:-${HD_ENABLED}}"
+HD_PHASE_MODE="${HD_PHASE_MODE:-deployment}"
 SAVE_FREQ="${SAVE_FREQ:-500}"
 LOG_FREQ="${LOG_FREQ:-50}"
 SEED="${SEED:-1000}"
@@ -59,7 +59,6 @@ fi
 # so ``steps`` really denotes the requested number of dataset epochs.
 WINDOWS="$(${PYTHON_BIN} - "${DATASET_ROOT}" "${SEQUENCE_LENGTH}" "${SEQUENCE_STRIDE}" "${MAX_WINDOWS_ARG}" "${DATASET_EPISODES}" <<'PY'
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -79,10 +78,17 @@ for episode_index, row in enumerate(episodes):
     if selected is not None and episode_index not in selected:
         continue
     n = int(row["dataset_to_index"]) - int(row["dataset_from_index"])
-    windows = math.ceil(n / stride)
-    if cap is not None:
-        windows = min(windows, cap)
-    total += windows
+    offsets = list(range(0, n, stride))
+    if cap is not None and len(offsets) > cap:
+        last_full_offset = max(n - length, 0)
+        full_offsets = list(range(0, last_full_offset + 1, stride))
+        if not full_offsets or full_offsets[-1] != last_full_offset:
+            full_offsets.append(last_full_offset)
+        # Match TailPreservingSequenceDataset's deterministic linspace/round
+        # selection exactly, including its terminal full window.
+        positions = [round(i * (len(full_offsets) - 1) / (cap - 1)) for i in range(cap)] if cap > 1 else [0]
+        offsets = [full_offsets[position] for position in sorted(set(positions))]
+    total += len(offsets)
 print(total)
 PY
 )"
@@ -113,6 +119,7 @@ COMMON_ARGS=(
   --policy.resize_imgs_with_padding="${RESIZE}"
   --policy.hd_ttt_enabled="${HD_ENABLED}"
   --policy.hd_learned_write_gate="${HD_LEARNED_GATE}"
+  --policy.hd_phase_mode="${HD_PHASE_MODE}"
   --batch_size=1
   --num_workers="${NUM_WORKERS:-4}"
   --prefetch_factor="${PREFETCH_FACTOR:-2}"

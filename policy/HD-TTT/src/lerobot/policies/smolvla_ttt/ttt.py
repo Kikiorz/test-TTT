@@ -334,7 +334,19 @@ class TTTMLPLayer(nn.Module):
                 for weight, updated in zip(state.tensors(), updated_tensors, strict=True)
             )
         next_state = TTTFastState(*updated_tensors, position=state.position)
-        return (next_state, per_trajectory_loss) if return_loss else next_state
+        if return_loss:
+            # The value projection is the target of the local K/V objective,
+            # not a second predictor.  Stop its outer gradient in the exposed
+            # H2L loss so the writer cannot reduce the loss by moving both
+            # sides of the reconstruction together.  The numerical inner
+            # update above intentionally retains the original objective.
+            exposed_loss = F.mse_loss(
+                prediction,
+                values.detach(),
+                reduction="none",
+            ).mean(dim=(1, 2))
+            return next_state, exposed_loss
+        return next_state
 
     def _apply_rope(self, inputs: Tensor, positions: Tensor) -> Tensor:
         rotary_dim = self.dim - self.dim % 2

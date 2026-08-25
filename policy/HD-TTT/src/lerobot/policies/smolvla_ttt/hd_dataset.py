@@ -24,6 +24,12 @@ For convenience, records with ``episode_index``/``frame_index`` (or a global
 supported, which is useful when labels are generated one episode at a time.
 Labels are deliberately kept out of ``LeRobotDataset.meta``: they are training
 annotations, not physical observations or action features.
+
+For bounded recurrent training, a payload may instead contain a ``windows``
+list.  Each record stores the complete context for one target window, keyed by
+its source ``target_global_index``.  ``TailPreservingSequenceDataset`` calls
+``get_window_labels`` to select that context; this preserves distinct labels
+for overlapping windows and is required for counterfactual gate replay.
 """
 
 from __future__ import annotations
@@ -162,6 +168,9 @@ class HindsightLabelDataset(Dataset):
         self.dataset = dataset
         self.label_path = Path(label_path).expanduser()
         self.strict = bool(strict)
+        self.label_metadata: dict[str, Any] = {}
+        self.hd_window_local = False
+        self.hd_window_keyed = False
         self._episode_locations = self._build_episode_locations(dataset)
         self._absolute_frame_indices = self._build_absolute_frame_indices(dataset)
         self._source_to_local = (
@@ -170,22 +179,40 @@ class HindsightLabelDataset(Dataset):
             else {}
         )
         self._records: dict[int, dict[str, Tensor]] = {}
+        # Window-local artifacts keep one complete replay context per target
+        # window.  A frame can belong to several overlapping windows, so a
+        # single frame record is not expressive enough for counterfactual
+        # gates/noise/state labels.
+        self._window_records: dict[int, dict[str, Any]] = {}
         self._label_keys: tuple[str, ...] = ()
         self._templates: dict[str, Tensor] = {}
 
         payload = _read_label_file(self.label_path)
-        self._ingest_payload(payload)
-        if not self._records or not self._label_keys:
+        if isinstance(payload, Mapping) and isinstance(payload.get("metadata"), Mapping):
+            self.label_metadata = dict(payload["metadata"])
+            self.hd_window_local = bool(self.label_metadata.get("window_local", False))
+        if isinstance(payload, Mapping) and "windows" in payload:
+            self._ingest_window_records(payload["windows"])
+            # A window artifact may also carry ordinary frame columns for
+            # inspection/backward compatibility.  Do not send the structural
+            # ``windows`` list through the columnar parser.
+            ordinary_payload = {key: value for key, value in payload.items() if key != "windows"}
+            if any(_canonical_label_key(key) is not None for key in ordinary_payload):
+                self._ingest_payload(ordinary_payload)
+        else:
+            self._ingest_payload(payload)
+        if not self._label_keys:
             raise ValueError(f"HD label artifact {self.label_path} contains no hd_* label columns")
+        self.hd_window_keyed = bool(self._window_records)
 
         missing = sorted(set(range(len(dataset))) - set(self._records))
-        if missing and self.strict:
+        if missing and self.strict and not self._window_records:
             preview = missing[:8]
             raise ValueError(
                 f"HD labels at {self.label_path} do not cover {len(missing)} of {len(dataset)} frames; "
                 f"first missing dataset indices: {preview}. Use aligned labels or strict=False."
             )
-        if self.strict:
+        if self.strict and not self._window_records:
             incomplete = [
                 index
                 for index, record in self._records.items()
@@ -209,9 +236,16 @@ class HindsightLabelDataset(Dataset):
         sample = dict(self.dataset[index])
         record = self._records.get(int(index))
         if record is None:
-            if self.strict:  # checked eagerly, retained for defensive use
+            if self.strict and not self._window_records:  # checked eagerly, retained for defensive use
                 raise IndexError(f"No HD labels for dataset index {index}")
-            record = {key: torch.zeros_like(template) for key, template in self._templates.items()}
+            record = {}
+            if not self._window_records:
+                record = {key: torch.zeros_like(template) for key, template in self._templates.items()}
+        # Window-keyed artifacts are attached by TailPreservingSequenceDataset
+        # after it knows the target/history context.  A direct frame lookup has
+        # no unambiguous record, so return the physical sample unchanged here.
+        if self._window_records and not record:
+            return sample
         for key in self._label_keys:
             value = record.get(key)
             if value is None:
@@ -230,6 +264,7 @@ class HindsightLabelDataset(Dataset):
         if name in {
             "dataset",
             "_records",
+            "_window_records",
             "_label_keys",
             "_templates",
             "_source_to_local",
@@ -245,6 +280,70 @@ class HindsightLabelDataset(Dataset):
     @property
     def label_keys(self) -> tuple[str, ...]:
         return self._label_keys
+
+    def get_window_labels(
+        self,
+        target_start: int,
+        history_start: int,
+        window_length: int,
+    ) -> dict[int, dict[str, Tensor]] | None:
+        """Return labels for the exact sequence window requested by the sampler.
+
+        ``target_start``/``history_start`` are indices in the selected (and
+        possibly episode-subset) dataset view.  Artifacts are keyed by source
+        ``global_index`` so they remain valid when LeRobot reindexes a subset.
+        ``None`` means this is an ordinary frame-level artifact or the window
+        was not generated by the collector.
+        """
+
+        if not self._window_records:
+            return None
+        if target_start < 0 or target_start >= len(self.dataset):
+            raise IndexError(f"target_start {target_start} is outside the dataset")
+        if self._absolute_frame_indices is None:
+            source_target = int(target_start)
+        else:
+            source_target = int(self._absolute_frame_indices[target_start])
+        window = self._window_records.get(source_target)
+        if window is None:
+            if self.strict:
+                raise KeyError(
+                    "No window-local HD labels for target source frame "
+                    f"{source_target}; regenerate labels with the same sampler settings"
+                )
+            return None
+        expected_length = int(window["length"])
+        if expected_length != int(window_length):
+            raise ValueError(
+                "Window-local HD label length mismatch: artifact="
+                f"{expected_length}, sampler={window_length}"
+            )
+        expected_history = int(window["history_start_source"])
+        actual_history = (
+            int(self._absolute_frame_indices[history_start])
+            if self._absolute_frame_indices is not None
+            else int(history_start)
+        )
+        if expected_history != actual_history:
+            raise ValueError(
+                "Window-local HD history mismatch: artifact="
+                f"{expected_history}, sampler={actual_history}"
+            )
+        source_indices = window["source_indices"]
+        labels = window["labels"]
+        result: dict[int, dict[str, Tensor]] = {}
+        for row, source_index_value in enumerate(source_indices):
+            source_index = _scalar_int(source_index_value, name="window global_index")
+            local_index = self._source_to_local.get(source_index, source_index)
+            if not 0 <= local_index < len(self.dataset):
+                raise ValueError(
+                    f"Window-local label source frame {source_index} is not in the selected dataset"
+                )
+            result[local_index] = {
+                key: _as_cpu_tensor(value)[row]
+                for key, value in labels.items()
+            }
+        return result
 
     # ------------------------------------------------------------------
     # Episode/index resolution
@@ -476,6 +575,77 @@ class HindsightLabelDataset(Dataset):
             if key not in self._templates:
                 self._templates[key] = tensor
         self._label_keys = tuple(sorted(set(self._label_keys).union(values)))
+
+    def _ingest_window_records(self, windows: Any) -> None:
+        """Load a window-keyed artifact without collapsing it to frame rows."""
+
+        if not isinstance(windows, Sequence) or isinstance(windows, (str, bytes, bytearray)):
+            raise ValueError("Window-local HD artifact 'windows' must be a record sequence")
+        for position, raw_window in enumerate(windows):
+            if not isinstance(raw_window, Mapping):
+                raise ValueError(f"Window-local record {position} must be a mapping")
+            raw_target = _mapping_value(
+                raw_window,
+                ("target_global_index", "target_index", "global_index"),
+            )
+            if raw_target is None:
+                raise ValueError(
+                    f"Window-local record {position} needs target_global_index"
+                )
+            target_source = _scalar_int(raw_target, name="target_global_index")
+            if self._source_to_local and target_source not in self._source_to_local:
+                # The artifact may intentionally contain a superset of the
+                # selected episodes.  Ignore windows outside this view rather
+                # than making a subset training run impossible.
+                continue
+            source_values = raw_window.get("source_indices", raw_window.get("global_indices"))
+            if source_values is None:
+                raise ValueError(f"Window-local record {position} needs source_indices")
+            source_tensor = _as_cpu_tensor(source_values).reshape(-1)
+            row_count = int(source_tensor.numel())
+            if row_count <= 0:
+                raise ValueError(f"Window-local record {position} has no context rows")
+            raw_labels = raw_window.get("labels", raw_window)
+            if not isinstance(raw_labels, Mapping):
+                raise ValueError(f"Window-local record {position} labels must be a mapping")
+            columns = self._label_columns(raw_labels)
+            if not columns:
+                raise ValueError(f"Window-local record {position} has no hd_* labels")
+            labels: dict[str, Tensor] = {}
+            for key, value in columns.items():
+                tensor = _as_cpu_tensor(value)
+                if tensor.ndim == 0:
+                    tensor = tensor.expand(row_count)
+                elif int(tensor.shape[0]) != row_count:
+                    raise ValueError(
+                        f"Window-local label {key!r} in record {position} has first dimension "
+                        f"{tensor.shape[0]}, expected {row_count}"
+                    )
+                labels[key] = tensor
+                if key not in self._templates:
+                    self._templates[key] = tensor[0]
+            if target_source not in set(int(value) for value in source_tensor.tolist()):
+                raise ValueError(
+                    f"Window-local target {target_source} is not present in its source_indices"
+                )
+            history_source = raw_window.get("history_start_source", source_tensor[0])
+            history_source = _scalar_int(history_source, name="history_start_source")
+            length = _scalar_int(raw_window.get("length", row_count), name="window length")
+            if length != row_count:
+                raise ValueError(
+                    f"Window-local record {position} length={length} but has {row_count} rows"
+                )
+            if target_source in self._window_records:
+                raise ValueError(
+                    f"Duplicate window-local target source frame {target_source}"
+                )
+            self._window_records[target_source] = {
+                "length": length,
+                "history_start_source": history_source,
+                "source_indices": source_tensor,
+                "labels": labels,
+            }
+            self._label_keys = tuple(sorted(set(self._label_keys).union(labels)))
 
     @staticmethod
     def _row_value(value: Any, row: int, row_count: int) -> Any:
