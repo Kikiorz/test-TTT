@@ -128,6 +128,8 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
         "dataset_repo_id",
         "action_chunk_size",
         "max_action_dim",
+        "fps",
+        "frame_batch_size",
         "checkpoint",
         "teacher_checkpoint",
         "teacher_policy_type",

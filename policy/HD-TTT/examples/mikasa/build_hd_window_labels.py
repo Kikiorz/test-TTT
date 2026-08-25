@@ -381,6 +381,8 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
         "teacher_ttt_num_register_tokens",
         "action_chunk_size",
         "max_action_dim",
+        "fps",
+        "frame_batch_size",
     )
     reference: dict[str, Any] | None = None
     for path, payload in zip(inputs, payloads, strict=True):

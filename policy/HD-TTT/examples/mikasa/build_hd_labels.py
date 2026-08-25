@@ -718,6 +718,8 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         "attribution_threshold",
         "action_chunk_size",
         "max_action_dim",
+        "fps",
+        "frame_batch_size",
     )
     reference_metadata: dict[str, Any] | None = None
     for path, payload in zip(inputs, payloads, strict=True):
