@@ -100,6 +100,10 @@ def test_long_horizon_window_cap_is_deterministic_and_episode_balanced() -> None
     assert len(sequences.window_specs) == 4
     assert sequences.window_specs[0] == (0, 16)
     assert sequences.window_specs[2] == (100, 16)
+    # Capped sampling must retain a complete terminal window rather than the
+    # one-frame tail that would be produced by the raw stride offsets.
+    assert sequences.window_specs[1] == (84, 16)
+    assert sequences.window_specs[3] == (119, 16)
 
 
 def test_history_warmup_masks_prefix_but_keeps_it_in_the_recurrent_window() -> None:

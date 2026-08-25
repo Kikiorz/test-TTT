@@ -103,9 +103,18 @@ class TailPreservingSequenceDataset(Dataset):
             offsets = list(range(0, episode_length, sequence_stride))
             if max_windows_per_episode is not None and len(offsets) > max_windows_per_episode:
                 # Deterministic, episode-local coverage: retain evenly spaced
-                # windows and always include the first window.  The default
-                # remains the full tail-preserving set, so this only changes
-                # explicitly requested long-horizon speed ablations.
+                # *full* windows and always include the first and terminal
+                # windows.  Sampling raw ``range(0, length, stride)`` offsets
+                # can otherwise select a one-frame tail (e.g. length=513,
+                # stride=64), leaving the terminal phase almost unobserved.
+                # The default remains the full tail-preserving set, so this
+                # only changes explicitly requested speed/episode-balanced
+                # ablations.
+                last_full_offset = max(episode_length - sequence_length, 0)
+                full_offsets = list(range(0, last_full_offset + 1, sequence_stride))
+                if not full_offsets or full_offsets[-1] != last_full_offset:
+                    full_offsets.append(last_full_offset)
+                offsets = full_offsets
                 positions = torch.linspace(
                     0,
                     len(offsets) - 1,
