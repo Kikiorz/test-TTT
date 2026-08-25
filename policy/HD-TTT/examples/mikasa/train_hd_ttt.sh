@@ -2,11 +2,11 @@
 
 # Reproducible MIKASA HD-TTT training recipe.
 #
-# The default recipe is episode-balanced: one 64-frame window per episode and
-# 150 passes over the 250 demonstrations.  This keeps the recurrent update
-# causal while making the experiment runnable on a single 4xRTX5090 node.  Set
-# MAX_WINDOWS_PER_EPISODE=none to use every tail-preserving window (the strict
-# full-coverage setting; substantially more expensive for the Long task).
+# The default recipe is episode-balanced: four evenly spaced 64-frame windows
+# per long episode and 150 passes over the 250 demonstrations.  This keeps the
+# recurrent update causal while covering the beginning, middle, and terminal
+# phases of the Long task. Set MAX_WINDOWS_PER_EPISODE=none to use every
+# tail-preserving window (the strict full-coverage setting; more expensive).
 
 set -euo pipefail
 
@@ -22,7 +22,7 @@ EPOCHS="${EPOCHS:-150}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-64}"
 SEQUENCE_STRIDE="${SEQUENCE_STRIDE:-64}"
-MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-1}"
+MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-4}"
 TBPTT_SEGMENT_LENGTH="${TBPTT_SEGMENT_LENGTH:-32}"
 TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
