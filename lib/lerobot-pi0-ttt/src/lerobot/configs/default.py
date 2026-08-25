@@ -73,8 +73,12 @@ class EvalConfig:
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
     # Defaults to True; automatically downgraded to SyncVectorEnv when batch_size=1.
     use_async_envs: bool = True
+    # Maximum number of evaluation episodes to save as videos. Set to 0 to disable rendering.
+    max_episodes_rendered: int = 10
 
     def __post_init__(self) -> None:
+        if self.max_episodes_rendered < 0:
+            raise ValueError("max_episodes_rendered must be non-negative")
         if self.batch_size == 0:
             self.batch_size = self._auto_batch_size()
         if self.batch_size > self.n_episodes:
