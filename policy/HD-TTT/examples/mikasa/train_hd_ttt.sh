@@ -124,4 +124,10 @@ LAUNCH=(
 )
 
 cd "${REPO_ROOT}"
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  printf 'DRY RUN:'
+  printf ' %q' "${LAUNCH[@]}" "${COMMON_ARGS[@]}"
+  printf '\n'
+  exit 0
+fi
 exec "${LAUNCH[@]}" "${COMMON_ARGS[@]}"
