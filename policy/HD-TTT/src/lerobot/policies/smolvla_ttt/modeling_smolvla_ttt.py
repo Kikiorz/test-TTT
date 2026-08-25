@@ -88,6 +88,9 @@ _CHECKPOINT_ARCHITECTURE_FIELDS = {
     "hd_attribution_threshold",
     "hd_attribution_topk",
     "hd_counterfactual_margin",
+    "hd_write_gate_weight",
+    "hd_write_gate_init",
+    "hd_learned_write_gate",
 }
 
 
@@ -97,9 +100,40 @@ def _restore_checkpoint_model_fields(
     raw_config: dict,
 ) -> None:
     """Restore every checkpoint-owned field that affects model structure or TTT behavior."""
+    # A caller may intentionally turn HD-TTT on while initializing from an
+    # ordinary TTT checkpoint (the normal baseline -> HD fine-tuning path).
+    # Preserve that explicit opt-in across the structural checkpoint merge;
+    # otherwise the source's ``hd_ttt_enabled=false`` silently disables the
+    # new objective and learned gate.
+    hd_field_names = {
+        "hd_ttt_enabled",
+        "hd_hca_weight",
+        "hd_h2l_weight",
+        "hd_grounding_weight",
+        "hd_invariance_weight",
+        "hd_event_block_size",
+        "hd_attribution_threshold",
+        "hd_attribution_topk",
+        "hd_counterfactual_margin",
+        "hd_write_gate_weight",
+        "hd_write_gate_init",
+        "hd_learned_write_gate",
+    }
+    requested_hd = {
+        name: getattr(config, name)
+        for name in hd_field_names
+        if hasattr(config, name)
+    }
+    explicit_hd_opt_in = bool(
+        requested_hd.get("hd_ttt_enabled", False)
+        or requested_hd.get("hd_learned_write_gate", False)
+    )
     for field_name in _CHECKPOINT_ARCHITECTURE_FIELDS:
         if field_name in raw_config:
             setattr(config, field_name, getattr(source_config, field_name))
+    if explicit_hd_opt_in:
+        for field_name, value in requested_hd.items():
+            setattr(config, field_name, value)
     config.__post_init__()
 
 
@@ -109,6 +143,7 @@ def _validate_checkpoint_keys(
     *,
     source_is_ttt: bool,
     strict: bool,
+    source_has_learned_write_gate: bool = False,
 ) -> None:
     """Allow new TTT tensors to be absent only when converting a base SmolVLA checkpoint."""
     allowed_base_missing = [
@@ -116,9 +151,20 @@ def _validate_checkpoint_keys(
         for key in missing_keys
         if key.startswith("model.ttt_layers.") or key == "model.register_tokens"
     ]
-    disallowed_missing = [key for key in missing_keys if key not in allowed_base_missing]
+    # Older SmolVLA-TTT checkpoints predate the optional HD gate head.  They
+    # remain loadable when the caller explicitly enables that extension, while
+    # a checkpoint that declares the head is still checked strictly.
+    allowed_gate_extension = [
+        key
+        for key in missing_keys
+        if ".write_gate_head." in key and not source_has_learned_write_gate
+    ]
+    allowed_missing = set(allowed_base_missing) | set(allowed_gate_extension)
+    disallowed_missing = [key for key in missing_keys if key not in allowed_missing]
     require_exact_checkpoint = source_is_ttt or strict
-    if unexpected_keys or disallowed_missing or (require_exact_checkpoint and missing_keys):
+    if unexpected_keys or disallowed_missing or (
+        require_exact_checkpoint and any(key not in allowed_gate_extension for key in missing_keys)
+    ):
         raise RuntimeError(
             f"Incompatible SmolVLA checkpoint: missing={missing_keys}, unexpected={unexpected_keys}"
         )
@@ -391,6 +437,9 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             list(unexpected_keys),
             source_is_ttt=source_is_ttt,
             strict=strict,
+            source_has_learned_write_gate=bool(
+                raw_config.get("hd_learned_write_gate", False)
+            ),
         )
         if missing_keys:
             logging.info(
@@ -736,6 +785,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         wrong_student_velocity: Tensor | None = None,
         grounding_student_velocity: Tensor | None = None,
         local_ttt_loss: Tensor | None = None,
+        predicted_write_gate: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         """Compute optional HD terms from training-only teacher/intervention labels.
 
@@ -764,6 +814,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         h2l_weight = float(getattr(self.config, "hd_h2l_weight", 1.0))
         grounding_weight = float(getattr(self.config, "hd_grounding_weight", 1.0))
         invariance_weight = float(getattr(self.config, "hd_invariance_weight", 1.0))
+        write_gate_weight = float(getattr(self.config, "hd_write_gate_weight", 1.0))
         counterfactual_margin = float(getattr(self.config, "hd_counterfactual_margin", 0.0))
         valid_steps = self._hd_valid_step_weight(
             batch,
@@ -865,6 +916,33 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 kvb = local_kvb_loss(local_query, local_key, local_value, local_prediction, local_gate)
                 total = total + h2l_weight * kvb
                 metrics["hd_h2l"] = float(kvb.detach().item())
+
+        # Hindsight ``u_i`` is available only offline.  Distill it into the
+        # causal gate predicted from the current interaction so deployment
+        # does not need labels or a teacher.  The target is detached and the
+        # same valid-step mask used by action loss handles padded chunks.
+        if predicted_write_gate is not None and batch.get("hd_write_gate") is not None:
+            predicted_gate = self._reshape_hd_field(
+                predicted_write_gate,
+                sequence_shape,
+                name="predicted_write_gate",
+            ).to(device=student_velocity.device, dtype=student_velocity.dtype).clamp(0, 1)
+            target_gate = self._hd_step_weight(
+                self._reshape_hd_field(batch.get("hd_write_gate"), sequence_shape, name="hd_write_gate"),
+                (B, T),
+                device=student_velocity.device,
+                dtype=student_velocity.dtype,
+                name="hd_write_gate",
+            )
+            if target_gate is not None:
+                gate_error = F.smooth_l1_loss(
+                    predicted_gate,
+                    target_gate.detach().clamp(0, 1),
+                    reduction="none",
+                )
+                gate_loss = self._hd_weighted_mean(gate_error, valid_steps)
+                total = total + write_gate_weight * gate_loss
+                metrics["hd_gate"] = float(gate_loss.detach().item())
 
         if wrong_student_velocity is not None:
             grounding_student = (
@@ -984,13 +1062,25 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         actions = self.prepare_action(batch)
-        hd_fields_present = self.config.hd_ttt_enabled and any(
-            key.startswith("hd_") for key in batch
+        # ``hd_ttt_enabled`` is an architecture/deployment switch, while
+        # ``hd_labels_present`` only indicates that this training batch carries
+        # hindsight teacher fields.  Keeping them separate is essential:
+        # an HD checkpoint must use its learned local gate at deployment even
+        # though no offline labels are available then.
+        hd_enabled = bool(getattr(self.config, "hd_ttt_enabled", False))
+        hd_labels_present = hd_enabled and any(
+            key in batch
+            for key in (
+                "hd_teacher_velocity",
+                "hd_write_gate",
+                "hd_noise",
+                "hd_time",
+            )
         )
         # A hindsight collector may store the exact flow phase/noise used by
         # its causal teacher.  Reusing them makes HCA distillation phase
         # matched; ordinary TTT batches continue to sample fresh values.
-        if noise is None and hd_fields_present and batch.get("hd_noise") is not None:
+        if noise is None and hd_labels_present and batch.get("hd_noise") is not None:
             labeled_noise = self._reshape_hd_field(
                 batch["hd_noise"], sequence_shape, name="hd_noise"
             )
@@ -1027,7 +1117,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             noise = labeled_noise.reshape_as(actions)
         if noise is None:
             noise = self.model.sample_noise(actions.shape, actions.device)
-        if time is None and hd_fields_present and batch.get("hd_time") is not None:
+        if time is None and hd_labels_present and batch.get("hd_time") is not None:
             labeled_time = self._reshape_hd_field(
                 batch["hd_time"], sequence_shape, name="hd_time"
             ).to(device=actions.device, dtype=torch.float32)
@@ -1041,12 +1131,25 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
 
         hd_write_gate = self._reshape_hd_field(
             batch.get("hd_write_gate"), sequence_shape, name="hd_write_gate"
-        ) if hd_fields_present else None
+        ) if hd_labels_present else None
         if hd_write_gate is not None:
             hd_write_gate = hd_write_gate.clamp(0, 1)
-        initial_fast_states = self._clone_fast_states(fast_states) if hd_fields_present else None
-        if hd_fields_present:
-            student_velocity, fast_states, local_ttt_loss = self.model.forward_with_state(
+        learned_write_gate = bool(
+            hd_enabled and getattr(self.config, "hd_learned_write_gate", False)
+        )
+        if learned_write_gate and hd_labels_present and hd_write_gate is None:
+            raise ValueError(
+                "HD learned-gate training requires the frame-aligned 'hd_write_gate' label"
+            )
+        initial_fast_states = self._clone_fast_states(fast_states) if hd_labels_present else None
+        if hd_enabled:
+            # In the learned-gate variant hindsight ``u_i`` is a target, not
+            # an online input.  The main writer therefore uses only its local
+            # prediction; the labels remain available to the auxiliary gate
+            # distillation loss.  The legacy HD path (gate disabled) retains
+            # the direct label override for backwards compatibility.
+            writer_gate_override = None if learned_write_gate else hd_write_gate
+            forward_result = self.model.forward_with_state(
                 images,
                 img_masks,
                 lang_tokens,
@@ -1057,10 +1160,24 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 time,
                 sequence_shape=sequence_shape,
                 fast_states=fast_states,
-                write_gate=hd_write_gate,
+                write_gate=writer_gate_override,
                 return_velocity=True,
-                return_local_loss=True,
+                return_local_loss=hd_labels_present,
+                use_learned_write_gate=learned_write_gate,
+                return_write_gate=learned_write_gate,
             )
+            if hd_labels_present and learned_write_gate:
+                student_velocity, fast_states, local_ttt_loss, predicted_write_gate = forward_result
+            elif hd_labels_present:
+                student_velocity, fast_states, local_ttt_loss = forward_result
+                predicted_write_gate = None
+            elif learned_write_gate:
+                student_velocity, fast_states, predicted_write_gate = forward_result
+                local_ttt_loss = None
+            else:
+                student_velocity, fast_states = forward_result
+                local_ttt_loss = None
+                predicted_write_gate = None
             flow_target = noise - actions
             losses = F.mse_loss(flow_target, student_velocity, reduction="none")
             wrong_student_velocity = None
@@ -1101,9 +1218,10 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     sequence_shape=sequence_shape,
                     fast_states=grounding_initial_states,
                     create_graph=False,
-                    write_gate=hd_write_gate,
+                    write_gate=None if learned_write_gate else hd_write_gate,
                     detach_writer=True,
                     return_velocity=True,
+                    use_learned_write_gate=learned_write_gate,
                 )
                 wrong_initial_states = self._clone_fast_states(
                     initial_fast_states,
@@ -1125,6 +1243,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     write_gate=wrong_gate,
                     detach_writer=True,
                     return_velocity=True,
+                    use_learned_write_gate=learned_write_gate,
                 )
             hd_aux_loss, hd_metrics = self._hd_auxiliary_losses(
                 batch,
@@ -1133,6 +1252,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 wrong_student_velocity=wrong_student_velocity,
                 grounding_student_velocity=grounding_student_velocity,
                 local_ttt_loss=local_ttt_loss,
+                predicted_write_gate=predicted_write_gate,
             )
         else:
             losses, fast_states = self.model.forward_with_state(
@@ -1406,6 +1526,7 @@ class SmolVLATTTFlowMatching(nn.Module):
         ]
         if invalid_layers:
             raise ValueError(f"No SmolVLA action-expert layer exists at TTT indices {invalid_layers}")
+        self.write_gate_layer_index = min(config.resolved_ttt_layer_indices)
         self.ttt_layers = nn.ModuleDict(
             {
                 str(layer_index): TTTMLPLayer(
@@ -1416,6 +1537,17 @@ class SmolVLATTTFlowMatching(nn.Module):
                     gate_trainable=config.trains_gate,
                     rope_theta=config.ttt_rope_theta,
                     second_order=config.ttt_second_order,
+                    # One scalar gate is shared by all selected TTT layers for
+                    # each physical interaction.  Predict it at the first
+                    # selected layer so later layers cannot disagree about
+                    # what was written to the recurrent state.
+                    learned_write_gate=(
+                        config.hd_ttt_enabled
+                        and config.hd_learned_write_gate
+                        and layer_index == self.write_gate_layer_index
+                    ),
+                    write_gate_init=config.hd_write_gate_init,
+                    write_gate_token_index=config.ttt_num_register_tokens,
                 )
                 for layer_index in config.resolved_ttt_layer_indices
             }
@@ -1487,6 +1619,8 @@ class SmolVLATTTFlowMatching(nn.Module):
         detach_writer: bool = False,
         return_local_loss: bool = False,
         local_loss_accumulator: list[Tensor] | None = None,
+        use_learned_write_gate: bool = False,
+        write_gate_accumulator: list[Tensor] | None = None,
     ):
         """Build an expert callback, optionally collecting H2L writer losses.
 
@@ -1498,7 +1632,13 @@ class SmolVLATTTFlowMatching(nn.Module):
         """
         batch_size, sequence_length = sequence_shape
 
+        # The learned gate is deliberately shared by all selected layers.  A
+        # closure-local cache ensures the first selected layer computes one
+        # scalar per physical interaction and every later layer reuses it.
+        predicted_write_gate: Tensor | None = None
+
         def apply_ttt(layer_index: int, hidden_states: Tensor) -> Tensor:
+            nonlocal predicted_write_gate
             layer_key = str(layer_index)
             if layer_key not in self.ttt_layers:
                 return hidden_states
@@ -1511,6 +1651,17 @@ class SmolVLATTTFlowMatching(nn.Module):
                 batch_size, sequence_length, hidden_states.shape[1], hidden_states.shape[2]
             )
             layer_write_gate = write_gate
+            if use_learned_write_gate and update:
+                if predicted_write_gate is None:
+                    if layer_index != self.write_gate_layer_index:
+                        raise RuntimeError(
+                            "The shared HD write gate must be predicted at the first selected TTT layer"
+                        )
+                    predicted_write_gate = self.ttt_layers[layer_key].predict_write_gate(sequence)
+                    if write_gate_accumulator is not None:
+                        write_gate_accumulator.append(predicted_write_gate)
+                learned_gate = predicted_write_gate.detach() if detach_writer else predicted_write_gate
+                layer_write_gate = learned_gate if write_gate is None else learned_gate * write_gate
             if layer_write_gate is not None:
                 if layer_write_gate.shape != (batch_size, sequence_length):
                     raise ValueError(
@@ -1829,7 +1980,14 @@ class SmolVLATTTFlowMatching(nn.Module):
         detach_writer: bool = False,
         return_velocity: bool = False,
         return_local_loss: bool = False,
-    ) -> tuple[Tensor, TTTFastStates] | tuple[Tensor, TTTFastStates, Tensor]:
+        use_learned_write_gate: bool = False,
+        return_write_gate: bool = False,
+    ) -> (
+        tuple[Tensor, TTTFastStates]
+        | tuple[Tensor, TTTFastStates, Tensor]
+        | tuple[Tensor, TTTFastStates, Tensor]
+        | tuple[Tensor, TTTFastStates, Tensor, Tensor]
+    ):
         """Run flow matching while optionally exposing the local H2L loss.
 
         The default two-item return is unchanged.  With
@@ -1841,6 +1999,7 @@ class SmolVLATTTFlowMatching(nn.Module):
         """
         fast_states = {} if fast_states is None else dict(fast_states)
         local_loss_parts: list[Tensor] | None = [] if return_local_loss else None
+        write_gate_parts: list[Tensor] | None = [] if return_write_gate else None
         callback = self._make_expert_layer_callback(
             sequence_shape,
             fast_states,
@@ -1850,6 +2009,8 @@ class SmolVLATTTFlowMatching(nn.Module):
             detach_writer=detach_writer,
             return_local_loss=return_local_loss,
             local_loss_accumulator=local_loss_parts,
+            use_learned_write_gate=use_learned_write_gate,
+            write_gate_accumulator=write_gate_parts,
         )
         losses = self.forward(
             images,
@@ -1863,13 +2024,25 @@ class SmolVLATTTFlowMatching(nn.Module):
             expert_layer_callback=callback,
             return_velocity=return_velocity,
         )
-        if not return_local_loss:
-            return losses, fast_states
-        if local_loss_parts:
-            local_loss = torch.stack(local_loss_parts, dim=0).mean(dim=0)
-        else:
-            local_loss = losses.new_zeros(sequence_shape)
-        return losses, fast_states, local_loss
+        local_loss = None
+        if return_local_loss:
+            if local_loss_parts:
+                local_loss = torch.stack(local_loss_parts, dim=0).mean(dim=0)
+            else:
+                local_loss = losses.new_zeros(sequence_shape)
+        predicted_gate = None
+        if return_write_gate:
+            if write_gate_parts:
+                predicted_gate = torch.stack(write_gate_parts, dim=0).mean(dim=0)
+            else:
+                predicted_gate = losses.new_ones(sequence_shape)
+        if return_local_loss and return_write_gate:
+            return losses, fast_states, local_loss, predicted_gate
+        if return_local_loss:
+            return losses, fast_states, local_loss
+        if return_write_gate:
+            return losses, fast_states, predicted_gate
+        return losses, fast_states
 
     def sample_actions(
         self,
@@ -1975,6 +2148,10 @@ class SmolVLATTTFlowMatching(nn.Module):
                 fast_states,
                 update=update,
                 create_graph=False,
+                use_learned_write_gate=(
+                    getattr(self.config, "hd_ttt_enabled", False)
+                    and getattr(self.config, "hd_learned_write_gate", False)
+                ),
             )
 
         actions = self.sample_actions(

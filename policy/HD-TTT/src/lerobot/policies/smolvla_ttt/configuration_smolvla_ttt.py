@@ -153,6 +153,13 @@ class SmolVLATTTConfig(PreTrainedConfig):
     hd_attribution_threshold: float = 0.0
     hd_attribution_topk: int = 8
     hd_counterfactual_margin: float = 0.05
+    # Hindsight labels supervise a local, causal predictor of whether the
+    # current interaction should be written to fast weights.  The predictor
+    # is enabled only when ``hd_ttt_enabled`` is true; ordinary SmolVLA/TTT
+    # checkpoints therefore keep their original update path exactly.
+    hd_write_gate_weight: float = 1.0
+    hd_write_gate_init: float = 0.95
+    hd_learned_write_gate: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -206,9 +213,12 @@ class SmolVLATTTConfig(PreTrainedConfig):
             "hd_invariance_weight",
             "hd_attribution_threshold",
             "hd_counterfactual_margin",
+            "hd_write_gate_weight",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
+        if not 0 < self.hd_write_gate_init < 1:
+            raise ValueError("hd_write_gate_init must be strictly between 0 and 1")
         if self.hd_event_block_size <= 0:
             raise ValueError("hd_event_block_size must be positive")
         if self.hd_attribution_topk < 0:

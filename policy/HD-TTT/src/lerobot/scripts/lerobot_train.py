@@ -756,7 +756,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
     if is_smolvla_ttt and getattr(cfg.policy, "hd_ttt_enabled", False):
-        for metric_name in ("hd_hca", "hd_h2l", "hd_grounding"):
+        for metric_name in ("hd_hca", "hd_h2l", "hd_gate", "hd_grounding"):
             train_metrics[metric_name] = AverageMeter(metric_name, ":.3f")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
@@ -819,7 +819,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 sample_weighter=sample_weighter,
             )
         if is_smolvla_ttt and cfg.policy.hd_ttt_enabled:
-            for metric_name in ("hd_hca", "hd_h2l", "hd_grounding"):
+            for metric_name in ("hd_hca", "hd_h2l", "hd_gate", "hd_grounding"):
                 if metric_name in output_dict:
                     setattr(train_tracker, metric_name, output_dict[metric_name])
 

@@ -78,6 +78,9 @@ class TTTMLPLayer(nn.Module):
         gate_trainable: bool = False,
         rope_theta: float = 10_000.0,
         second_order: bool = True,
+        learned_write_gate: bool = False,
+        write_gate_init: float = 0.95,
+        write_gate_token_index: int = 0,
     ) -> None:
         super().__init__()
         if dim <= 0 or hidden_dim <= 0:
@@ -88,16 +91,29 @@ class TTTMLPLayer(nn.Module):
             raise ValueError("effective_gate_init must be in [0, 1)")
         if rope_theta <= 0:
             raise ValueError("rope_theta must be positive")
+        if not 0 < write_gate_init < 1:
+            raise ValueError("write_gate_init must be strictly between 0 and 1")
+        if write_gate_token_index < 0:
+            raise ValueError("write_gate_token_index must be non-negative")
 
         self.dim = dim
         self.hidden_dim = hidden_dim
         self.base_inner_lr = base_inner_lr
         self.rope_theta = rope_theta
         self.second_order = second_order
+        self.learned_write_gate = learned_write_gate
+        self.write_gate_token_index = write_gate_token_index
+        self.write_gate_init = write_gate_init
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
+        # This head is intentionally local to the TTT layer and is only
+        # constructed for the HD-TTT learned-gate variant.  The input is the
+        # first action token (after any register prefix); the causal suffix
+        # mask guarantees that it can read the observation prefix and its own
+        # current candidate action, but no future action token.
+        self.write_gate_head = nn.Linear(dim, 1) if learned_write_gate else None
 
         self.fast_w1_init = nn.Parameter(torch.empty(hidden_dim, dim))
         self.fast_b1_init = nn.Parameter(torch.empty(hidden_dim))
@@ -112,6 +128,14 @@ class TTTMLPLayer(nn.Module):
     def reset_parameters(self) -> None:
         for projection in (self.q_proj, self.k_proj, self.v_proj):
             nn.init.xavier_uniform_(projection.weight)
+
+        if self.write_gate_head is not None:
+            # Start close to the original ungated update.  Zero input weights
+            # make the first HD steps stable while the hindsight gate loss
+            # teaches the head which interactions deserve long-term memory.
+            nn.init.zeros_(self.write_gate_head.weight)
+            init_logit = math.log(self.write_gate_init / (1.0 - self.write_gate_init))
+            nn.init.constant_(self.write_gate_head.bias, init_logit)
 
         nn.init.kaiming_uniform_(self.fast_w1_init, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.fast_w2_init, a=math.sqrt(5))
@@ -157,6 +181,32 @@ class TTTMLPLayer(nn.Module):
         """Project an interaction into the local K/V write objective."""
         normalized_inputs = F.layer_norm(inputs, (self.dim,))
         return self.k_proj(normalized_inputs), self.v_proj(normalized_inputs)
+
+    def predict_write_gate(self, inputs: Tensor) -> Tensor:
+        """Predict a causal scalar write gate for each physical timestep.
+
+        ``inputs`` has shape ``[B,T,N,D]``.  Only one action slot is read,
+        rather than pooling the complete 50-action chunk: pooling all slots
+        would expose future candidate actions during training and make the
+        hindsight target unavailable at deployment.  The returned ``[B,T]``
+        gate remains differentiable for the local distillation loss.
+        """
+
+        if self.write_gate_head is None:
+            raise RuntimeError("predict_write_gate requires learned_write_gate=True")
+        if inputs.ndim != 4 or inputs.shape[-1] != self.dim:
+            raise ValueError(
+                f"Expected [B,T,N,{self.dim}] inputs, got {tuple(inputs.shape)}"
+            )
+        if self.write_gate_token_index >= inputs.shape[2]:
+            raise ValueError(
+                f"write_gate_token_index={self.write_gate_token_index} is outside token axis "
+                f"of length {inputs.shape[2]}"
+            )
+        token = inputs[:, :, self.write_gate_token_index, :]
+        token = F.layer_norm(token, (self.dim,))
+        token = token.to(dtype=self.write_gate_head.weight.dtype)
+        return torch.sigmoid(self.write_gate_head(token).squeeze(-1))
 
     def _update(
         self,

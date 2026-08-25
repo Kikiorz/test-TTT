@@ -153,6 +153,7 @@ def test_gate_is_fixed_during_ttt_only_stage() -> None:
 
     assert not layer.gate.requires_grad
     torch.testing.assert_close(layer.effective_gate, torch.full((8,), 0.05), rtol=0, atol=1e-7)
+    assert layer.write_gate_head is None
 
 
 def test_fast_state_carries_across_detached_tbptt_segments() -> None:
@@ -188,6 +189,67 @@ def test_frozen_teacher_still_computes_local_fast_weight_updates() -> None:
     assert torch.isfinite(outputs).all()
     assert state.position.tolist() == [2]
     assert all(not parameter.requires_grad for parameter in layer.parameters())
+
+
+def test_learned_write_gate_is_causal_and_initializes_near_full_write() -> None:
+    torch.manual_seed(21)
+    layer = TTTMLPLayer(
+        dim=8,
+        hidden_dim=16,
+        second_order=False,
+        learned_write_gate=True,
+        write_gate_init=0.95,
+        write_gate_token_index=2,
+    )
+    inputs = torch.randn(2, 3, 5, 8, dtype=torch.float32)
+    gates = layer.predict_write_gate(inputs)
+    assert gates.shape == (2, 3)
+    assert torch.all((gates > 0) & (gates < 1))
+    torch.testing.assert_close(gates, torch.full_like(gates, 0.95), atol=1e-6, rtol=0)
+
+    # The head reads only token 2. Changing another (future) token cannot
+    # alter the local gate, which is the causal input contract used at deploy.
+    changed = inputs.clone()
+    changed[:, :, 4] += 100.0
+    torch.testing.assert_close(layer.predict_write_gate(changed), gates, atol=0, rtol=0)
+
+
+def test_learned_write_gate_controls_state_updates() -> None:
+    torch.manual_seed(22)
+    layer = TTTMLPLayer(
+        dim=8,
+        hidden_dim=16,
+        second_order=False,
+        learned_write_gate=True,
+        write_gate_init=0.5,
+        write_gate_token_index=0,
+    )
+    inputs = torch.randn(1, 2, 3, 8)
+    # Force a deterministic local prediction and compare against an explicit
+    # zero intervention.  Both runs must advance position, but only the
+    # learned-gate run mutates the fast weights.
+    with torch.no_grad():
+        layer.write_gate_head.weight.zero_()
+        layer.write_gate_head.bias.fill_(10.0)
+    predicted = layer.predict_write_gate(inputs)
+    _, learned_state = layer(
+        inputs,
+        update=True,
+        write_gate=predicted,
+        create_graph=False,
+    )
+    _, skipped_state = layer(
+        inputs,
+        state=layer.initial_state(1),
+        update=True,
+        write_gate=torch.zeros(1, 2),
+        create_graph=False,
+    )
+    assert learned_state.position.tolist() == skipped_state.position.tolist() == [1]
+    assert any(
+        not torch.equal(a, b)
+        for a, b in zip(learned_state.tensors(), skipped_state.tensors(), strict=True)
+    )
 
 
 def test_zero_write_gate_skips_fast_weight_mutation_but_advances_position() -> None:
@@ -300,6 +362,56 @@ def test_flow_forward_with_state_forwards_optional_local_loss() -> None:
     assert 0 in fast_states
     assert local_loss.shape == (1, 2)
     assert torch.isfinite(local_loss).all()
+
+
+def test_flow_forward_with_state_auto_injects_one_shared_learned_gate() -> None:
+    flow = SmolVLATTTFlowMatching.__new__(SmolVLATTTFlowMatching)
+    torch.nn.Module.__init__(flow)
+    flow.ttt_layers = torch.nn.ModuleDict(
+        {
+            "0": TTTMLPLayer(
+                dim=4,
+                hidden_dim=8,
+                second_order=False,
+                learned_write_gate=True,
+                write_gate_token_index=0,
+            ),
+            "1": TTTMLPLayer(dim=4, hidden_dim=8, second_order=False),
+        }
+    )
+    flow.write_gate_layer_index = 0
+
+    def fake_forward(
+        self,
+        *args,
+        expert_layer_callback=None,
+        return_velocity=False,
+        **kwargs,
+    ):
+        del self, args, kwargs, return_velocity
+        hidden = torch.randn(2, 3, 4, requires_grad=True)
+        expert_layer_callback(0, hidden)
+        expert_layer_callback(1, hidden)
+        return torch.zeros(2, 2, 3)
+
+    flow.forward = MethodType(fake_forward, flow)
+    losses, _, predicted_gate = flow.forward_with_state(
+        None,
+        None,
+        None,
+        None,
+        torch.zeros(2, 1),
+        torch.zeros(2, 2, 3),
+        torch.zeros(2, 2, 3),
+        torch.zeros(2),
+        sequence_shape=(1, 2),
+        return_velocity=True,
+        use_learned_write_gate=True,
+        return_write_gate=True,
+    )
+    assert losses.shape == (2, 2, 3)
+    assert predicted_gate.shape == (1, 2)
+    assert torch.all((predicted_gate > 0) & (predicted_gate < 1))
 
 
 def test_hindsight_attribution_is_causal_and_counterfactual_reader_is_teacher_detached() -> None:
@@ -492,6 +604,38 @@ def test_checkpoint_restore_uses_source_ttt_model_fields_but_keeps_training_stag
     for field_name, expected_value in raw_config.items():
         assert getattr(target, field_name) == expected_value
     assert target.ttt_training_stage == "action_head"
+
+
+def test_checkpoint_restore_preserves_explicit_hd_opt_in_over_clean_ttt_source() -> None:
+    source = SmolVLATTTConfig(hd_ttt_enabled=False, hd_learned_write_gate=False)
+    target = SmolVLATTTConfig(hd_ttt_enabled=True, hd_learned_write_gate=True)
+    raw_config = {
+        "type": "smolvla_ttt",
+        "hd_ttt_enabled": False,
+        "hd_learned_write_gate": False,
+    }
+
+    _restore_checkpoint_model_fields(target, source, raw_config)
+
+    assert target.hd_ttt_enabled is True
+    assert target.hd_learned_write_gate is True
+
+
+def test_old_ttt_checkpoint_may_omit_the_optional_gate_but_hd_checkpoint_may_not() -> None:
+    missing_gate = ["model.ttt_layers.12.write_gate_head.weight"]
+    _validate_checkpoint_keys(
+        missing_gate,
+        [],
+        source_is_ttt=True,
+        source_has_learned_write_gate=False,
+    )
+    with pytest.raises(RuntimeError, match="Incompatible SmolVLA checkpoint"):
+        _validate_checkpoint_keys(
+            missing_gate,
+            [],
+            source_is_ttt=True,
+            source_has_learned_write_gate=True,
+        )
 
 
 def test_ttt_checkpoint_missing_keys_are_always_rejected() -> None:
