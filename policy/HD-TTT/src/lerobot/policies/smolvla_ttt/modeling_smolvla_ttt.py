@@ -1068,15 +1068,10 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # an HD checkpoint must use its learned local gate at deployment even
         # though no offline labels are available then.
         hd_enabled = bool(getattr(self.config, "hd_ttt_enabled", False))
-        hd_labels_present = hd_enabled and any(
-            key in batch
-            for key in (
-                "hd_teacher_velocity",
-                "hd_write_gate",
-                "hd_noise",
-                "hd_time",
-            )
-        )
+        # Keep compatibility with older artifacts that only contain projected
+        # local K/V or counterfactual columns; phase/teacher fields are checked
+        # independently below when they are actually consumed.
+        hd_labels_present = hd_enabled and any(key.startswith("hd_") for key in batch)
         # A hindsight collector may store the exact flow phase/noise used by
         # its causal teacher.  Reusing them makes HCA distillation phase
         # matched; ordinary TTT batches continue to sample fresh values.

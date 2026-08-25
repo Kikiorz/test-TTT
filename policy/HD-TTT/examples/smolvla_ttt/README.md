@@ -39,6 +39,28 @@ HCA intervention labels are training-only. Deployment keeps the ordinary SmolVLA
 one update-then-apply fast-weight write per physical observation, and the recurrent state reset
 at episode boundaries.
 
+### Causal local write gate
+
+For the paper HD-TTT run, enable the learned gate as well:
+
+```bash
+--policy.hd_ttt_enabled=true --policy.hd_learned_write_gate=true
+```
+
+The first selected TTT layer predicts one scalar `g_t` in `(0,1)` from the first
+causal action slot of the current suffix (the slot after the register prefix). The
+same gate is used by every selected TTT layer. The offline `hd_write_gate`/`u_t`
+label is only a Smooth-L1 training target; it is never supplied at deployment. The
+first denoising step advances the fast state with the predicted gate and later
+denoising steps only read it. Since the first action slot cannot attend to later
+action slots, the gate has no access to future action-chunk tokens. `hd_ttt_enabled=false`
+does not construct or call this head, preserving the ordinary TTT path.
+
+When initializing HD-TTT from an existing clean TTT checkpoint, start a new run with
+`--policy.pretrained_path=<checkpoint>` and the two HD flags above. Do not resume the
+old optimizer state: the learned gate head is new and has no corresponding optimizer
+slots in the clean checkpoint.
+
 ### Loading offline labels
 
 Pass `--dataset.hd_label_path=/path/to/labels.pt` (or a directory containing
