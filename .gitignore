@@ -35,14 +35,13 @@ logs/
 *token*
 
 # Keep LeRobot source modules whose names overlap the artifact/credential rules above.
-!policy/lerobot-pi0-ttt/src/lerobot/datasets/
-!policy/lerobot-pi0-ttt/src/lerobot/datasets/**
-!policy/lerobot-pi0-ttt/src/lerobot/processor/tokenizer_processor.py
-!policy/lerobot-pi0-ttt/src/lerobot/scripts/lerobot_train_tokenizer.py
+!policy/Method1_lerobot-pi0-ttt/src/lerobot/datasets/
+!policy/Method1_lerobot-pi0-ttt/src/lerobot/datasets/**
+!policy/Method1_lerobot-pi0-ttt/src/lerobot/processor/tokenizer_processor.py
+!policy/Method1_lerobot-pi0-ttt/src/lerobot/scripts/lerobot_train_tokenizer.py
 
 # Editors and operating systems
 .DS_Store
 ._*
 .idea/
 .vscode/
-
