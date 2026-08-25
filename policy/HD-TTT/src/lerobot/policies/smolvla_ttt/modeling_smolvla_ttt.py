@@ -1181,6 +1181,13 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+            # LeRobot's offline loader can intentionally return uint8 images
+            # (the training loop normally converts them before preprocessing),
+            # while direct evaluation/label collection may call the policy
+            # without that loop.  Normalize here as a safe boundary so byte
+            # tensors never reach bilinear interpolation or the [-1, 1] cast.
+            if img.dtype == torch.uint8:
+                img = img.to(dtype=torch.float32) / 255.0
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
