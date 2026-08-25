@@ -108,6 +108,14 @@ def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
         )
     teacher_hd_ttt_enabled = raw.get("hd_ttt_enabled", False)
     teacher_hd_learned_write_gate = raw.get("hd_learned_write_gate", False)
+    # Early SmolVLA-TTT checkpoints serialized the newly introduced learned
+    # gate as JSON ``null``.  That value means "field absent" for those clean
+    # checkpoints, not an enabled HD gate; normalize it to the explicit clean
+    # value while retaining strict rejection of arbitrary malformed values.
+    if teacher_hd_ttt_enabled is None:
+        teacher_hd_ttt_enabled = False
+    if teacher_hd_learned_write_gate is None:
+        teacher_hd_learned_write_gate = False
     # Generated draccus configs use JSON booleans.  Reject malformed values
     # instead of allowing e.g. the string ``"false"`` to become truthy and
     # bypass the clean-teacher guard.
