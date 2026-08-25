@@ -115,33 +115,39 @@ def _load_policy(args: argparse.Namespace):
     # the source checkpoint's HD switches into the requested config; otherwise
     # an HD checkpoint would silently be evaluated as clean TTT.  CLI values
     # override the source flags and make clean-vs-HD ablations reproducible.
-    source_flags: dict[str, bool] = {}
+    source_config: dict[str, Any] = {}
     checkpoint_config = args.checkpoint / "config.json"
     if checkpoint_config.is_file():
         try:
-            raw_config = json.loads(checkpoint_config.read_text(encoding="utf-8"))
-            source_flags = {
-                name: bool(raw_config.get(name, False))
-                for name in ("hd_ttt_enabled", "hd_learned_write_gate")
-            }
+            source_config = json.loads(checkpoint_config.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError(f"Could not read checkpoint config {checkpoint_config}: {error}") from error
-    hd_enabled = source_flags.get("hd_ttt_enabled", False)
+    # Preserve every serialized HD hyperparameter (not just the two switches)
+    # so an evaluation checkpoint with non-default attribution/loss weights is
+    # evaluated under the same objective it was trained with.
+    valid_config_fields = set(SmolVLATTTConfig.__dataclass_fields__)
+    hd_kwargs = {
+        name: value
+        for name, value in source_config.items()
+        if name.startswith("hd_") and name in valid_config_fields
+    }
+    hd_enabled = bool(hd_kwargs.get("hd_ttt_enabled", False))
     if args.hd_ttt_enabled is not None:
         hd_enabled = bool(args.hd_ttt_enabled)
-    learned_gate = source_flags.get("hd_learned_write_gate", False)
+    learned_gate = bool(hd_kwargs.get("hd_learned_write_gate", False))
     if args.hd_learned_write_gate is not None:
         learned_gate = bool(args.hd_learned_write_gate)
     if learned_gate and not hd_enabled:
         raise ValueError("--hd-learned-write-gate requires --hd-ttt-enabled")
+    hd_kwargs["hd_ttt_enabled"] = hd_enabled
+    hd_kwargs["hd_learned_write_gate"] = learned_gate
     # ``make_policy`` first projects the dataset schema into policy features;
     # constructing ``from_pretrained`` directly would leave input_features
     # empty and silently drop the two MIKASA cameras.
     config = SmolVLATTTConfig(
         device=args.device,
         pretrained_path=Path(args.checkpoint),
-        hd_ttt_enabled=hd_enabled,
-        hd_learned_write_gate=learned_gate,
+        **hd_kwargs,
     )
     policy = make_policy(config, ds_meta=metadata)
     preprocessor, postprocessor = make_smolvla_ttt_pre_post_processors(
