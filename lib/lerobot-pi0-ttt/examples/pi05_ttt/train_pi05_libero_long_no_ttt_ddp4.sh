@@ -64,3 +64,14 @@ exec "${ACCELERATE_BIN}" launch \
   --policy.scheduler_decay_lr=5e-6 \
   --policy.push_to_hub=false \
   --batch_size=1 \
+  --num_workers=2 \
+  --prefetch_factor=1 \
+  --persistent_workers=true \
+  --steps="${STEPS}" \
+  --log_freq=10 \
+  --save_checkpoint=true \
+  --save_freq="${SAVE_FREQ}" \
+  --eval_freq=0 \
+  --wandb.enable=false \
+  --seed="${SEED}" \
+  --output_dir="${OUTPUT_DIR}"
