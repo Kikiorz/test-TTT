@@ -296,6 +296,7 @@ def update_policy_tbptt(
     total_loss = torch.zeros((), device=accelerator.device)
     loss_per_dim = None
     num_segments = 0
+    auxiliary_metric_sums: dict[str, float] = {}
     segment_loss_weights = _tbptt_segment_loss_weights(
         batch,
         sequence_shape,
@@ -334,6 +335,11 @@ def update_policy_tbptt(
             loss_per_dim = segment_loss_per_dim * segment_weight
         else:
             loss_per_dim += segment_loss_per_dim * segment_weight
+        for metric_name, metric_value in segment_output.items():
+            if metric_name.startswith("hd_"):
+                auxiliary_metric_sums[metric_name] = auxiliary_metric_sums.get(metric_name, 0.0) + float(
+                    metric_value
+                ) * segment_weight
         fast_states = {
             layer_index: fast_state.detach() for layer_index, fast_state in fast_states.items()
         }
@@ -363,6 +369,11 @@ def update_policy_tbptt(
 
         total_loss = accelerator.reduce(total_loss, reduction="mean")
         loss_per_dim = accelerator.reduce(loss_per_dim, reduction="mean")
+        for metric_name, metric_value in list(auxiliary_metric_sums.items()):
+            metric_tensor = torch.tensor(metric_value, device=accelerator.device)
+            auxiliary_metric_sums[metric_name] = float(
+                accelerator.reduce(metric_tensor, reduction="mean").item()
+            )
 
     if grad_clip_norm > 0:
         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
@@ -413,6 +424,7 @@ def update_policy_tbptt(
         "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
         "tbptt_segments": num_segments,
     }
+    output_dict.update(auxiliary_metric_sums)
     return train_metrics, output_dict
 
 
@@ -743,6 +755,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
+    if is_smolvla_ttt and getattr(cfg.policy, "hd_ttt_enabled", False):
+        for metric_name in ("hd_hca", "hd_h2l", "hd_grounding"):
+            train_metrics[metric_name] = AverageMeter(metric_name, ":.3f")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
     effective_batch_size = cfg.batch_size * accelerator.num_processes
@@ -803,6 +818,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 lr_scheduler=lr_scheduler,
                 sample_weighter=sample_weighter,
             )
+        if is_smolvla_ttt and cfg.policy.hd_ttt_enabled:
+            for metric_name in ("hd_hca", "hd_h2l", "hd_grounding"):
+                if metric_name in output_dict:
+                    setattr(train_tracker, metric_name, output_dict[metric_name])
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
