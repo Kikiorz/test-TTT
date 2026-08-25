@@ -92,7 +92,11 @@ class SmolVLAMikasaPolicy:
         action = self.postprocessor(action)
         if action.ndim == 2:
             action = action[0]
-        return action.detach().to(device="cpu", dtype=torch.float32)
+        # MIKASA's canonical action space is bounded to [-1, 1].  A freshly
+        # initialized/partially fine-tuned flow head can briefly leave that
+        # range after unnormalization; the official runner expects the policy
+        # adapter to enforce the environment contract.
+        return action.detach().to(device="cpu", dtype=torch.float32).clamp(-1.0, 1.0)
 
     def set_task(self, instruction: str) -> None:
         self._task = instruction

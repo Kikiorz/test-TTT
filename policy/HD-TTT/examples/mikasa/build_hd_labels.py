@@ -525,8 +525,8 @@ def _build_shard(args: argparse.Namespace) -> None:
     # Imports are delayed so ``--merge`` works on a lightweight CPU machine
     # without transformers/SAPIEN dependencies.
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    from lerobot.policies.factory import make_policy
     from lerobot.policies.smolvla_ttt.configuration_smolvla_ttt import SmolVLATTTConfig
-    from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import SmolVLATTTPolicy
     from lerobot.policies.smolvla_ttt.processor_smolvla_ttt import make_smolvla_ttt_pre_post_processors
 
     device = torch.device(args.device)
@@ -548,9 +548,17 @@ def _build_shard(args: argparse.Namespace) -> None:
     )
     table = _episode_table(dataset, selected)
 
-    config = SmolVLATTTConfig(device=args.device, ttt_training_stage="ttt_only")
-    policy = SmolVLATTTPolicy.from_pretrained(args.checkpoint, config=config)
-    policy.to(device)
+    # ``make_policy(..., ds_meta=...)`` is important here: it injects the
+    # dataset's top/wrist cameras and 7-D action feature into the config before
+    # loading the generic SmolVLA checkpoint.  Direct ``from_pretrained`` would
+    # otherwise retain an empty or unrelated checkpoint feature schema and can
+    # silently omit one of the MIKASA views.
+    config = SmolVLATTTConfig(
+        device=args.device,
+        pretrained_path=Path(args.checkpoint),
+        ttt_training_stage="ttt_only",
+    )
+    policy = make_policy(config, ds_meta=metadata)
     policy.eval()
     for parameter in policy.parameters():
         parameter.requires_grad_(False)
