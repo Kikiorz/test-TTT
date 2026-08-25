@@ -74,7 +74,7 @@ class TailPreservingSequenceDataset(Dataset):
         sequence_length: int,
         sequence_stride: int,
         max_windows_per_episode: int | None = None,
-        history_warmup_length: int = 0,
+        history_warmup_length: int | None = 0,
     ) -> None:
         if sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
@@ -84,13 +84,15 @@ class TailPreservingSequenceDataset(Dataset):
             raise ValueError("sequence_stride cannot exceed sequence_length because that would drop frames")
         if max_windows_per_episode is not None and max_windows_per_episode <= 0:
             raise ValueError("max_windows_per_episode must be positive when provided")
-        if history_warmup_length < 0:
+        if history_warmup_length is not None and history_warmup_length < 0:
             raise ValueError("history_warmup_length must be non-negative")
 
         self.dataset = dataset
         self.sequence_length = sequence_length
         self.sequence_stride = sequence_stride
-        self.history_warmup_length = int(history_warmup_length)
+        self.history_warmup_length = (
+            None if history_warmup_length is None else int(history_warmup_length)
+        )
         self.window_specs: list[tuple[int, int]] = []
         self.history_specs: list[tuple[int, int]] = []
 
@@ -115,7 +117,11 @@ class TailPreservingSequenceDataset(Dataset):
                 window_length = min(sequence_length, episode_length - offset)
                 target_start = episode_start + offset
                 self.window_specs.append((target_start, window_length))
-                history_start = max(episode_start, target_start - self.history_warmup_length)
+                history_start = (
+                    episode_start
+                    if self.history_warmup_length is None
+                    else max(episode_start, target_start - self.history_warmup_length)
+                )
                 self.history_specs.append((history_start, target_start))
             episode_start += episode_length
 

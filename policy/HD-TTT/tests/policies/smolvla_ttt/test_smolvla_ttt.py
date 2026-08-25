@@ -127,6 +127,17 @@ def test_history_warmup_masks_prefix_but_keeps_it_in_the_recurrent_window() -> N
     assert all(not bool(samples[index]["action_is_pad"].any()) for index in range(3, 7))
 
 
+def test_none_history_warmup_replays_from_episode_start() -> None:
+    dataset = _EpisodeDataset([20])
+    sequences = TailPreservingSequenceDataset(
+        dataset,
+        sequence_length=4,
+        sequence_stride=4,
+        history_warmup_length=None,
+    )
+    assert [sample["frame_index"] for sample in sequences[2]] == list(range(12))
+
+
 def test_gate_is_fixed_during_ttt_only_stage() -> None:
     config = SmolVLATTTConfig(ttt_training_stage="ttt_only")
     layer = TTTMLPLayer(

@@ -25,6 +25,11 @@ SEQUENCE_STRIDE="${SEQUENCE_STRIDE:-64}"
 MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-4}"
 TBPTT_SEGMENT_LENGTH="${TBPTT_SEGMENT_LENGTH:-32}"
 HISTORY_WARMUP_LENGTH="${HISTORY_WARMUP_LENGTH:-64}"
+if [[ "${HISTORY_WARMUP_LENGTH}" == "full" ]]; then
+  HISTORY_WARMUP_ARG="None"
+else
+  HISTORY_WARMUP_ARG="${HISTORY_WARMUP_LENGTH}"
+fi
 TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
 REGISTER_TOKENS="${REGISTER_TOKENS:-16}"
@@ -98,7 +103,7 @@ COMMON_ARGS=(
   --policy.sequence_stride="${SEQUENCE_STRIDE}"
   --policy.max_windows_per_episode="${MAX_WINDOWS_ARG}"
   --policy.tbptt_segment_length="${TBPTT_SEGMENT_LENGTH}"
-  --policy.ttt_history_warmup_length="${HISTORY_WARMUP_LENGTH}"
+  --policy.ttt_history_warmup_length="${HISTORY_WARMUP_ARG}"
   --policy.ttt_hidden_dim="${TTT_HIDDEN_DIM}"
   --policy.ttt_second_order=false
   --policy.ttt_layer_indices="${TTT_LAYERS}"

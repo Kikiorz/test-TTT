@@ -118,7 +118,7 @@ class SmolVLATTTConfig(PreTrainedConfig):
     # window.  Warm-up frames advance fast weights but are masked from all
     # action/HD losses, keeping offline full-history labels state-consistent
     # even when windows are shuffled across workers.
-    ttt_history_warmup_length: int = 0
+    ttt_history_warmup_length: int | None = 0
     # Optional episode-balanced subsampling for very long demonstrations.
     # ``None`` keeps every tail-preserving window (the default, rigorous
     # setting).  A positive value selects at most that many evenly spaced
@@ -183,7 +183,7 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("tbptt_segment_length must be positive")
         if self.tbptt_segment_length > self.sequence_length:
             raise ValueError("tbptt_segment_length cannot exceed sequence_length")
-        if self.ttt_history_warmup_length < 0:
+        if self.ttt_history_warmup_length is not None and self.ttt_history_warmup_length < 0:
             raise ValueError("ttt_history_warmup_length must be non-negative")
         if self.max_windows_per_episode is not None and self.max_windows_per_episode <= 0:
             raise ValueError("max_windows_per_episode must be positive when provided")
