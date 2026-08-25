@@ -209,6 +209,15 @@ class HindsightLabelDataset(Dataset):
             raise ValueError(f"HD label artifact {self.label_path} contains no hd_* label columns")
         self.hd_window_keyed = bool(self._window_records)
 
+        # A complete window artifact is expected to cover every target window
+        # consumed by the configured sequence sampler.  Older unit fixtures
+        # intentionally omit episode provenance; those remain loadable, while
+        # production artifacts (which carry ``episodes``) fail immediately if
+        # a shard/range or sampler contract is incomplete instead of raising a
+        # delayed worker-side KeyError.
+        if self.strict and self.hd_window_keyed and self.label_metadata.get("episodes") is not None:
+            self._validate_window_coverage()
+
         missing = sorted(set(range(len(dataset))) - set(self._records))
         if missing and self.strict and not self._window_records:
             preview = missing[:8]
@@ -284,6 +293,71 @@ class HindsightLabelDataset(Dataset):
     @property
     def label_keys(self) -> tuple[str, ...]:
         return self._label_keys
+
+    @staticmethod
+    def _window_offsets(
+        length: int,
+        sequence_length: int,
+        sequence_stride: int,
+        max_windows_per_episode: int | None,
+    ) -> list[int]:
+        """Mirror ``TailPreservingSequenceDataset`` target-offset selection."""
+
+        offsets = list(range(0, length, sequence_stride))
+        if max_windows_per_episode is not None and len(offsets) > max_windows_per_episode:
+            last_full_offset = max(length - sequence_length, 0)
+            full_offsets = list(range(0, last_full_offset + 1, sequence_stride))
+            if not full_offsets or full_offsets[-1] != last_full_offset:
+                full_offsets.append(last_full_offset)
+            positions = (
+                torch.linspace(0, len(full_offsets) - 1, max_windows_per_episode)
+                .round()
+                .to(torch.long)
+                .tolist()
+            )
+            offsets = [full_offsets[int(position)] for position in sorted(set(positions))]
+        return offsets
+
+    def _validate_window_coverage(self) -> None:
+        """Eagerly verify target-window coverage for a provenance-rich artifact."""
+
+        metadata = self.label_metadata
+        required = ("sequence_length", "sequence_stride", "max_windows_per_episode")
+        if any(key not in metadata for key in required):
+            return
+        table = self._episode_table(self.dataset)
+        if table is None:
+            return
+        episode_ids, absolute_starts, lengths = table
+        declared = {int(value) for value in metadata.get("episodes", [])}
+        missing_episodes = [episode for episode in episode_ids if episode not in declared]
+        if missing_episodes:
+            raise ValueError(
+                "Window-local HD artifact does not include selected dataset episodes: "
+                f"{missing_episodes[:8]}"
+            )
+        sequence_length = int(metadata["sequence_length"])
+        sequence_stride = int(metadata["sequence_stride"])
+        max_windows = metadata["max_windows_per_episode"]
+        if max_windows is not None:
+            max_windows = int(max_windows)
+        expected_targets: set[int] = set()
+        local_start = 0
+        for source_start, length in zip(absolute_starts, lengths, strict=True):
+            for offset in self._window_offsets(length, sequence_length, sequence_stride, max_windows):
+                local_target = local_start + offset
+                if self._absolute_frame_indices is None:
+                    expected_targets.add(local_target)
+                else:
+                    expected_targets.add(int(self._absolute_frame_indices[local_target]))
+            local_start += length
+        missing_targets = sorted(expected_targets - set(self._window_records))
+        if missing_targets:
+            raise ValueError(
+                "Window-local HD artifact is missing "
+                f"{len(missing_targets)} target windows; first missing source frames: "
+                f"{missing_targets[:8]}"
+            )
 
     def get_window_labels(
         self,

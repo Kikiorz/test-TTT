@@ -36,7 +36,7 @@ Examples (run in the Python 3.11 MIKASA environment)::
       --dataset-repo-id shell_game_color_lamp_touch_vla_v0 \
       --dataset-root /workspace/data_mikasa_robo/data_lerobot/\
         shell_game_color_lamp_touch_vla_v0 \
-      --checkpoint lerobot/smolvla_base \
+      --checkpoint /workspace/experiments/short_ttt150_clean/checkpoints/016375/pretrained_model \
       --output /workspace/labels/color-000.pt \
       --episode-start 0 --episode-end 50 --max-events 8
 
@@ -53,6 +53,8 @@ dataset.  It only reads the dataset and writes the requested label artifact.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import math
 from collections.abc import Mapping, Sequence
@@ -64,6 +66,79 @@ from torch import Tensor
 
 
 LOGGER = logging.getLogger("build_hd_labels")
+
+
+def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
+    """Require a trained SmolVLA-TTT teacher rather than random TTT weights."""
+
+    checkpoint_text = str(checkpoint)
+    checkpoint_path = Path(checkpoint_text).expanduser()
+    if checkpoint_path.is_dir():
+        config_path = checkpoint_path / "config.json"
+    else:
+        config_path = checkpoint_path if checkpoint_path.name == "config.json" else None
+    if config_path is None or not config_path.is_file():
+        try:
+            from huggingface_hub import hf_hub_download
+
+            config_path = Path(hf_hub_download(repo_id=checkpoint_text, filename="config.json"))
+        except Exception as error:
+            raise ValueError(
+                "Could not resolve teacher config.json for "
+                f"{checkpoint_text!r}: {error}"
+            ) from error
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Could not read teacher config {config_path}: {error}") from error
+    if raw.get("type") != "smolvla_ttt":
+        raise ValueError(
+            "HD hindsight labels require a trained clean/HD SmolVLA-TTT teacher "
+            f"(config.type='smolvla_ttt'), got {raw.get('type')!r} from {checkpoint_text!r}. "
+            "Train clean-TTT first; a standard SmolVLA checkpoint would leave "
+            "the TTT/register weights randomly initialized."
+        )
+    if "ttt_layer_indices" not in raw or "ttt_num_register_tokens" not in raw:
+        raise ValueError(
+            f"Teacher config {config_path} lacks TTT architecture fields; refusing an untrained teacher"
+        )
+    config_bytes = config_path.read_bytes()
+    layer_indices = raw.get("ttt_layer_indices")
+    if layer_indices is None:
+        # ``None`` is the valid config representation for the contiguous
+        # default range; resolve it exactly as ``SmolVLATTTConfig`` does.
+        try:
+            layer_indices = list(
+                range(int(raw.get("ttt_start_layer", 12)), int(raw.get("num_vlm_layers", 16)))
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Teacher config {config_path} cannot resolve default TTT layer range"
+            ) from error
+    if isinstance(layer_indices, tuple):
+        layer_indices = list(layer_indices)
+    if not isinstance(layer_indices, list):
+        raise ValueError(
+            f"Teacher config {config_path} has non-list ttt_layer_indices={layer_indices!r}"
+        )
+    try:
+        layer_indices = [int(index) for index in layer_indices]
+        register_tokens = int(raw["ttt_num_register_tokens"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"Teacher config {config_path} has invalid TTT architecture fields"
+        ) from error
+    if not layer_indices or register_tokens < 0:
+        raise ValueError(
+            f"Teacher config {config_path} has empty/invalid TTT architecture fields"
+        )
+    return {
+        "policy_type": raw.get("type"),
+        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "ttt_layer_indices": layer_indices,
+        "ttt_num_register_tokens": register_tokens,
+        "config_path": str(config_path),
+    }
 
 
 def _load_torch(path: Path) -> Any:
@@ -625,6 +700,26 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
     # independent of the input payload objects.
     shard_metadata: list[dict[str, Any]] = []
     episodes_detail: dict[str, Any] = {}
+    merged_episode_ids: set[int] = set()
+    metadata_contract_keys = (
+        "dataset_repo_id",
+        "dataset_root",
+        "checkpoint",
+        "teacher_checkpoint",
+        "teacher_policy_type",
+        "teacher_config_sha256",
+        "teacher_ttt_layer_indices",
+        "teacher_ttt_num_register_tokens",
+        "seed",
+        "phase_mode",
+        "history_mode",
+        "event_block_size",
+        "max_events",
+        "attribution_threshold",
+        "action_chunk_size",
+        "max_action_dim",
+    )
+    reference_metadata: dict[str, Any] | None = None
     for path, payload in zip(inputs, payloads, strict=True):
         metadata = payload.get("metadata")
         if not isinstance(metadata, Mapping):
@@ -632,6 +727,31 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         copied = dict(metadata)
         copied["source_path"] = str(path)
         shard_metadata.append(copied)
+        if reference_metadata is None:
+            reference_metadata = dict(metadata)
+        else:
+            missing_contract_fields = {
+                key
+                for key in metadata_contract_keys
+                if (key in reference_metadata) != (key in metadata)
+            }
+            if missing_contract_fields:
+                raise ValueError(
+                    "Cannot merge hindsight shards with incomplete metadata contract: "
+                    f"{sorted(missing_contract_fields)}"
+                )
+            mismatches = {
+                key: (reference_metadata.get(key), metadata.get(key))
+                for key in metadata_contract_keys
+                if key in reference_metadata and key in metadata and reference_metadata[key] != metadata[key]
+            }
+            if mismatches:
+                raise ValueError(f"Cannot merge incompatible hindsight shards: {mismatches}")
+        declared_episodes = metadata.get("episodes")
+        if isinstance(declared_episodes, Sequence) and not isinstance(
+            declared_episodes, (str, bytes, bytearray)
+        ):
+            merged_episode_ids.update(int(episode) for episode in declared_episodes)
         details = metadata.get("episodes_detail")
         if isinstance(details, Mapping):
             for episode_key, episode_detail in details.items():
@@ -675,7 +795,7 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         duplicates = sorted_indices[1:][sorted_indices[1:] == sorted_indices[:-1]].tolist()
         raise ValueError(f"Duplicate global indices while merging shards: {duplicates[:8]}")
     merged = {key: value.index_select(0, order) for key, value in columns.items()}
-    merged["metadata"] = {
+    merged_metadata = {
         "format": "hd_ttt_labels_v1",
         "merged_from": [str(path) for path in inputs],
         "num_frames": int(sorted_indices.numel()),
@@ -689,6 +809,15 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
             "time_shape_per_frame": list(columns["hd_time"].shape[1:]),
         },
     }
+    if reference_metadata is not None:
+        # Carry the common generation contract to the merged artifact.  Do
+        # not copy per-shard episode ranges; those are retained in
+        # ``shard_metadata`` and the union below.
+        for key in metadata_contract_keys:
+            if key in reference_metadata:
+                merged_metadata[key] = reference_metadata[key]
+        merged_metadata["episodes"] = sorted(merged_episode_ids | {int(key) for key in episodes_detail})
+    merged["metadata"] = merged_metadata
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(merged, output)
     LOGGER.info("Merged %d shards (%d frames) -> %s", len(inputs), sorted_indices.numel(), output)
@@ -703,6 +832,7 @@ def _build_shard(args: argparse.Namespace) -> None:
     from lerobot.policies.smolvla_ttt.processor_smolvla_ttt import make_smolvla_ttt_pre_post_processors
 
     device = torch.device(args.device)
+    teacher_info = _validate_teacher_checkpoint(args.checkpoint)
     metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
     selected = _selected_episodes(metadata, args.episode_start, args.episode_end)
     if args.max_episodes is not None:
@@ -828,12 +958,18 @@ def _build_shard(args: argparse.Namespace) -> None:
         "dataset_repo_id": args.dataset_repo_id,
         "dataset_root": str(args.dataset_root),
         "checkpoint": str(args.checkpoint),
+        "teacher_checkpoint": str(args.checkpoint),
+        "teacher_policy_type": teacher_info["policy_type"],
+        "teacher_config_sha256": teacher_info["config_sha256"],
+        "teacher_ttt_layer_indices": list(teacher_info["ttt_layer_indices"]),
+        "teacher_ttt_num_register_tokens": int(teacher_info["ttt_num_register_tokens"]),
         "fps": fps,
         "episode_start": args.episode_start,
         "episode_end": args.episode_end,
         "episodes": selected,
         "seed": args.seed,
         "phase_mode": args.phase_mode,
+        "history_mode": "full_episode_replay",
         "writer_observation": (
             "pure_gaussian_action_noise_at_t1"
             if args.phase_mode == "deployment"

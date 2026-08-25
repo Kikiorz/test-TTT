@@ -151,6 +151,11 @@ class SmolVLATTTConfig(PreTrainedConfig):
     hd_grounding_weight: float = 1.0
     hd_invariance_weight: float = 0.25
     hd_event_block_size: int = 4
+    # Maximum causal event replays used when constructing offline labels.
+    # Zero means every causal block.  Keeping this in the policy config makes
+    # the label/training compute contract explicit instead of silently
+    # accepting an artifact generated with a different event budget.
+    hd_max_events: int = 0
     hd_attribution_threshold: float = 0.0
     hd_attribution_topk: int = 8
     hd_counterfactual_margin: float = 0.05
@@ -229,6 +234,8 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("hd_write_gate_init must be strictly between 0 and 1")
         if self.hd_event_block_size <= 0:
             raise ValueError("hd_event_block_size must be positive")
+        if self.hd_max_events < 0:
+            raise ValueError("hd_max_events must be non-negative")
         if self.hd_attribution_topk < 0:
             raise ValueError("hd_attribution_topk must be non-negative")
         if self.hd_phase_mode not in {"random", "deployment"}:

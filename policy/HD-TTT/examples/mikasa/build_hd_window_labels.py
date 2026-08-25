@@ -33,6 +33,7 @@ try:  # Direct ``python examples/mikasa/...py`` invocation.
         _fixed_noise_time,
         _prepare_episode,
         _selected_episodes,
+        _validate_teacher_checkpoint,
     )
 except ImportError:  # Package-style invocation.
     from .build_hd_labels import (
@@ -41,6 +42,7 @@ except ImportError:  # Package-style invocation.
         _fixed_noise_time,
         _prepare_episode,
         _selected_episodes,
+        _validate_teacher_checkpoint,
     )
 
 
@@ -177,6 +179,7 @@ def _build_shard(args: argparse.Namespace) -> None:
     )
 
     device = torch.device(args.device)
+    teacher_info = _validate_teacher_checkpoint(args.checkpoint)
     metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
     selected = _selected_episodes(metadata, args.episode_start, args.episode_end)
     if args.max_episodes is not None:
@@ -316,6 +319,11 @@ def _build_shard(args: argparse.Namespace) -> None:
             "dataset_repo_id": args.dataset_repo_id,
             "dataset_root": str(args.dataset_root),
             "checkpoint": str(args.checkpoint),
+            "teacher_checkpoint": str(args.checkpoint),
+            "teacher_policy_type": teacher_info["policy_type"],
+            "teacher_config_sha256": teacher_info["config_sha256"],
+            "teacher_ttt_layer_indices": list(teacher_info["ttt_layer_indices"]),
+            "teacher_ttt_num_register_tokens": int(teacher_info["ttt_num_register_tokens"]),
             "fps": fps,
             "episodes": selected,
             "sequence_length": args.sequence_length,
@@ -324,7 +332,11 @@ def _build_shard(args: argparse.Namespace) -> None:
             "max_windows_per_episode": args.max_windows_per_episode,
             "event_block_size": args.event_block_size,
             "max_events": args.max_events,
+            "attribution_threshold": args.attribution_threshold,
+            "seed": args.seed,
+            "frame_batch_size": args.frame_batch_size,
             "phase_mode": args.phase_mode,
+            "history_mode": "bounded_window_replay",
             "writer_observation": (
                 "pure_gaussian_action_noise_at_t1"
                 if args.phase_mode == "deployment"
@@ -349,13 +361,26 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
     metadata: list[dict[str, Any]] = []
     seen_targets: set[int] = set()
     contract_keys = (
+        "dataset_repo_id",
+        "dataset_root",
         "sequence_length",
         "sequence_stride",
         "context_length",
         "max_windows_per_episode",
         "event_block_size",
+        "max_events",
+        "attribution_threshold",
+        "seed",
         "phase_mode",
+        "history_mode",
         "checkpoint",
+        "teacher_checkpoint",
+        "teacher_policy_type",
+        "teacher_config_sha256",
+        "teacher_ttt_layer_indices",
+        "teacher_ttt_num_register_tokens",
+        "action_chunk_size",
+        "max_action_dim",
     )
     reference: dict[str, Any] | None = None
     for path, payload in zip(inputs, payloads, strict=True):
@@ -386,6 +411,15 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
     if reference is None:
         raise ValueError("No shard metadata")
     merged_meta = dict(reference)
+    # Shards cover disjoint episode ranges.  Preserve the union rather than
+    # leaving the first shard's episode list as misleading provenance.
+    merged_meta["episodes"] = sorted(
+        {
+            int(episode)
+            for shard in metadata
+            for episode in shard.get("episodes", [])
+        }
+    )
     merged_meta.update(
         {
             "merged_from": [str(path) for path in inputs],
