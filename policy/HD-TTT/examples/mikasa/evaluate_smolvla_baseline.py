@@ -96,7 +96,8 @@ class SmolVLABaselineMikasaPolicy(SmolVLAMikasaPolicy):
 def _resolve_checkpoint_config(checkpoint: str) -> Path:
     """Resolve a local or Hub checkpoint's ``config.json`` without choice parsing."""
 
-    checkpoint_path = Path(checkpoint)
+    checkpoint_id = str(checkpoint)
+    checkpoint_path = Path(checkpoint_id)
     if checkpoint_path.is_dir():
         config_path = checkpoint_path / "config.json"
         if not config_path.is_file():
@@ -109,7 +110,7 @@ def _resolve_checkpoint_config(checkpoint: str) -> Path:
     try:
         from huggingface_hub import hf_hub_download
 
-        return Path(hf_hub_download(repo_id=checkpoint, filename="config.json"))
+        return Path(hf_hub_download(repo_id=checkpoint_id, filename="config.json"))
     except Exception as error:
         raise FileNotFoundError(
             f"Could not resolve config.json for local checkpoint or Hub repo {checkpoint!r}: {error}"
