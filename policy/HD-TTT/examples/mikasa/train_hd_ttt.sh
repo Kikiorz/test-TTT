@@ -129,11 +129,13 @@ LAUNCH=(
   "${ACCELERATE_BIN}" launch
   --num_machines=1
   --num_processes="${NUM_PROCESSES}"
-  --multi_gpu
   --mixed_precision=bf16
   --dynamo_backend=no
-  -m lerobot.scripts.lerobot_train
 )
+if (( NUM_PROCESSES > 1 )); then
+  LAUNCH+=(--multi_gpu)
+fi
+LAUNCH+=(-m lerobot.scripts.lerobot_train)
 
 cd "${REPO_ROOT}"
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
