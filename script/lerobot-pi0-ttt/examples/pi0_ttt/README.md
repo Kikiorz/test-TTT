@@ -77,6 +77,28 @@ Evaluate the source PI0 and trained PI0-TTT checkpoint with identical LIBERO tas
 image resolution, and `n_action_steps`. Reset TTT state at every episode boundary and carry it only within the
 episode; report both overall and per-task success rates.
 
+## LIBERO-Long Experiment
+
+`train_libero_long.sh` applies the same frozen-backbone PI0-TTT recipe to all 379 trajectories in the
+`libero_10` (LIBERO-Long) subset of `lerobot/libero`. The subset is episode indices 0 through 378 and task
+indices 0 through 9. The defaults below target the Vast workspace used for the controlled Long benchmark:
+
+```bash
+cd /workspace/lerobot-pi0-ttt
+CUDA_VISIBLE_DEVICES=0,1,2,3 NUM_PROCESSES=4 examples/pi0_ttt/train_libero_long.sh
+```
+
+The default LIBERO-Long run trains for 2,000 optimizer steps and writes its final checkpoint under
+`/workspace/outputs/train/pi0_ttt_libero_long_t128_v1`. Before the full run, use a separate output directory
+with `STEPS=1 SAVE_CHECKPOINT=false` as a data/CUDA smoke test. Evaluate the source PI0 and PI0-TTT with
+the same ten LIBERO-Long task IDs, initial-state seeds, relative action mode, `n_action_steps=10`, and episode
+count. Report the 10 per-task rates and the overall rate; training loss alone is not an evaluation result.
+`NUM_PROCESSES=4` runs one data-parallel model with per-device batch size 1 and global batch size 4. The
+2,000-step run therefore consumes 8,000 trajectory windows. Each
+worker carries fast state only for its own trajectory window; after all TBPTT segments, trainable outer
+gradients are averaged across workers before every optimizer step. Set `NUM_PROCESSES=1` for a single-GPU
+run, or set `SEED` when launching a separate matched training replica.
+
 ### Visualize Fast Weights During Inference
 
 After training, trace the four TTT layers during one closed-loop LIBERO episode:
