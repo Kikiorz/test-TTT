@@ -529,6 +529,12 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         "format": "hd_ttt_labels_v1",
         "merged_from": [str(path) for path in inputs],
         "num_frames": int(sorted_indices.numel()),
+        "fixed_phase": {
+            "noise_column": "hd_noise",
+            "time_column": "hd_time",
+            "noise_shape_per_frame": list(columns["hd_noise"].shape[1:]),
+            "time_shape_per_frame": list(columns["hd_time"].shape[1:]),
+        },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(merged, output)
@@ -680,6 +686,12 @@ def _build_shard(args: argparse.Namespace) -> None:
         "frame_batch_size": args.frame_batch_size,
         "action_chunk_size": int(policy.config.chunk_size),
         "max_action_dim": action_dim,
+        "fixed_phase": {
+            "noise_column": "hd_noise",
+            "time_column": "hd_time",
+            "noise_shape_per_frame": [int(policy.config.chunk_size), action_dim],
+            "time_shape_per_frame": [],
+        },
         "episodes_detail": episode_metadata,
     }
     torch.save(payload, output)
