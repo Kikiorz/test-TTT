@@ -119,12 +119,27 @@ def _load_policy(args: argparse.Namespace):
     # an HD checkpoint would silently be evaluated as clean TTT.  CLI values
     # override the source flags and make clean-vs-HD ablations reproducible.
     source_config: dict[str, Any] = {}
-    checkpoint_config = args.checkpoint / "config.json"
-    if checkpoint_config.is_file():
+    checkpoint_path = args.checkpoint / "config.json"
+    if checkpoint_path.is_file():
+        config_file = checkpoint_path
+    else:
+        # A Hub ID is accepted by the policy loader as well as a local path.
+        # Resolve its config explicitly so HD switches are not silently
+        # replaced by clean-TTT defaults during evaluation.
         try:
-            source_config = json.loads(checkpoint_config.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"Could not read checkpoint config {checkpoint_config}: {error}") from error
+            from huggingface_hub import hf_hub_download
+
+            config_file = Path(
+                hf_hub_download(repo_id=str(args.checkpoint), filename="config.json")
+            )
+        except Exception as error:
+            raise FileNotFoundError(
+                f"Could not resolve config.json for checkpoint {args.checkpoint!s}: {error}"
+            ) from error
+    try:
+        source_config = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Could not read checkpoint config {config_file}: {error}") from error
     # Preserve every serialized HD hyperparameter (not just the two switches)
     # so an evaluation checkpoint with non-default attribution/loss weights is
     # evaluated under the same objective it was trained with.
