@@ -765,6 +765,17 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
             raise ValueError(
                 f"Shard {path} is missing hindsight metadata contract fields: {missing_metadata}"
             )
+        for flag_name in ("teacher_hd_ttt_enabled", "teacher_hd_learned_write_gate"):
+            flag_value = metadata[flag_name]
+            if type(flag_value) is not bool:
+                raise ValueError(
+                    f"Shard {path} has malformed {flag_name}; expected a JSON boolean"
+                )
+            if flag_value:
+                raise ValueError(
+                    f"Shard {path} was generated with an HD teacher; "
+                    "the clean/all-write replay contract must be used for hindsight labels"
+                )
         copied = dict(metadata)
         copied["source_path"] = str(path)
         shard_metadata.append(copied)
