@@ -38,7 +38,7 @@ Examples (run in the Python 3.11 MIKASA environment)::
         shell_game_color_lamp_touch_vla_v0 \
       --checkpoint /workspace/experiments/short_ttt150_clean/checkpoints/016375/pretrained_model \
       --output /workspace/labels/color-000.pt \
-      --episode-start 0 --episode-end 50 --max-events 8
+      --episode-start 0 --episode-end 50 --max-events 0
 
     # Merge independently generated shards.  Inputs are sorted by
     # global_index and duplicate indices are rejected.
@@ -723,27 +723,24 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
     for path, payload in zip(inputs, payloads, strict=True):
         metadata = payload.get("metadata")
         if not isinstance(metadata, Mapping):
-            continue
+            raise ValueError(
+                f"Shard {path} is missing metadata; refusing to merge an unprovenanced HD artifact"
+            )
+        missing_metadata = sorted(set(metadata_contract_keys) - set(metadata))
+        if missing_metadata:
+            raise ValueError(
+                f"Shard {path} is missing hindsight metadata contract fields: {missing_metadata}"
+            )
         copied = dict(metadata)
         copied["source_path"] = str(path)
         shard_metadata.append(copied)
         if reference_metadata is None:
             reference_metadata = dict(metadata)
         else:
-            missing_contract_fields = {
-                key
-                for key in metadata_contract_keys
-                if (key in reference_metadata) != (key in metadata)
-            }
-            if missing_contract_fields:
-                raise ValueError(
-                    "Cannot merge hindsight shards with incomplete metadata contract: "
-                    f"{sorted(missing_contract_fields)}"
-                )
             mismatches = {
                 key: (reference_metadata.get(key), metadata.get(key))
                 for key in metadata_contract_keys
-                if key in reference_metadata and key in metadata and reference_metadata[key] != metadata[key]
+                if reference_metadata[key] != metadata[key]
             }
             if mismatches:
                 raise ValueError(f"Cannot merge incompatible hindsight shards: {mismatches}")

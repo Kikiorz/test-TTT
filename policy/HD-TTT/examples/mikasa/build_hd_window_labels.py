@@ -390,13 +390,18 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
         if not isinstance(shard_meta, Mapping):
             raise ValueError(f"Shard {path} is missing metadata")
         shard_meta = dict(shard_meta)
+        missing_metadata = sorted(set(contract_keys) - set(shard_meta))
+        if missing_metadata:
+            raise ValueError(
+                f"Shard {path} is missing window metadata contract fields: {missing_metadata}"
+            )
         if reference is None:
             reference = shard_meta
         else:
             mismatches = {
                 key: (reference.get(key), shard_meta.get(key))
                 for key in contract_keys
-                if reference.get(key) != shard_meta.get(key)
+                if reference[key] != shard_meta[key]
             }
             if mismatches:
                 raise ValueError(f"Cannot merge incompatible window shards: {mismatches}")
