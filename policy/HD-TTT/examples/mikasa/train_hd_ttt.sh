@@ -2,10 +2,11 @@
 
 # Reproducible MIKASA HD-TTT training recipe.
 #
-# The default recipe uses every tail-preserving window and 150 passes over the
-# demonstrations.  This is the strict setting required by window-keyed HD
-# labels; set MAX_WINDOWS_PER_EPISODE to a positive value only for an explicit
-# episode-balanced speed ablation.
+# The default recipe uses four deterministic, episode-balanced windows per
+# long demonstration and 150 passes.  The window-keyed HD artifact stores a
+# complete replay context for each selected window, so this cap is an exact
+# contract rather than an approximate frame-label shortcut.  Set it to
+# ``none`` for full-window coverage.
 
 set -euo pipefail
 
@@ -21,7 +22,7 @@ EPOCHS="${EPOCHS:-150}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-64}"
 SEQUENCE_STRIDE="${SEQUENCE_STRIDE:-64}"
-MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-none}"
+MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-4}"
 TBPTT_SEGMENT_LENGTH="${TBPTT_SEGMENT_LENGTH:-32}"
 HISTORY_WARMUP_LENGTH="${HISTORY_WARMUP_LENGTH:-64}"
 if [[ "${HISTORY_WARMUP_LENGTH}" == "full" ]]; then

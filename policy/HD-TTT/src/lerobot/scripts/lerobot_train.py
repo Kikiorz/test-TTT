@@ -113,7 +113,28 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
     # used to generate it.  Fail at startup rather than silently training a
     # different state distribution (especially important for long episodes).
     metadata = labeled_dataset.label_metadata
+    if labeled_dataset.hd_window_local and not metadata:
+        raise ValueError("Window-local HD artifacts must include a provenance metadata mapping")
     if metadata:
+        if labeled_dataset.hd_window_local:
+            required_metadata = {
+                "phase_mode",
+                "sequence_length",
+                "sequence_stride",
+                "context_length",
+                "max_windows_per_episode",
+                "event_block_size",
+                "dataset_repo_id",
+                "action_chunk_size",
+                "max_action_dim",
+                "checkpoint",
+            }
+            missing_metadata = sorted(required_metadata - set(metadata))
+            if missing_metadata:
+                raise ValueError(
+                    "Window-local HD artifact is missing required provenance fields: "
+                    f"{missing_metadata}"
+                )
         expected_phase = getattr(policy_cfg, "hd_phase_mode", "random")
         artifact_phase = metadata.get("phase_mode")
         if artifact_phase is not None and str(artifact_phase) != str(expected_phase):
