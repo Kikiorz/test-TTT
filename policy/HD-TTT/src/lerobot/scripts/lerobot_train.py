@@ -277,6 +277,15 @@ def _tbptt_segment_loss_weights(
         segment_end = min(segment_start + segment_length, sequence_length)
         if actions_is_pad is None:
             action_valid_count = batch_size * (segment_end - segment_start)
+        elif writer_valid is not None:
+            # HD auxiliary losses are normalized per physical interaction,
+            # not per action-chunk slot.  Count a target frame once here;
+            # otherwise a 50-slot action chunk would down-weight a warm-up
+            # writer segment by roughly 50x even though its gate/H2L loss is
+            # itself a per-frame mean.
+            action_valid_count = int(
+                (~action_padding[:, segment_start:segment_end]).any(dim=-1).sum().item()
+            )
         else:
             action_valid_count = int((~action_padding[:, segment_start:segment_end]).sum().item())
         if writer_valid is not None:

@@ -752,6 +752,26 @@ def test_tbptt_weights_segments_by_valid_actions_instead_of_timestep_count() -> 
     assert timestep_weights == pytest.approx([0.5, 0.5])
 
 
+def test_hd_action_validity_retains_chunk_slot_mask() -> None:
+    pad = torch.tensor(
+        [[False, False, True], [False, True, True], [False, False, False], [True, True, True]]
+    )
+    slot_valid = SmolVLATTTPolicy._hd_action_slot_valid_weight(
+        {"action_is_pad": pad},
+        sequence_shape=(1, 4),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert slot_valid.tolist() == [[[1.0, 1.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0]]]
+    step_valid = SmolVLATTTPolicy._hd_valid_step_weight(
+        {"action_is_pad": pad},
+        sequence_shape=(1, 4),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(step_valid, torch.tensor([[2 / 3, 1 / 3, 1.0, 0.0]]))
+
+
 def test_tbptt_writer_mask_keeps_history_only_segment_trainable() -> None:
     batch = {
         "action_is_pad": torch.tensor(
@@ -766,9 +786,9 @@ def test_tbptt_writer_mask_keeps_history_only_segment_trainable() -> None:
         weight_by_valid_actions=True,
         include_writer_valid=True,
     )
-    # The first segment has two writer interactions but no action targets; the
-    # second has four action targets, so union/max weighting is 2:4.
-    assert weights == pytest.approx([1 / 3, 2 / 3])
+    # Both segments contain two physical writer interactions.  Action chunk
+    # slots do not multiply the weight of the target segment.
+    assert weights == pytest.approx([0.5, 0.5])
 
 
 def test_ttt_hook_runs_after_expert_attention_residual_and_before_mlp() -> None:
