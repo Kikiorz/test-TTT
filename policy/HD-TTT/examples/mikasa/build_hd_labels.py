@@ -517,6 +517,32 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         if not isinstance(payload, Mapping) or not required.issubset(payload):
             raise ValueError(f"Shard {path} is missing one or more required columns")
 
+    # Keep the full per-shard audit trail.  In particular, generation shards
+    # store the causal ``C`` matrices and event scores under
+    # ``metadata.episodes_detail``; dropping those fields during merge would
+    # make the merged artifact impossible to inspect or reproduce.  Metadata
+    # is copied as plain dictionaries so the output remains torch-loadable and
+    # independent of the input payload objects.
+    shard_metadata: list[dict[str, Any]] = []
+    episodes_detail: dict[str, Any] = {}
+    for path, payload in zip(inputs, payloads, strict=True):
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        copied = dict(metadata)
+        copied["source_path"] = str(path)
+        shard_metadata.append(copied)
+        details = metadata.get("episodes_detail")
+        if isinstance(details, Mapping):
+            for episode_key, episode_detail in details.items():
+                key = str(episode_key)
+                if key in episodes_detail:
+                    raise ValueError(
+                        "Duplicate episode metadata while merging shards: "
+                        f"episode {key!r} appears in more than one shard"
+                    )
+                episodes_detail[key] = episode_detail
+
     columns = {key: torch.cat([payload[key].detach().cpu() for payload in payloads], dim=0) for key in required}
     global_index = columns["global_index"].to(torch.long)
     order = torch.argsort(global_index)
@@ -529,6 +555,8 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         "format": "hd_ttt_labels_v1",
         "merged_from": [str(path) for path in inputs],
         "num_frames": int(sorted_indices.numel()),
+        "shard_metadata": shard_metadata,
+        "episodes_detail": episodes_detail,
         "fixed_phase": {
             "noise_column": "hd_noise",
             "time_column": "hd_time",
