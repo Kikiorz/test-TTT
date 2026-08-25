@@ -15,6 +15,8 @@ The training-facing columns are one row per source frame:
   velocity, padded to the model's ``max_action_dim``;
 * ``hd_teacher_wrong_velocity``: velocity from the highest-credit event
   intervention in the episode;
+* ``hd_noise`` / ``hd_time``: the fixed flow-matching noise and timestep used
+  by every full/reset replay;
 * ``hd_attribution`` and ``hd_rho``: normalized future dependency ``rho[j]``;
 * ``hd_write_gate``: normalized event importance ``u[i]``;
 * ``hd_counterfactual_write_gate``: the selected event's causal zero-write
@@ -475,6 +477,8 @@ def _episode_labels(
         "hd_teacher_velocity": full_velocity.float(),
         "hd_teacher_true_velocity": full_velocity.float().clone(),
         "hd_teacher_wrong_velocity": best_wrong.float(),
+        "hd_noise": noise.detach().cpu().float(),
+        "hd_time": time.detach().cpu().float(),
         "hd_attribution": rho.float(),
         "hd_rho": rho.float(),
         "hd_write_gate": write_gate.float(),
@@ -502,6 +506,8 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         "hd_teacher_velocity",
         "hd_teacher_true_velocity",
         "hd_teacher_wrong_velocity",
+        "hd_noise",
+        "hd_time",
         "hd_attribution",
         "hd_rho",
         "hd_write_gate",
@@ -589,6 +595,8 @@ def _build_shard(args: argparse.Namespace) -> None:
             "hd_teacher_velocity",
             "hd_teacher_true_velocity",
             "hd_teacher_wrong_velocity",
+            "hd_noise",
+            "hd_time",
             "hd_attribution",
             "hd_rho",
             "hd_write_gate",
