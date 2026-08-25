@@ -33,6 +33,11 @@ if [[ "${HISTORY_WARMUP_LENGTH}" == "full" ]]; then
 else
   HISTORY_WARMUP_ARG="${HISTORY_WARMUP_LENGTH}"
 fi
+# Window-keyed HD labels carry their numeric replay context in metadata and
+# are checked against this value at startup.  For the current Shuffle data
+# (maximum 513 frames), use HISTORY_WARMUP_LENGTH=513 for a full-episode
+# replay; reserve the human-readable ``full`` sentinel above for an unlabeled
+# teacher run or a future artifact whose loader explicitly records None.
 TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
 REGISTER_TOKENS="${REGISTER_TOKENS:-16}"
