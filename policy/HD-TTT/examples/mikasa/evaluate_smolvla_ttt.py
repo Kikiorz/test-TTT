@@ -176,7 +176,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     from mikasa_robo_suite.vla import benchmarking
 
     tasks = benchmarking.select_benchmark_tasks(env_ids=args.tasks)
-    benchmark_revision = benchmarking.benchmark_commit()
+    benchmark_commit_fn = getattr(benchmarking, "benchmark_commit", None)
+    benchmark_revision = benchmark_commit_fn() if benchmark_commit_fn is not None else None
+    if len(tasks) == 2:
+        benchmark_subset = "two_task_subset"
+    elif len(tasks) == 1:
+        benchmark_subset = "single_task"
+    else:
+        benchmark_subset = "selected_task_set"
     policy = _load_policy(args)
     results: list[dict[str, Any]] = []
     for task in tasks:
@@ -219,7 +226,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "sim_backend": args.sim_backend,
             "reward_mode": "normalized_dense",
             "benchmark_protocol": "MIKASA-Robo-VLA official runner",
-            "benchmark_subset": "two_task_subset",
+            "benchmark_subset": benchmark_subset,
+            "requested_tasks": [task.env_id for task in tasks],
             "benchmark_commit": benchmark_revision,
             "wrapper_chain": "apply_mikasa_vla_wrappers(include_overlays=False)",
             # The adapter executes one action at a time so recurrent TTT state
