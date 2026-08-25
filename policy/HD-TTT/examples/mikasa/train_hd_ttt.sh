@@ -51,6 +51,8 @@ HD_COUNTERFACTUAL_MARGIN="${HD_COUNTERFACTUAL_MARGIN:-0.0}"
 SAVE_FREQ="${SAVE_FREQ:-500}"
 LOG_FREQ="${LOG_FREQ:-50}"
 SEED="${SEED:-1000}"
+RESUME="${RESUME:-false}"
+CONFIG_PATH="${CONFIG_PATH:-}"
 # Optional comma-free JSON/list syntax understood by draccus, e.g. ``[0]`` or
 # ``[0,1,2]``.  This is useful for a bounded smoke run and for reproducible
 # per-shard experiments; when unset all 250 demonstrations are used.
@@ -122,7 +124,7 @@ MAX_EPISODE_LENGTH="$("${PYTHON_BIN}" -c 'import sys; print(sys.argv[1].split()[
 STEPS_PER_EPOCH=$(( (WINDOWS + NUM_PROCESSES - 1) / NUM_PROCESSES ))
 STEPS=$(( STEPS_PER_EPOCH * EPOCHS ))
 
-echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}"
+echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, margin=${HD_COUNTERFACTUAL_MARGIN}, grounding_weight=${HD_GROUNDING_WEIGHT}"
 
 COMMON_ARGS=(
   --dataset.repo_id="${DATASET_REPO_ID}"
@@ -163,6 +165,7 @@ COMMON_ARGS=(
   --save_checkpoint=true
   --save_freq="${SAVE_FREQ}"
   --eval_freq=0
+  --resume="${RESUME}"
   --wandb.enable=false
   --seed="${SEED}"
   --output_dir="${OUTPUT_DIR}"
@@ -173,6 +176,9 @@ if [[ -n "${LABEL_PATH}" ]]; then
 fi
 if [[ -n "${DATASET_EPISODES}" ]]; then
   COMMON_ARGS+=(--dataset.episodes="${DATASET_EPISODES}")
+fi
+if [[ -n "${CONFIG_PATH}" ]]; then
+  COMMON_ARGS+=(--config_path="${CONFIG_PATH}")
 fi
 
 LAUNCH=(
