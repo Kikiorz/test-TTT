@@ -114,6 +114,12 @@ class SmolVLATTTConfig(PreTrainedConfig):
     sequence_length: int = 256
     sequence_stride: int = 256
     tbptt_segment_length: int = 4
+    # Optional episode-balanced subsampling for very long demonstrations.
+    # ``None`` keeps every tail-preserving window (the default, rigorous
+    # setting).  A positive value selects at most that many evenly spaced
+    # windows per episode, which makes a fixed 150-epoch ablation feasible on
+    # long-horizon benchmarks without changing the recurrent update itself.
+    max_windows_per_episode: int | None = None
 
     # RoboTTT fast MLPs are inserted after attention and before the expert MLP.
     ttt_hidden_dim: int = 4096
@@ -172,6 +178,8 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("tbptt_segment_length must be positive")
         if self.tbptt_segment_length > self.sequence_length:
             raise ValueError("tbptt_segment_length cannot exceed sequence_length")
+        if self.max_windows_per_episode is not None and self.max_windows_per_episode <= 0:
+            raise ValueError("max_windows_per_episode must be positive when provided")
         if self.ttt_hidden_dim <= 0:
             raise ValueError("ttt_hidden_dim must be positive")
         if self.ttt_base_inner_lr <= 0:

@@ -67,13 +67,21 @@ class TailPreservingSequenceDataset(Dataset):
     ``sequence_length == sequence_stride == 256``, which covers every frame once.
     """
 
-    def __init__(self, dataset: Dataset, sequence_length: int, sequence_stride: int) -> None:
+    def __init__(
+        self,
+        dataset: Dataset,
+        sequence_length: int,
+        sequence_stride: int,
+        max_windows_per_episode: int | None = None,
+    ) -> None:
         if sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
         if sequence_stride <= 0:
             raise ValueError("sequence_stride must be positive")
         if sequence_stride > sequence_length:
             raise ValueError("sequence_stride cannot exceed sequence_length because that would drop frames")
+        if max_windows_per_episode is not None and max_windows_per_episode <= 0:
+            raise ValueError("max_windows_per_episode must be positive when provided")
 
         self.dataset = dataset
         self.sequence_length = sequence_length
@@ -84,7 +92,20 @@ class TailPreservingSequenceDataset(Dataset):
         for episode_length in _dataset_episode_lengths(dataset):
             if episode_length <= 0:
                 raise ValueError("Episode lengths must be positive")
-            for offset in range(0, episode_length, sequence_stride):
+            offsets = list(range(0, episode_length, sequence_stride))
+            if max_windows_per_episode is not None and len(offsets) > max_windows_per_episode:
+                # Deterministic, episode-local coverage: retain evenly spaced
+                # windows and always include the first window.  The default
+                # remains the full tail-preserving set, so this only changes
+                # explicitly requested long-horizon speed ablations.
+                positions = torch.linspace(
+                    0,
+                    len(offsets) - 1,
+                    max_windows_per_episode,
+                    dtype=torch.float32,
+                ).round().to(torch.long).tolist()
+                offsets = [offsets[int(position)] for position in sorted(set(positions))]
+            for offset in offsets:
                 window_length = min(sequence_length, episode_length - offset)
                 self.window_specs.append((episode_start + offset, window_length))
             episode_start += episode_length

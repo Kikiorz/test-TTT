@@ -86,6 +86,22 @@ def test_tail_preserving_sequence_windows_cover_every_frame_once() -> None:
     assert any(length < 256 for _, length in sequences.window_specs)
 
 
+def test_long_horizon_window_cap_is_deterministic_and_episode_balanced() -> None:
+    dataset = _EpisodeDataset([100, 35])
+    sequences = TailPreservingSequenceDataset(
+        dataset,
+        sequence_length=16,
+        sequence_stride=16,
+        max_windows_per_episode=2,
+    )
+
+    # Two windows per episode, with the first window retained for causal
+    # warm-up and a later evenly spaced window for temporal coverage.
+    assert len(sequences.window_specs) == 4
+    assert sequences.window_specs[0] == (0, 16)
+    assert sequences.window_specs[2] == (100, 16)
+
+
 def test_gate_is_fixed_during_ttt_only_stage() -> None:
     config = SmolVLATTTConfig(ttt_training_stage="ttt_only")
     layer = TTTMLPLayer(

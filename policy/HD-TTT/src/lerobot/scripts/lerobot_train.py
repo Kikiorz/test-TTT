@@ -665,6 +665,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             dataset,
             sequence_length=active_cfg.sequence_length,
             sequence_stride=active_cfg.sequence_stride,
+            max_windows_per_episode=getattr(active_cfg, "max_windows_per_episode", None),
         )
         shuffle = True
         sampler = None
