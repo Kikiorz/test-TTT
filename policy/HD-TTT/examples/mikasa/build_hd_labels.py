@@ -80,7 +80,12 @@ def _as_int(value: Any) -> int:
 def _episode_table(dataset: Any, selected: Sequence[int]) -> list[tuple[int, int, int]]:
     """Return ``(episode_id, local_start, length)`` for a selected dataset."""
 
-    episodes = dataset.meta.episodes
+    # ``LeRobotDataset`` exposes metadata through ``dataset.meta`` while
+    # ``LeRobotDatasetMetadata`` (used before constructing the selected view)
+    # exposes the same table directly.  Accept both so shard selection does
+    # not depend on which object the caller already has in memory.
+    metadata = getattr(dataset, "meta", dataset)
+    episodes = metadata.episodes
     if isinstance(episodes, Mapping):
         starts = episodes["dataset_from_index"]
         ends = episodes["dataset_to_index"]
@@ -104,7 +109,8 @@ def _episode_table(dataset: Any, selected: Sequence[int]) -> list[tuple[int, int
 
 
 def _selected_episodes(dataset: Any, start: int, end: int | None) -> list[int]:
-    total = int(dataset.meta.total_episodes)
+    metadata = getattr(dataset, "meta", dataset)
+    total = int(metadata.total_episodes)
     if start < 0 or start >= total:
         raise ValueError(f"episode-start must be in [0, {total}), got {start}")
     stop = total if end is None else end
