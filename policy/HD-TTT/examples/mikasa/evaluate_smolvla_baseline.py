@@ -213,14 +213,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     from mikasa_robo_suite.vla import benchmarking
 
     tasks = benchmarking.select_benchmark_tasks(env_ids=args.tasks)
+    if len(tasks) != 1:
+        raise ValueError(
+            "Evaluate exactly one MIKASA task per invocation.  Each task needs "
+            "its own dataset-root/statistics; run this script separately and "
+            "merge the JSON summaries afterward."
+        )
     benchmark_commit_fn = getattr(benchmarking, "benchmark_commit", None)
     benchmark_revision = benchmark_commit_fn() if callable(benchmark_commit_fn) else None
-    if len(tasks) == 2:
-        benchmark_subset = "two_task_subset"
-    elif len(tasks) == 1:
-        benchmark_subset = "single_task"
-    else:
-        benchmark_subset = "selected_task_set"
+    benchmark_subset = "single_task"
     policy = _load_policy(args)
     results: list[dict[str, Any]] = []
 

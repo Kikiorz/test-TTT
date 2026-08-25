@@ -14,11 +14,12 @@ Example (run inside the MIKASA Python 3.11 environment)::
       --dataset-root /workspace/data_mikasa_robo/data_lerobot/shell_game_color_lamp_touch_vla_v0 \
       --task ShellGameColorLampTouch-VLA-v0 --num-episodes 1 --sim-backend gpu
 
-For a reproducible two-task subset report use ``--num-episodes 50`` separately
-for each task.  This is not the complete 90-task benchmark: the color task is
-in the Short/Spatial split, while the shuffle ``_Long`` task is officially in
-the Medium/Tracking/MP split.  The script preserves that metadata in the
-output JSON.
+Run each task separately with its matching ``--dataset-root``.  The color and
+shuffle datasets have different normalization statistics; accepting both in a
+single invocation would silently apply the first dataset's processor to the
+second task.  This is not the complete 90-task benchmark: the color task is in
+the Short/Spatial split, while the shuffle ``_Long`` task is officially in the
+Medium/Tracking/MP split.
 """
 
 from __future__ import annotations
@@ -191,14 +192,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     from mikasa_robo_suite.vla import benchmarking
 
     tasks = benchmarking.select_benchmark_tasks(env_ids=args.tasks)
+    if len(tasks) != 1:
+        raise ValueError(
+            "Evaluate exactly one MIKASA task per invocation.  Each task needs "
+            "its own dataset-root/statistics; run this script separately and "
+            "merge the JSON summaries afterward."
+        )
     benchmark_commit_fn = getattr(benchmarking, "benchmark_commit", None)
     benchmark_revision = benchmark_commit_fn() if callable(benchmark_commit_fn) else None
-    if len(tasks) == 2:
-        benchmark_subset = "two_task_subset"
-    elif len(tasks) == 1:
-        benchmark_subset = "single_task"
-    else:
-        benchmark_subset = "selected_task_set"
+    benchmark_subset = "single_task"
     policy = _load_policy(args)
     results: list[dict[str, Any]] = []
     for task in tasks:
