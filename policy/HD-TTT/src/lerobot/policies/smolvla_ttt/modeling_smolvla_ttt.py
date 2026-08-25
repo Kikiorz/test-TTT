@@ -1357,10 +1357,24 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     slot_valid,
                     grounding_step_weights,
                 )
+                # Match the exact element-wise dead-zone used by
+                # ``counterfactual_grounding_loss``: high-rho rows compare
+                # student and teacher counterfactual deltas, while low-rho
+                # rows enforce student invariance.  Measuring only the raw
+                # teacher delta would report nearly 100% activity at
+                # margin=0 even when the optimized hinge is inactive.
+                direction_active = (
+                    (student_delta - teacher_delta).abs() > counterfactual_margin
+                ).to(dtype=teacher_delta.dtype).mean(dim=-1)
+                invariance_active = (student_delta.abs() > counterfactual_margin).to(
+                    dtype=teacher_delta.dtype
+                ).mean(dim=-1)
+                margin_active_field = (
+                    rho_weight.detach().float().unsqueeze(-1) * direction_active
+                    + (1.0 - rho_weight.detach().float().unsqueeze(-1)) * invariance_active
+                )
                 margin_active = self._hd_reduce_grounding_slots(
-                    (teacher_delta.abs() > counterfactual_margin)
-                    .to(dtype=teacher_delta.dtype)
-                    .mean(dim=-1),
+                    margin_active_field,
                     slot_valid,
                     grounding_step_weights,
                 )
