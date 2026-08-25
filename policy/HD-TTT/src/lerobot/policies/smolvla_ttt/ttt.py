@@ -319,7 +319,13 @@ class TTTMLPLayer(nn.Module):
             projected_inputs = projected_inputs.to(dtype=projection_dtype)
             if state is None:
                 state = self.initial_state(inputs.shape[0])
-            elif update and (
+            # A frozen hindsight teacher legitimately has every module
+            # parameter marked ``requires_grad=False``.  The local TTT update
+            # still needs differentiable *temporary* fast weights in order to
+            # call ``autograd.grad``; cloning them here does not unfreeze or
+            # accumulate gradients on the teacher parameters.  Keep the same
+            # path for inference-mode tensors and externally detached states.
+            if update and (
                 outer_inference_enabled or not all(tensor.requires_grad for tensor in state.tensors())
             ):
                 state = TTTFastState(

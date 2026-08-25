@@ -118,6 +118,22 @@ def test_fast_state_carries_across_detached_tbptt_segments() -> None:
     assert split_state.position.tolist() == joint_state.position.tolist() == [5]
 
 
+def test_frozen_teacher_still_computes_local_fast_weight_updates() -> None:
+    """Freezing outer parameters must not disable the deployment-time inner loop."""
+
+    torch.manual_seed(2)
+    layer = TTTMLPLayer(dim=8, hidden_dim=16, effective_gate_init=0.05, second_order=False)
+    layer.requires_grad_(False)
+    inputs = torch.randn(1, 3, 2, 8)
+
+    with torch.no_grad():
+        outputs, state = layer(inputs, update=True, create_graph=False)
+
+    assert torch.isfinite(outputs).all()
+    assert state.position.tolist() == [2]
+    assert all(not parameter.requires_grad for parameter in layer.parameters())
+
+
 def test_zero_write_gate_skips_fast_weight_mutation_but_advances_position() -> None:
     torch.manual_seed(3)
     layer = TTTMLPLayer(dim=8, hidden_dim=16, effective_gate_init=0.05, second_order=False)
