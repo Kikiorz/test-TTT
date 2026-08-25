@@ -158,7 +158,12 @@ class SmolVLATTTConfig(PreTrainedConfig):
     hd_max_events: int = 0
     hd_attribution_threshold: float = 0.0
     hd_attribution_topk: int = 8
-    hd_counterfactual_margin: float = 0.05
+    # Flow velocities in MIKASA's normalized action space are often much
+    # smaller than 0.05.  A non-zero dead-zone would therefore erase most of
+    # the counterfactual grounding signal before it reaches the reader.  Keep
+    # the objective faithful to the squared counterfactual error by default;
+    # experiments that need a tolerance must opt into it explicitly.
+    hd_counterfactual_margin: float = 0.0
     # ``random`` preserves ordinary flow-matching training. ``deployment``
     # makes the writer see the same first-denoise distribution as deployment:
     # a pure Gaussian action chunk (t=1), with no teacher-forced future action

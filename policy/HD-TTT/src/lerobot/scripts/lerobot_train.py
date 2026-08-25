@@ -1019,6 +1019,28 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             "hd_gate_observed_fraction",
         ):
             train_metrics[metric_name] = AverageMeter(metric_name, ":.3f")
+        # These diagnostics are deliberately separate from the optimized
+        # objectives.  Their finer display precision is needed to distinguish
+        # a genuinely inactive grounding loss from a small positive value that
+        # would otherwise be rounded to ``0.000``.
+        for metric_name in (
+            "hd_gate_pred_std",
+            "hd_gate_target_std",
+            "hd_gate_corr",
+            "hd_gate_constant",
+            "hd_gate_gain_vs_constant",
+            "hd_gate_weight_mass",
+            "hd_grounding_direction",
+            "hd_grounding_invariance",
+            "hd_grounding_weight_mass",
+            "hd_grounding_rho_nonzero_fraction",
+            "hd_grounding_wrong_gate_zero_fraction",
+            "hd_grounding_teacher_delta_rms",
+            "hd_grounding_student_delta_rms",
+            "hd_grounding_delta_ratio",
+            "hd_grounding_margin_active_fraction",
+        ):
+            train_metrics[metric_name] = AverageMeter(metric_name, ":.5f")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
     effective_batch_size = cfg.batch_size * accelerator.num_processes
@@ -1088,6 +1110,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "hd_gate_pred_mean",
                 "hd_gate_target_mean",
                 "hd_gate_observed_fraction",
+                "hd_gate_pred_std",
+                "hd_gate_target_std",
+                "hd_gate_corr",
+                "hd_gate_constant",
+                "hd_gate_gain_vs_constant",
+                "hd_gate_weight_mass",
+                "hd_grounding_direction",
+                "hd_grounding_invariance",
+                "hd_grounding_weight_mass",
+                "hd_grounding_rho_nonzero_fraction",
+                "hd_grounding_wrong_gate_zero_fraction",
+                "hd_grounding_teacher_delta_rms",
+                "hd_grounding_student_delta_rms",
+                "hd_grounding_delta_ratio",
+                "hd_grounding_margin_active_fraction",
             ):
                 if metric_name in output_dict:
                     setattr(train_tracker, metric_name, output_dict[metric_name])

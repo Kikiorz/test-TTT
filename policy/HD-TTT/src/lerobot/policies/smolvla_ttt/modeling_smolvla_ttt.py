@@ -881,6 +881,38 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         )
 
     @staticmethod
+    def _hd_reduce_grounding_slots(
+        values: Tensor,
+        slot_valid: Tensor | None,
+        step_weights: Tensor | None,
+    ) -> Tensor:
+        """Reduce a ``[B,T,S]`` grounding field without double padding weights.
+
+        ``slot_valid`` identifies real action-chunk slots.  When it is
+        available, first average the valid slots *within each physical
+        timestep* and only then apply the fractional timestep weight (for
+        example ``S_valid / S``).  Multiplying the unnormalised slot field by
+        that fraction would count the same padding factor twice and make a
+        terminal frame with one valid slot contribute quadratically less than
+        a full frame.
+        """
+
+        if slot_valid is None:
+            return SmolVLATTTPolicy._hd_weighted_mean(values, step_weights)
+        if values.ndim != 3 or slot_valid.ndim != 3:
+            raise ValueError(
+                "grounding slot reduction expects values and slot_valid with shape [B,T,S]"
+            )
+        slot_valid = torch.broadcast_to(slot_valid, values.shape).to(
+            device=values.device, dtype=values.dtype
+        )
+        valid_count = slot_valid.sum(dim=-1)
+        per_step = (values * slot_valid).sum(dim=-1) / valid_count.clamp_min(1.0)
+        if step_weights is None:
+            step_weights = (valid_count > 0).to(dtype=values.dtype)
+        return SmolVLATTTPolicy._hd_weighted_mean(per_step, step_weights)
+
+    @staticmethod
     def _clone_fast_states(
         fast_states: TTTFastStates | None,
         *,
@@ -1144,6 +1176,53 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                         (gate_weights > 0).to(dtype=student_velocity.dtype).mean().item()
                     )
 
+                # A matching mean is not enough to show that the local gate
+                # uses the current interaction: a constant predictor can
+                # achieve the same value whenever the target distribution is
+                # imbalanced.  Keep these detached diagnostics out of the
+                # optimized objective so they do not alter the HD recipe.
+                diagnostic_pred = predicted_gate.detach().float()
+                diagnostic_target = target_gate.detach().float().clamp(0, 1)
+                if gate_weights is None:
+                    diagnostic_weights = torch.ones_like(diagnostic_pred)
+                else:
+                    diagnostic_weights = gate_weights.detach().float().clamp_min(0)
+                diagnostic_denominator = diagnostic_weights.sum().clamp_min(1e-8)
+
+                def _gate_mean(value: Tensor) -> Tensor:
+                    return (value * diagnostic_weights).sum() / diagnostic_denominator
+
+                pred_mean = _gate_mean(diagnostic_pred)
+                target_mean = _gate_mean(diagnostic_target)
+                pred_variance = _gate_mean((diagnostic_pred - pred_mean).square())
+                target_variance = _gate_mean((diagnostic_target - target_mean).square())
+                covariance = _gate_mean(
+                    (diagnostic_pred - pred_mean) * (diagnostic_target - target_mean)
+                )
+                correlation_denominator = (pred_variance * target_variance).sqrt()
+                correlation = torch.where(
+                    correlation_denominator > 1e-8,
+                    covariance / correlation_denominator.clamp_min(1e-8),
+                    torch.zeros_like(correlation_denominator),
+                )
+                constant_error = F.smooth_l1_loss(
+                    torch.full_like(diagnostic_target, target_mean),
+                    diagnostic_target,
+                    reduction="none",
+                )
+                constant_loss = _gate_mean(constant_error)
+                gain_vs_constant = torch.where(
+                    constant_loss > 1e-8,
+                    (constant_loss - gate_loss.detach().float()) / constant_loss,
+                    torch.zeros_like(constant_loss),
+                )
+                metrics["hd_gate_pred_std"] = float(pred_variance.sqrt().item())
+                metrics["hd_gate_target_std"] = float(target_variance.sqrt().item())
+                metrics["hd_gate_corr"] = float(correlation.clamp(-1, 1).item())
+                metrics["hd_gate_constant"] = float(constant_loss.item())
+                metrics["hd_gate_gain_vs_constant"] = float(gain_vs_constant.item())
+                metrics["hd_gate_weight_mass"] = float(diagnostic_weights.sum().item())
+
         if wrong_student_velocity is not None:
             grounding_student = (
                 student_velocity
@@ -1236,14 +1315,97 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 )
                 if slot_valid is not None:
                     slot_valid = torch.broadcast_to(slot_valid, grounding_per_token.shape)
-                    grounding_weights = slot_valid
-                    if valid_steps is not None:
-                        grounding_weights = grounding_weights * valid_steps.unsqueeze(-1)
-                else:
-                    grounding_weights = valid_steps
-                grounding = self._hd_weighted_mean(grounding_per_token, grounding_weights)
+                grounding_step_weights = valid_steps
+                if slot_valid is not None and grounding_step_weights is None:
+                    grounding_step_weights = (slot_valid.sum(dim=-1) > 0).to(
+                        dtype=grounding_per_token.dtype
+                    )
+                # Reduce valid action slots within a physical timestep before
+                # applying the fractional timestep mask.  This avoids the
+                # previous K^2/S weighting at episode boundaries (K valid
+                # slots out of S total slots).
+                grounding = self._hd_reduce_grounding_slots(
+                    grounding_per_token,
+                    slot_valid,
+                    grounding_step_weights,
+                )
                 total = total + grounding_weight * grounding
                 metrics["hd_grounding"] = float(grounding.detach().item())
+
+                # Detached support/scale diagnostics distinguish an actually
+                # absent counterfactual signal from a small loss rounded to
+                # zero in the terminal log.  They never enter ``total``.
+                teacher_delta = (teacher_true_active - teacher_wrong_active).detach().float()
+                student_delta = (student_true_active - student_wrong_active).detach().float()
+                teacher_delta_rms = self._hd_reduce_grounding_slots(
+                    teacher_delta.square().mean(dim=-1).sqrt(),
+                    slot_valid,
+                    grounding_step_weights,
+                )
+                student_delta_rms = self._hd_reduce_grounding_slots(
+                    student_delta.square().mean(dim=-1).sqrt(),
+                    slot_valid,
+                    grounding_step_weights,
+                )
+                direction_metric = self._hd_reduce_grounding_slots(
+                    grounding_parts.direction.detach().float(),
+                    slot_valid,
+                    grounding_step_weights,
+                )
+                invariance_metric = self._hd_reduce_grounding_slots(
+                    grounding_parts.invariance.detach().float(),
+                    slot_valid,
+                    grounding_step_weights,
+                )
+                margin_active = self._hd_reduce_grounding_slots(
+                    (teacher_delta.abs() > counterfactual_margin)
+                    .to(dtype=teacher_delta.dtype)
+                    .mean(dim=-1),
+                    slot_valid,
+                    grounding_step_weights,
+                )
+                if grounding_step_weights is None:
+                    grounding_support = teacher_delta.new_tensor(float(B * T))
+                else:
+                    grounding_support = grounding_step_weights.detach().float().sum()
+                rho_support = self._hd_weighted_mean(
+                    (rho_weight.detach().float() > 1e-6).to(dtype=teacher_delta.dtype),
+                    grounding_step_weights,
+                )
+                counterfactual_gate = self._hd_step_weight(
+                    self._reshape_hd_field(
+                        batch.get("hd_counterfactual_write_gate"),
+                        sequence_shape,
+                        name="hd_counterfactual_write_gate",
+                    ),
+                    (B, T),
+                    device=teacher_delta.device,
+                    dtype=teacher_delta.dtype,
+                    name="hd_counterfactual_write_gate",
+                )
+                if counterfactual_gate is None:
+                    wrong_gate_zero_fraction = teacher_delta.new_zeros(())
+                else:
+                    wrong_gate_zero_fraction = self._hd_weighted_mean(
+                        (counterfactual_gate.detach() <= 1e-6).to(dtype=teacher_delta.dtype),
+                        grounding_step_weights,
+                    )
+                delta_ratio = torch.where(
+                    teacher_delta_rms > 1e-8,
+                    student_delta_rms / teacher_delta_rms,
+                    torch.zeros_like(teacher_delta_rms),
+                )
+                metrics["hd_grounding_direction"] = float(direction_metric.item())
+                metrics["hd_grounding_invariance"] = float(invariance_metric.item())
+                metrics["hd_grounding_weight_mass"] = float(grounding_support.item())
+                metrics["hd_grounding_rho_nonzero_fraction"] = float(rho_support.item())
+                metrics["hd_grounding_wrong_gate_zero_fraction"] = float(
+                    wrong_gate_zero_fraction.item()
+                )
+                metrics["hd_grounding_teacher_delta_rms"] = float(teacher_delta_rms.item())
+                metrics["hd_grounding_student_delta_rms"] = float(student_delta_rms.item())
+                metrics["hd_grounding_delta_ratio"] = float(delta_ratio.item())
+                metrics["hd_grounding_margin_active_fraction"] = float(margin_active.item())
 
         return total, metrics
 

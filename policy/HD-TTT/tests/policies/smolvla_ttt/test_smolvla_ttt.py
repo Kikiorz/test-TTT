@@ -68,6 +68,7 @@ def test_default_ttt_layers_match_last_four_smolvla_expert_layers() -> None:
     assert config.resolved_ttt_layer_indices == [12, 13, 14, 15]
     assert config.ttt_num_register_tokens == 16
     assert config.n_action_steps == 1
+    assert config.hd_counterfactual_margin == 0.0
 
 
 def test_legacy_null_hd_flags_decode_as_clean_checkpoint() -> None:
@@ -991,6 +992,24 @@ def test_hd_action_validity_retains_chunk_slot_mask() -> None:
         dtype=torch.float32,
     )
     torch.testing.assert_close(step_valid, torch.tensor([[2 / 3, 1 / 3, 1.0, 0.0]]))
+
+
+def test_grounding_slot_reduction_does_not_square_terminal_padding_weight() -> None:
+    # The second timestep has one valid slot out of three.  First averaging
+    # valid slots and then applying the 1/3 timestep weight gives
+    # (1*1 + 3*(1/3)) / (1 + 1/3) = 1.5.  Multiplying the raw slot field by
+    # 1/3 before reduction would incorrectly produce 1.2.
+    values = torch.tensor([[[1.0, 1.0, 1.0], [3.0, 3.0, 3.0]]])
+    slot_valid = torch.tensor([[[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]])
+    step_weights = torch.tensor([[1.0, 1.0 / 3.0]])
+
+    reduced = SmolVLATTTPolicy._hd_reduce_grounding_slots(
+        values,
+        slot_valid,
+        step_weights,
+    )
+
+    torch.testing.assert_close(reduced, torch.tensor(1.5))
 
 
 def test_tbptt_writer_mask_keeps_history_only_segment_trainable() -> None:
