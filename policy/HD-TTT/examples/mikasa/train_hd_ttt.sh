@@ -3,10 +3,12 @@
 # Reproducible MIKASA HD-TTT training recipe.
 #
 # The default recipe uses four deterministic, episode-balanced windows per
-# long demonstration and 150 passes.  The window-keyed HD artifact stores a
+# long demonstration and 150 passes.  A window-keyed HD artifact stores a
 # complete replay context for each selected window, so this cap is an exact
-# contract rather than an approximate frame-label shortcut.  Set it to
-# ``none`` for full-window coverage.
+# contract rather than an approximate frame-label shortcut.  For the strict
+# full-history Shuffle teacher/HD recipe, use the frame-level artifact emitted
+# by ``build_hd_labels.py`` and set ``MAX_WINDOWS_PER_EPISODE=1`` with
+# ``HISTORY_WARMUP_LENGTH=full``; the one window then covers each whole episode.
 
 set -euo pipefail
 
@@ -34,10 +36,10 @@ else
   HISTORY_WARMUP_ARG="${HISTORY_WARMUP_LENGTH}"
 fi
 # Window-keyed HD labels carry their numeric replay context in metadata and
-# are checked against this value at startup.  For the current Shuffle data
-# (maximum 513 frames), use HISTORY_WARMUP_LENGTH=513 for a full-episode
-# replay; reserve the human-readable ``full`` sentinel above for an unlabeled
-# teacher run or a future artifact whose loader explicitly records None.
+# are checked against this value at startup.  If LABEL_PATH points to the
+# frame-level full-episode artifact from ``build_hd_labels.py``, the ``full``
+# sentinel above is the correct setting; for a window-keyed artifact use its
+# exact numeric context length instead.
 TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
 REGISTER_TOKENS="${REGISTER_TOKENS:-16}"
