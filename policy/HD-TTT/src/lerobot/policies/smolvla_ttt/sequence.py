@@ -23,6 +23,11 @@ from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import ACTION
 
 SEQUENCE_SHAPE_KEY = "_lerobot_sequence_shape"
+# Complementary frame mask for training-only HD writer objectives.  Unlike
+# ``action_is_pad`` it remains true on replayed history frames: those frames
+# have no imitation target in the current window, but their causal interaction
+# still must train the local K/V objective and the deployable write gate.
+HD_WRITER_VALID_KEY = "hd_writer_valid"
 
 
 def _selected_episode_lengths(dataset: Dataset) -> list[int]:
@@ -152,11 +157,17 @@ class TailPreservingSequenceDataset(Dataset):
         samples: list[dict[str, Any]] = []
         for absolute_index in range(history_start, start_index + window_length):
             sample = dict(self.dataset[absolute_index])
+            # Hindsight labels are complementary data and are present only in
+            # an HD run.  Mark every physical frame carrying them as a valid
+            # writer interaction, including the history prefix below.  The
+            # target action remains masked independently via action_is_pad.
+            if any(isinstance(key, str) and key.startswith("hd_") for key in sample):
+                sample[HD_WRITER_VALID_KEY] = torch.tensor(True, dtype=torch.bool)
             # The warm-up is intentionally part of the recurrent computation,
-            # but it must not contribute an imitation or HD auxiliary loss.
-            # Reusing LeRobot's action padding convention lets the existing
-            # loss, TBPTT weighting, and HCA/H2L grounding masks handle this
-            # without introducing a second complementary-data field.
+            # but it must not contribute an imitation/HCA/grounding target.
+            # Reusing LeRobot's action padding convention masks those action
+            # losses.  ``hd_writer_valid`` above keeps the separate local
+            # writer/gate objective alive for labeled history frames.
             if absolute_index < target_start:
                 action_is_pad = sample.get("action_is_pad")
                 if isinstance(action_is_pad, torch.Tensor):

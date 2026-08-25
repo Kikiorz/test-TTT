@@ -47,14 +47,25 @@ For the paper HD-TTT run, enable the learned gate as well:
 --policy.hd_ttt_enabled=true --policy.hd_learned_write_gate=true
 ```
 
-The first selected TTT layer predicts one scalar `g_t` in `(0,1)` from the first
-causal action slot of the current suffix (the slot after the register prefix). The
-same gate is used by every selected TTT layer. The offline `hd_write_gate`/`u_t`
-label is only a Smooth-L1 training target; it is never supplied at deployment. The
-first denoising step advances the fast state with the predicted gate and later
-denoising steps only read it. Since the first action slot cannot attend to later
-action slots, the gate has no access to future action-chunk tokens. `hd_ttt_enabled=false`
-does not construct or call this head, preserving the ordinary TTT path.
+The first selected TTT layer predicts one scalar `g_t` in `(0,1)` from a masked
+pool of the current observation prefix (image, language, and proprioceptive
+state embeddings). It is computed before the action suffix is embedded, so it
+has no access to candidate actions, flow noise, or the denoising timestep. The
+same gate is used by every selected TTT layer. The offline
+`hd_write_gate`/`u_t` label is only a Smooth-L1 training target; it is never
+supplied at deployment. The first denoising step advances the fast state with
+the predicted gate and later denoising steps only read it. A context-free
+`TTTMLPLayer` can still be instantiated for an explicit action-conditioned
+unit-test ablation, but production HD checkpoints always construct the
+prefix-context head. `hd_ttt_enabled=false` does not construct or call this
+head when loading a clean/base checkpoint, preserving the ordinary TTT path.
+
+History warm-up frames carry a separate `hd_writer_valid` mask. Their action
+targets remain masked, while the local K/V and gate losses still train on the
+real interactions that prefill the recurrent state. If a label pass uses a
+positive `--max-events` cap, `hd_write_gate_observed` masks gate distillation on
+unsampled blocks; the safe default gate of 1.0 is never treated as measured
+credit.
 
 When initializing HD-TTT from an existing clean TTT checkpoint, start a new run with
 `--policy.pretrained_path=<checkpoint>` and the two HD flags above. Do not resume the
@@ -68,7 +79,8 @@ Pass `--dataset.hd_label_path=/path/to/labels.pt` (or a directory containing
 dataset. The loader accepts one row per dataset frame, episode/frame records,
 or episode-packed columns. Canonical columns are `hd_teacher_velocity`,
 `hd_teacher_true_velocity`, `hd_teacher_wrong_velocity`, `hd_attribution`,
-`hd_rho`, `hd_write_gate`, `hd_counterfactual_write_gate`, and the optional
+`hd_rho`, `hd_write_gate`, `hd_write_gate_observed`,
+`hd_counterfactual_write_gate`, and the optional
 `hd_local_{key,value,prediction,query}` tensors. Short aliases such as `rho`,
 `u`, `write_gate`, `C`, `hd_u`, and `hd_C` are accepted; a full `C[event,future]` matrix is
 reduced to one future-time attribution weight before batching. Labels are

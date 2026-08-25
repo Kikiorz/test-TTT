@@ -81,6 +81,7 @@ class TTTMLPLayer(nn.Module):
         learned_write_gate: bool = False,
         write_gate_init: float = 0.95,
         write_gate_token_index: int = 0,
+        write_gate_context_dim: int | None = None,
     ) -> None:
         super().__init__()
         if dim <= 0 or hidden_dim <= 0:
@@ -95,6 +96,8 @@ class TTTMLPLayer(nn.Module):
             raise ValueError("write_gate_init must be strictly between 0 and 1")
         if write_gate_token_index < 0:
             raise ValueError("write_gate_token_index must be non-negative")
+        if write_gate_context_dim is not None and write_gate_context_dim <= 0:
+            raise ValueError("write_gate_context_dim must be positive when provided")
 
         self.dim = dim
         self.hidden_dim = hidden_dim
@@ -104,16 +107,24 @@ class TTTMLPLayer(nn.Module):
         self.learned_write_gate = learned_write_gate
         self.write_gate_token_index = write_gate_token_index
         self.write_gate_init = write_gate_init
+        self.write_gate_context_dim = write_gate_context_dim
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
-        # This head is intentionally local to the TTT layer and is only
-        # constructed for the HD-TTT learned-gate variant.  The input is the
-        # first action token (after any register prefix); the causal suffix
-        # mask guarantees that it can read the observation prefix and its own
-        # current candidate action, but no future action token.
-        self.write_gate_head = nn.Linear(dim, 1) if learned_write_gate else None
+        # Production HD-TTT uses only the observation/state prefix summary.
+        # Keep the token head available only for the explicitly constructed
+        # context-free layer used by low-level tests/ablations; a layer that
+        # has a prefix context can therefore never silently fall back to an
+        # action/noise-dependent gate.
+        self.write_gate_head = (
+            nn.Linear(dim, 1) if learned_write_gate and write_gate_context_dim is None else None
+        )
+        self.write_gate_context_head = (
+            nn.Linear(write_gate_context_dim, 1)
+            if learned_write_gate and write_gate_context_dim is not None
+            else None
+        )
 
         self.fast_w1_init = nn.Parameter(torch.empty(hidden_dim, dim))
         self.fast_b1_init = nn.Parameter(torch.empty(hidden_dim))
@@ -136,6 +147,10 @@ class TTTMLPLayer(nn.Module):
             nn.init.zeros_(self.write_gate_head.weight)
             init_logit = math.log(self.write_gate_init / (1.0 - self.write_gate_init))
             nn.init.constant_(self.write_gate_head.bias, init_logit)
+        if self.write_gate_context_head is not None:
+            nn.init.zeros_(self.write_gate_context_head.weight)
+            init_logit = math.log(self.write_gate_init / (1.0 - self.write_gate_init))
+            nn.init.constant_(self.write_gate_context_head.bias, init_logit)
 
         nn.init.kaiming_uniform_(self.fast_w1_init, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.fast_w2_init, a=math.sqrt(5))
@@ -182,22 +197,36 @@ class TTTMLPLayer(nn.Module):
         normalized_inputs = F.layer_norm(inputs, (self.dim,))
         return self.k_proj(normalized_inputs), self.v_proj(normalized_inputs)
 
-    def predict_write_gate(self, inputs: Tensor) -> Tensor:
+    def predict_write_gate(self, inputs: Tensor, context: Tensor | None = None) -> Tensor:
         """Predict a causal scalar write gate for each physical timestep.
 
-        ``inputs`` has shape ``[B,T,N,D]``.  Only one action slot is read,
-        rather than pooling the complete 50-action chunk: pooling all slots
-        would expose future candidate actions during training and make the
-        hindsight target unavailable at deployment.  The returned ``[B,T]``
-        gate remains differentiable for the local distillation loss.
+        With ``context`` the head consumes an observation-only prefix summary
+        of shape ``[B,T,C]``.  A context-aware production layer rejects calls
+        without that summary, so action/noise/timestep tokens cannot become a
+        hidden shortcut.  A context-free layer can still be instantiated for
+        isolated unit tests or an explicit action-conditioned ablation.  The
+        returned ``[B,T]`` gate remains differentiable for distillation.
         """
 
-        if self.write_gate_head is None:
+        if self.write_gate_head is None and self.write_gate_context_head is None:
             raise RuntimeError("predict_write_gate requires learned_write_gate=True")
+        if context is not None:
+            if self.write_gate_context_head is None:
+                raise RuntimeError("This gate layer was not initialized with a prefix context head")
+            if context.ndim != 3 or context.shape[-1] != self.write_gate_context_dim:
+                raise ValueError(
+                    "Expected prefix context [B,T,"
+                    f"{self.write_gate_context_dim}], got {tuple(context.shape)}"
+                )
+            context = F.layer_norm(context, (self.write_gate_context_dim,))
+            context = context.to(dtype=self.write_gate_context_head.weight.dtype)
+            return torch.sigmoid(self.write_gate_context_head(context).squeeze(-1))
         if inputs.ndim != 4 or inputs.shape[-1] != self.dim:
             raise ValueError(
                 f"Expected [B,T,N,{self.dim}] inputs, got {tuple(inputs.shape)}"
             )
+        if self.write_gate_head is None:
+            raise RuntimeError("A prefix context is required for this learned gate layer")
         if self.write_gate_token_index >= inputs.shape[2]:
             raise ValueError(
                 f"write_gate_token_index={self.write_gate_token_index} is outside token axis "
@@ -382,6 +411,14 @@ class TTTMLPLayer(nn.Module):
             torch.enable_grad(),
             torch.autocast(device_type=inputs.device.type, enabled=False),
         ):
+            # ``sample_actions`` is normally called from an outer
+            # ``torch.inference_mode`` context.  A learned gate created there
+            # is an inference tensor and cannot participate in the temporary
+            # autograd graph used by the update-then-apply inner loop.  Make a
+            # regular leaf only on that inference path; training keeps the
+            # original differentiable gate tensor untouched.
+            if outer_inference_enabled and write_gate is not None:
+                write_gate = write_gate.detach().clone()
             projected_inputs = inputs.detach().clone() if outer_inference_enabled else inputs
             projected_inputs = projected_inputs.to(dtype=projection_dtype)
             if state is None:

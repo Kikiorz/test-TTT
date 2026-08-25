@@ -236,8 +236,16 @@ def _tbptt_segment_loss_weights(
     segment_length: int,
     *,
     weight_by_valid_actions: bool,
+    include_writer_valid: bool = False,
 ) -> list[float]:
-    """Return weights that reconstruct the full valid-action mean across TBPTT segments."""
+    """Return segment weights for action and optional HD-writer supervision.
+
+    Ordinary TTT uses valid action counts so padded action chunks do not bias
+    the sequence mean.  HD windows can additionally contain replayed history
+    frames whose ``action_is_pad`` flag is intentionally true; when requested,
+    those physical interactions are counted through ``hd_writer_valid`` so a
+    warm-up-only segment still contributes its gate/H2L gradients.
+    """
     batch_size, sequence_length = sequence_shape
     actions_is_pad = batch.get("action_is_pad") if weight_by_valid_actions else None
     segment_valid_counts: list[int] = []
@@ -253,12 +261,32 @@ def _tbptt_segment_loss_weights(
             )
         action_padding = actions_is_pad.reshape(batch_size, sequence_length, -1)
 
+    writer_valid = batch.get("hd_writer_valid") if include_writer_valid else None
+    if writer_valid is not None:
+        if not isinstance(writer_valid, torch.Tensor):
+            raise TypeError("hd_writer_valid must be a tensor for TTT sequence training")
+        writer_valid = writer_valid.reshape(-1)
+        if writer_valid.numel() != batch_size * sequence_length:
+            raise ValueError(
+                "hd_writer_valid must contain one value per flattened sequence frame "
+                f"[{batch_size * sequence_length}], got {tuple(writer_valid.shape)}"
+            )
+        writer_valid = writer_valid.reshape(batch_size, sequence_length).bool()
+
     for segment_start in range(0, sequence_length, segment_length):
         segment_end = min(segment_start + segment_length, sequence_length)
         if actions_is_pad is None:
-            valid_count = batch_size * (segment_end - segment_start)
+            action_valid_count = batch_size * (segment_end - segment_start)
         else:
-            valid_count = int((~action_padding[:, segment_start:segment_end]).sum().item())
+            action_valid_count = int((~action_padding[:, segment_start:segment_end]).sum().item())
+        if writer_valid is not None:
+            writer_valid_count = int(writer_valid[:, segment_start:segment_end].sum().item())
+            # The segment contains two internally normalized objectives.  A
+            # union/max count gives zero-action warm-up segments non-zero
+            # weight while retaining the usual action weighting elsewhere.
+            valid_count = max(action_valid_count, writer_valid_count)
+        else:
+            valid_count = action_valid_count
         segment_valid_counts.append(valid_count)
 
     total_valid_count = sum(segment_valid_counts)
@@ -303,6 +331,10 @@ def update_policy_tbptt(
         segment_length,
         weight_by_valid_actions=(
             getattr(unwrapped_policy, "tbptt_loss_weighting", None) == "valid_actions"
+        ),
+        include_writer_valid=bool(
+            getattr(getattr(unwrapped_policy, "config", None), "hd_ttt_enabled", False)
+            and "hd_writer_valid" in batch
         ),
     )
 
@@ -756,7 +788,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
     if is_smolvla_ttt and getattr(cfg.policy, "hd_ttt_enabled", False):
-        for metric_name in ("hd_hca", "hd_h2l", "hd_gate", "hd_grounding"):
+        for metric_name in (
+            "hd_hca",
+            "hd_h2l",
+            "hd_gate",
+            "hd_grounding",
+            "hd_gate_pred_mean",
+            "hd_gate_target_mean",
+            "hd_gate_observed_fraction",
+        ):
             train_metrics[metric_name] = AverageMeter(metric_name, ":.3f")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
@@ -819,7 +859,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 sample_weighter=sample_weighter,
             )
         if is_smolvla_ttt and cfg.policy.hd_ttt_enabled:
-            for metric_name in ("hd_hca", "hd_h2l", "hd_gate", "hd_grounding"):
+            for metric_name in (
+                "hd_hca",
+                "hd_h2l",
+                "hd_gate",
+                "hd_grounding",
+                "hd_gate_pred_mean",
+                "hd_gate_target_mean",
+                "hd_gate_observed_fraction",
+            ):
                 if metric_name in output_dict:
                     setattr(train_tracker, metric_name, output_dict[metric_name])
 

@@ -19,7 +19,7 @@ from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import (
     _restore_checkpoint_model_fields,
     _validate_checkpoint_keys,
 )
-from lerobot.policies.smolvla_ttt.sequence import TailPreservingSequenceDataset
+from lerobot.policies.smolvla_ttt.sequence import HD_WRITER_VALID_KEY, TailPreservingSequenceDataset
 from lerobot.policies.smolvla_ttt.smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
 from lerobot.policies.smolvla_ttt.ttt import TTTMLPLayer
 from lerobot.scripts.lerobot_train import _tbptt_segment_loss_weights
@@ -65,6 +65,11 @@ def test_config_allows_disabling_register_tokens_and_rejects_negative_count() ->
     assert SmolVLATTTConfig(ttt_num_register_tokens=0).ttt_num_register_tokens == 0
     with pytest.raises(ValueError, match="ttt_num_register_tokens must be non-negative"):
         SmolVLATTTConfig(ttt_num_register_tokens=-1)
+
+
+def test_learned_gate_requires_hd_objective() -> None:
+    with pytest.raises(ValueError, match="hd_learned_write_gate requires hd_ttt_enabled"):
+        SmolVLATTTConfig(hd_learned_write_gate=True)
 
 
 def test_config_rejects_layers_without_a_reduced_expert_layer() -> None:
@@ -129,6 +134,7 @@ def test_history_warmup_masks_prefix_but_keeps_it_in_the_recurrent_window() -> N
     assert [sample["frame_index"] for sample in samples] == [1, 2, 3, 4, 5, 6, 7]
     assert all(bool(samples[index]["action_is_pad"].all()) for index in range(3))
     assert all(not bool(samples[index]["action_is_pad"].any()) for index in range(3, 7))
+    assert all(bool(sample[HD_WRITER_VALID_KEY]) for sample in samples)
 
 
 def test_none_history_warmup_replays_from_episode_start() -> None:
@@ -250,6 +256,34 @@ def test_learned_write_gate_controls_state_updates() -> None:
         not torch.equal(a, b)
         for a, b in zip(learned_state.tensors(), skipped_state.tensors(), strict=True)
     )
+
+
+def test_prefix_context_gate_never_reads_action_or_denoising_inputs() -> None:
+    torch.manual_seed(23)
+    layer = TTTMLPLayer(
+        dim=8,
+        hidden_dim=16,
+        second_order=False,
+        learned_write_gate=True,
+        write_gate_init=0.5,
+        write_gate_context_dim=6,
+    )
+    with torch.no_grad():
+        layer.write_gate_context_head.weight.copy_(torch.arange(6, dtype=torch.float32)[None, :] / 10)
+    inputs = torch.randn(2, 3, 5, 8)
+    context = torch.randn(2, 3, 6)
+    gates = layer.predict_write_gate(inputs, context=context)
+    changed_inputs = inputs + 1000.0
+    changed_context = context.clone()
+    changed_context[:, 1] += 1000.0
+    changed_gates = layer.predict_write_gate(changed_inputs, context=changed_context)
+    # The action/noise tensor is ignored; only the corresponding prefix row
+    # may change when its observation context changes.
+    torch.testing.assert_close(changed_gates[:, 0], gates[:, 0], atol=0, rtol=0)
+    torch.testing.assert_close(changed_gates[:, 2], gates[:, 2], atol=0, rtol=0)
+    assert not torch.equal(changed_gates[:, 1], gates[:, 1])
+    with pytest.raises(RuntimeError, match="prefix context is required"):
+        layer.predict_write_gate(inputs)
 
 
 def test_zero_write_gate_skips_fast_weight_mutation_but_advances_position() -> None:
@@ -412,6 +446,23 @@ def test_flow_forward_with_state_auto_injects_one_shared_learned_gate() -> None:
     assert losses.shape == (2, 2, 3)
     assert predicted_gate.shape == (1, 2)
     assert torch.all((predicted_gate > 0) & (predicted_gate < 1))
+
+
+def test_inference_mode_can_run_a_learned_gate_inner_update() -> None:
+    layer = TTTMLPLayer(
+        dim=4,
+        hidden_dim=8,
+        second_order=False,
+        learned_write_gate=True,
+        write_gate_context_dim=4,
+    )
+    inputs = torch.randn(1, 2, 3, 4)
+    context = torch.randn(1, 2, 4)
+    with torch.inference_mode():
+        gate = layer.predict_write_gate(inputs, context=context)
+        _, state = layer(inputs, update=True, write_gate=gate, create_graph=False)
+    assert state.position.tolist() == [1]
+    assert all(torch.isfinite(tensor).all() for tensor in state.tensors())
 
 
 def test_hindsight_attribution_is_causal_and_counterfactual_reader_is_teacher_detached() -> None:
@@ -622,7 +673,10 @@ def test_checkpoint_restore_preserves_explicit_hd_opt_in_over_clean_ttt_source()
 
 
 def test_old_ttt_checkpoint_may_omit_the_optional_gate_but_hd_checkpoint_may_not() -> None:
-    missing_gate = ["model.ttt_layers.12.write_gate_head.weight"]
+    missing_gate = [
+        "model.ttt_layers.12.write_gate_head.weight",
+        "model.ttt_layers.12.write_gate_context_head.weight",
+    ]
     _validate_checkpoint_keys(
         missing_gate,
         [],
@@ -695,6 +749,23 @@ def test_tbptt_weights_segments_by_valid_actions_instead_of_timestep_count() -> 
         weight_by_valid_actions=False,
     )
     assert timestep_weights == pytest.approx([0.5, 0.5])
+
+
+def test_tbptt_writer_mask_keeps_history_only_segment_trainable() -> None:
+    batch = {
+        "action_is_pad": torch.tensor(
+            [[True, True], [False, False], [False, False], [False, False]]
+        ),
+        "hd_writer_valid": torch.ones(4, dtype=torch.bool),
+    }
+    weights = _tbptt_segment_loss_weights(
+        batch,
+        sequence_shape=(1, 4),
+        segment_length=2,
+        weight_by_valid_actions=True,
+        include_writer_valid=True,
+    )
+    assert weights == pytest.approx([0.5, 0.5])
 
 
 def test_ttt_hook_runs_after_expert_attention_residual_and_before_mlp() -> None:

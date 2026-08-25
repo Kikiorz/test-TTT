@@ -19,6 +19,8 @@ The training-facing columns are one row per source frame:
   by every full/reset replay;
 * ``hd_attribution`` and ``hd_rho``: normalized future dependency ``rho[j]``;
 * ``hd_write_gate``: normalized event importance ``u[i]``;
+* ``hd_write_gate_observed``: one where the event was actually replayed (used
+  to avoid treating capped-event defaults as supervision);
 * ``hd_counterfactual_write_gate``: the selected event's causal zero-write
   mask (one value per frame);
 * ``global_index`` / ``episode_index`` / ``frame_index``: source indexing.
@@ -464,10 +466,15 @@ def _episode_labels(
     # Unobserved event blocks (when ``max_events`` is a positive sampling cap)
     # retain the ordinary writer rather than being silently trained as
     # permanent skips.  Every block is therefore either assigned its measured
-    # ``u_i`` or receives the safe default gate 1.0.
+    # ``u_i`` or receives the safe default gate 1.0.  Keep a separate observed
+    # mask so the learned gate is *not* trained on that default; otherwise a
+    # capped long-horizon pass would turn missing credit into a spurious
+    # all-positive target.
     write_gate = torch.ones(length, dtype=torch.float32)
+    write_gate_observed = torch.zeros(length, dtype=torch.float32)
     for event_index, (event_start, event_end) in enumerate(events):
         write_gate[event_start:event_end] = event_u[event_index]
+        write_gate_observed[event_start:event_end] = 1.0
 
     if best_wrong is None:
         best_wrong = full_velocity.clone()
@@ -482,6 +489,7 @@ def _episode_labels(
         "hd_attribution": rho.float(),
         "hd_rho": rho.float(),
         "hd_write_gate": write_gate.float(),
+        "hd_write_gate_observed": write_gate_observed.float(),
         "hd_counterfactual_write_gate": best_gate.float(),
         "hd_C": credits.float(),
         "hd_event_u": event_u.float(),
@@ -516,6 +524,11 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
     for path, payload in zip(inputs, payloads, strict=True):
         if not isinstance(payload, Mapping) or not required.issubset(payload):
             raise ValueError(f"Shard {path} is missing one or more required columns")
+    observed_available = [
+        isinstance(payload, Mapping) and "hd_write_gate_observed" in payload for payload in payloads
+    ]
+    if any(observed_available) and not all(observed_available):
+        raise ValueError("All merged shards must either contain hd_write_gate_observed or omit it")
 
     # Keep the full per-shard audit trail.  In particular, generation shards
     # store the causal ``C`` matrices and event scores under
@@ -543,7 +556,19 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
                     )
                 episodes_detail[key] = episode_detail
 
-    columns = {key: torch.cat([payload[key].detach().cpu() for payload in payloads], dim=0) for key in required}
+    columns = {
+        key: torch.cat([payload[key].detach().cpu() for payload in payloads], dim=0)
+        for key in required
+    }
+    if all(observed_available):
+        columns["hd_write_gate_observed"] = torch.cat(
+            [payload["hd_write_gate_observed"].detach().cpu() for payload in payloads], dim=0
+        )
+    else:
+        # Legacy artifacts predate the observed mask and were generated with
+        # all event blocks measured.  Treat their available gate values as
+        # observed rather than silently dropping gate supervision.
+        columns["hd_write_gate_observed"] = torch.ones_like(columns["hd_write_gate"])
     global_index = columns["global_index"].to(torch.long)
     order = torch.argsort(global_index)
     sorted_indices = global_index[order]
@@ -634,6 +659,7 @@ def _build_shard(args: argparse.Namespace) -> None:
             "hd_attribution",
             "hd_rho",
             "hd_write_gate",
+            "hd_write_gate_observed",
             "hd_counterfactual_write_gate",
         )
     }
@@ -710,6 +736,7 @@ def _build_shard(args: argparse.Namespace) -> None:
         "max_events": args.max_events,
         "event_sampling": "all_causal_blocks" if args.max_events == 0 else "uniform",
         "unsampled_write_gate_default": 1.0,
+        "write_gate_observed_column": "hd_write_gate_observed",
         "attribution_threshold": args.attribution_threshold,
         "frame_batch_size": args.frame_batch_size,
         "action_chunk_size": int(policy.config.chunk_size),

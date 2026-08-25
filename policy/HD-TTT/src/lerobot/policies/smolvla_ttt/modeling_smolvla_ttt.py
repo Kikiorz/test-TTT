@@ -47,7 +47,7 @@ from ..utils import (
 )
 from .configuration_smolvla_ttt import SmolVLATTTConfig
 from .hd_ttt import counterfactual_grounding_loss, local_kvb_loss
-from .sequence import SEQUENCE_SHAPE_KEY
+from .sequence import HD_WRITER_VALID_KEY, SEQUENCE_SHAPE_KEY
 from .smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
 from .ttt import TTTFastState, TTTMLPLayer
 
@@ -157,12 +157,23 @@ def _validate_checkpoint_keys(
     allowed_gate_extension = [
         key
         for key in missing_keys
-        if ".write_gate_head." in key and not source_has_learned_write_gate
+        if (
+            (".write_gate_head." in key or ".write_gate_context_head." in key)
+            and not source_has_learned_write_gate
+        )
     ]
     allowed_missing = set(allowed_base_missing) | set(allowed_gate_extension)
     disallowed_missing = [key for key in missing_keys if key not in allowed_missing]
+    # A short-lived prefix-gate prototype constructed both the old
+    # action-token head and the new context head.  Ignore only that known
+    # obsolete tensor family when loading it into the production
+    # context-only architecture; all other unexpected keys remain fatal.
+    allowed_legacy_unexpected = {
+        key for key in unexpected_keys if ".write_gate_head." in key
+    }
+    disallowed_unexpected = [key for key in unexpected_keys if key not in allowed_legacy_unexpected]
     require_exact_checkpoint = source_is_ttt or strict
-    if unexpected_keys or disallowed_missing or (
+    if disallowed_unexpected or disallowed_missing or (
         require_exact_checkpoint and any(key not in allowed_gate_extension for key in missing_keys)
     ):
         raise RuntimeError(
@@ -728,17 +739,85 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
     ) -> Tensor | None:
         """Return fractional non-padding weight for each physical timestep."""
 
+        slot_valid = SmolVLATTTPolicy._hd_action_slot_valid_weight(
+            batch,
+            sequence_shape,
+            device=device,
+            dtype=dtype,
+        )
+        if slot_valid is None:
+            return None
+        return slot_valid.mean(dim=-1)
+
+    @staticmethod
+    def _hd_action_slot_valid_weight(
+        batch: dict[str, Tensor],
+        sequence_shape: tuple[int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor | None:
+        """Return ``[B,T,S]`` validity for action-chunk slots.
+
+        LeRobot normally stores ``action_is_pad`` as ``[B*T,S]``.  A few
+        processors retain singleton/action-feature axes; those are reduced
+        conservatively so a slot is valid only when all of its padding flags
+        are false.  Keeping the slot axis lets HCA and grounding ignore
+        repeated terminal actions instead of merely down-weighting the whole
+        physical frame.
+        """
+
         action_is_pad = batch.get("action_is_pad")
         if action_is_pad is None:
             return None
         pad = SmolVLATTTPolicy._reshape_hd_field(
-            action_is_pad, sequence_shape, name="action_is_pad"
+            action_is_pad,
+            sequence_shape,
+            name="action_is_pad",
         ).to(device=device)
-        if pad.ndim <= 2:
-            valid = (~pad.bool()).to(dtype=dtype)
-        else:
-            valid = (~pad.bool()).to(dtype=dtype).mean(dim=tuple(range(2, pad.ndim)))
-        return valid
+        while pad.ndim > 3:
+            if pad.shape[-1] == 1:
+                pad = pad.squeeze(-1)
+            else:
+                pad = pad.all(dim=-1)
+        if pad.ndim == 2:
+            pad = pad.unsqueeze(-1)
+        return (~pad.bool()).to(dtype=dtype)
+
+    @staticmethod
+    def _hd_writer_valid_step_weight(
+        batch: dict[str, Tensor],
+        sequence_shape: tuple[int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        fallback: Tensor | None,
+    ) -> Tensor | None:
+        """Return the mask for physical interactions that may train a writer.
+
+        ``action_is_pad`` describes whether an action *target* is present in a
+        sampled window.  History warm-up frames intentionally have no such
+        target, but they still represent real observations and must supervise
+        the local K/V objective and gate.  ``hd_writer_valid`` is injected by
+        :class:`TailPreservingSequenceDataset` only for labeled HD sequences;
+        old artifacts and ordinary TTT batches fall back to the legacy action
+        mask.
+        """
+
+        writer_valid = batch.get(HD_WRITER_VALID_KEY)
+        if writer_valid is None:
+            return fallback
+        return SmolVLATTTPolicy._hd_step_weight(
+            SmolVLATTTPolicy._reshape_hd_field(
+                writer_valid,
+                sequence_shape,
+                name=HD_WRITER_VALID_KEY,
+            ),
+            sequence_shape,
+            device=device,
+            dtype=dtype,
+            name=HD_WRITER_VALID_KEY,
+        )
 
     @staticmethod
     def _hd_weighted_mean(
@@ -822,6 +901,13 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             device=student_velocity.device,
             dtype=student_velocity.dtype,
         )
+        writer_valid_steps = self._hd_writer_valid_step_weight(
+            batch,
+            sequence_shape,
+            device=student_velocity.device,
+            dtype=student_velocity.dtype,
+            fallback=valid_steps,
+        )
 
         teacher_velocity = self._reshape_hd_field(
             batch.get("hd_teacher_velocity"), sequence_shape, name="hd_teacher_velocity"
@@ -843,8 +929,26 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             student_active = student_velocity[..., :active_dim]
             teacher_active = teacher_velocity[..., :active_dim].detach()
             hca_error = (student_active - teacher_active).square()
-            hca_reduce_dims = tuple(range(2, hca_error.ndim))
-            per_step = hca_error.mean(dim=hca_reduce_dims) if hca_reduce_dims else hca_error
+            if hca_error.ndim >= 4:
+                # [B,T,chunk,action_dim]: ignore repeated/padded future
+                # actions before reducing to one HCA value per physical frame.
+                per_slot = hca_error.mean(dim=-1)
+                slot_valid = self._hd_action_slot_valid_weight(
+                    batch,
+                    sequence_shape,
+                    device=per_slot.device,
+                    dtype=per_slot.dtype,
+                )
+                if slot_valid is not None:
+                    slot_valid = torch.broadcast_to(slot_valid, per_slot.shape)
+                    per_step = (per_slot * slot_valid).sum(dim=-1) / slot_valid.sum(
+                        dim=-1
+                    ).clamp_min(1.0)
+                else:
+                    per_step = per_slot.mean(dim=-1)
+            else:
+                hca_reduce_dims = tuple(range(2, hca_error.ndim))
+                per_step = hca_error.mean(dim=hca_reduce_dims) if hca_reduce_dims else hca_error
             attribution_weight = self._hd_step_weight(
                 attribution,
                 (B, T),
@@ -864,7 +968,8 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
 
         # The deployable writer objective is computed directly inside each
         # TTT layer.  It is intentionally returned as an un-gated [B,T] loss
-        # and weighted here by hindsight ``hd_write_gate`` plus action padding.
+        # and weighted here by hindsight ``hd_write_gate`` plus the physical
+        # writer-valid mask (which includes labeled history warm-up frames).
         # This removes the need for unavailable/offline ``hd_local_*`` labels.
         if local_ttt_loss is not None:
             local_loss = self._reshape_hd_field(
@@ -879,8 +984,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 dtype=student_velocity.dtype,
                 name="hd_write_gate",
             )
-            if valid_steps is not None:
-                local_gate = valid_steps if local_gate is None else local_gate * valid_steps
+            if writer_valid_steps is not None:
+                local_gate = (
+                    writer_valid_steps
+                    if local_gate is None
+                    else local_gate * writer_valid_steps
+                )
             kvb = self._hd_weighted_mean(local_loss, local_gate)
             total = total + h2l_weight * kvb
             metrics["hd_h2l"] = float(kvb.detach().item())
@@ -913,6 +1022,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                         device=student_velocity.device,
                         dtype=student_velocity.dtype,
                     )
+                if writer_valid_steps is not None:
+                    local_gate = (
+                        writer_valid_steps
+                        if local_gate is None
+                        else local_gate * writer_valid_steps
+                    )
                 kvb = local_kvb_loss(local_query, local_key, local_value, local_prediction, local_gate)
                 total = total + h2l_weight * kvb
                 metrics["hd_h2l"] = float(kvb.detach().item())
@@ -920,7 +1035,8 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # Hindsight ``u_i`` is available only offline.  Distill it into the
         # causal gate predicted from the current interaction so deployment
         # does not need labels or a teacher.  The target is detached and the
-        # same valid-step mask used by action loss handles padded chunks.
+        # The writer-valid/observed masks keep history warm-up trainable while
+        # excluding padded or unsampled interactions.
         if predicted_write_gate is not None and batch.get("hd_write_gate") is not None:
             predicted_gate = self._reshape_hd_field(
                 predicted_write_gate,
@@ -940,9 +1056,39 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     target_gate.detach().clamp(0, 1),
                     reduction="none",
                 )
-                gate_loss = self._hd_weighted_mean(gate_error, valid_steps)
+                gate_observed = self._hd_step_weight(
+                    self._reshape_hd_field(
+                        batch.get("hd_write_gate_observed"),
+                        sequence_shape,
+                        name="hd_write_gate_observed",
+                    ),
+                    (B, T),
+                    device=student_velocity.device,
+                    dtype=student_velocity.dtype,
+                    name="hd_write_gate_observed",
+                )
+                gate_weights = writer_valid_steps
+                if gate_observed is not None:
+                    gate_weights = (
+                        gate_observed
+                        if gate_weights is None
+                        else gate_weights * gate_observed
+                    )
+                gate_loss = self._hd_weighted_mean(gate_error, gate_weights)
                 total = total + write_gate_weight * gate_loss
                 metrics["hd_gate"] = float(gate_loss.detach().item())
+                metrics["hd_gate_pred_mean"] = float(
+                    self._hd_weighted_mean(predicted_gate.detach(), gate_weights).item()
+                )
+                metrics["hd_gate_target_mean"] = float(
+                    self._hd_weighted_mean(target_gate.detach(), gate_weights).item()
+                )
+                if gate_weights is None:
+                    metrics["hd_gate_observed_fraction"] = 1.0
+                else:
+                    metrics["hd_gate_observed_fraction"] = float(
+                        (gate_weights > 0).to(dtype=student_velocity.dtype).mean().item()
+                    )
 
         if wrong_student_velocity is not None:
             grounding_student = (
@@ -1028,7 +1174,19 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 grounding_per_token = grounding_parts.direction + (
                     invariance_weight * grounding_parts.invariance
                 )
-                grounding_weights = valid_steps
+                slot_valid = self._hd_action_slot_valid_weight(
+                    batch,
+                    sequence_shape,
+                    device=grounding_per_token.device,
+                    dtype=grounding_per_token.dtype,
+                )
+                if slot_valid is not None:
+                    slot_valid = torch.broadcast_to(slot_valid, grounding_per_token.shape)
+                    grounding_weights = slot_valid
+                    if valid_steps is not None:
+                        grounding_weights = grounding_weights * valid_steps.unsqueeze(-1)
+                else:
+                    grounding_weights = valid_steps
                 grounding = self._hd_weighted_mean(grounding_per_token, grounding_weights)
                 total = total + grounding_weight * grounding
                 metrics["hd_grounding"] = float(grounding.detach().item())
@@ -1543,6 +1701,15 @@ class SmolVLATTTFlowMatching(nn.Module):
                     ),
                     write_gate_init=config.hd_write_gate_init,
                     write_gate_token_index=config.ttt_num_register_tokens,
+                    write_gate_context_dim=(
+                        self.vlm_with_expert.config.text_config.hidden_size
+                        if (
+                            config.hd_ttt_enabled
+                            and config.hd_learned_write_gate
+                            and layer_index == self.write_gate_layer_index
+                        )
+                        else None
+                    ),
                 )
                 for layer_index in config.resolved_ttt_layer_indices
             }
@@ -1631,6 +1798,11 @@ class SmolVLATTTFlowMatching(nn.Module):
         # closure-local cache ensures the first selected layer computes one
         # scalar per physical interaction and every later layer reuses it.
         predicted_write_gate: Tensor | None = None
+        gate_context: Tensor | None = None
+
+        def set_gate_context(context: Tensor) -> None:
+            nonlocal gate_context
+            gate_context = context
 
         def apply_ttt(layer_index: int, hidden_states: Tensor) -> Tensor:
             nonlocal predicted_write_gate
@@ -1652,7 +1824,22 @@ class SmolVLATTTFlowMatching(nn.Module):
                         raise RuntimeError(
                             "The shared HD write gate must be predicted at the first selected TTT layer"
                         )
-                    predicted_write_gate = self.ttt_layers[layer_key].predict_write_gate(sequence)
+                    context_sequence = None
+                    if gate_context is not None:
+                        if gate_context.shape[0] != batch_size * sequence_length:
+                            raise ValueError(
+                                "prefix gate context must have the flattened sequence batch size "
+                                f"{batch_size * sequence_length}, got {gate_context.shape[0]}"
+                            )
+                        context_sequence = gate_context.reshape(
+                            batch_size,
+                            sequence_length,
+                            gate_context.shape[-1],
+                        )
+                    predicted_write_gate = self.ttt_layers[layer_key].predict_write_gate(
+                        sequence,
+                        context=context_sequence,
+                    )
                     if write_gate_accumulator is not None:
                         write_gate_accumulator.append(predicted_write_gate)
                 learned_gate = predicted_write_gate.detach() if detach_writer else predicted_write_gate
@@ -1681,6 +1868,11 @@ class SmolVLATTTFlowMatching(nn.Module):
             fast_states[layer_index] = next_state
             return sequence.reshape_as(hidden_states)
 
+        # ``FlowMatching.forward``/``sample_actions`` install the current
+        # observation-only prefix summary through this setter before the first
+        # expert layer executes.  Keeping it as an attribute preserves the
+        # existing two-argument callback API used by the sibling model/tests.
+        apply_ttt.set_gate_context = set_gate_context
         return apply_ttt
 
     def sample_noise(self, shape, device):
@@ -1928,6 +2120,26 @@ class SmolVLATTTFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
+        need_gate_context = bool(
+            expert_layer_callback is not None
+            and getattr(self.config, "hd_ttt_enabled", False)
+            and getattr(self.config, "hd_learned_write_gate", False)
+        )
+        if need_gate_context:
+            prefix_weights = prefix_pad_masks.to(dtype=prefix_embs.dtype).unsqueeze(-1)
+            prefix_context = (prefix_embs * prefix_weights).sum(dim=1) / prefix_weights.sum(
+                dim=1
+            ).clamp_min(1.0)
+        else:
+            prefix_context = None
+        if expert_layer_callback is not None:
+            set_gate_context = getattr(expert_layer_callback, "set_gate_context", None)
+            if set_gate_context is not None and prefix_context is not None:
+                # Prefix tokens contain only the current observation, language
+                # instruction, and proprioceptive state.  Pooling them before
+                # the suffix is a strict causal gate context: no action chunk
+                # or denoising timestep can leak into the write decision.
+                set_gate_context(prefix_context)
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -2061,6 +2273,18 @@ class SmolVLATTTFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
+        need_gate_context = bool(
+            _expert_layer_callback_factory is not None
+            and getattr(self.config, "hd_ttt_enabled", False)
+            and getattr(self.config, "hd_learned_write_gate", False)
+        )
+        if need_gate_context:
+            prefix_weights = prefix_pad_masks.to(dtype=prefix_embs.dtype).unsqueeze(-1)
+            prefix_context = (prefix_embs * prefix_weights).sum(dim=1) / prefix_weights.sum(
+                dim=1
+            ).clamp_min(1.0)
+        else:
+            prefix_context = None
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
@@ -2084,6 +2308,10 @@ class SmolVLATTTFlowMatching(nn.Module):
                 if _expert_layer_callback_factory is not None
                 else None
             )
+            if expert_layer_callback is not None:
+                set_gate_context = getattr(expert_layer_callback, "set_gate_context", None)
+                if set_gate_context is not None and prefix_context is not None:
+                    set_gate_context(prefix_context)
 
             def denoise_step_partial_call(
                 input_x_t,

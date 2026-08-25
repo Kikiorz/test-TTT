@@ -115,9 +115,9 @@ class SmolVLATTTConfig(PreTrainedConfig):
     sequence_stride: int = 256
     tbptt_segment_length: int = 4
     # Number of preceding episode frames replayed before each sampled target
-    # window.  Warm-up frames advance fast weights but are masked from all
-    # action/HD losses, keeping offline full-history labels state-consistent
-    # even when windows are shuffled across workers.
+    # window.  Warm-up frames advance fast weights and are masked from action,
+    # HCA, and grounding targets; labeled HD sequences retain them for the
+    # separate local-writer/gate objective through ``hd_writer_valid``.
     ttt_history_warmup_length: int | None = 0
     # Optional episode-balanced subsampling for very long demonstrations.
     # ``None`` keeps every tail-preserving window (the default, rigorous
@@ -206,6 +206,8 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("ttt_num_register_tokens must be non-negative")
         if self.ttt_training_stage not in {"ttt_only", "action_head"}:
             raise ValueError("ttt_training_stage must be 'ttt_only' or 'action_head'")
+        if self.hd_learned_write_gate and not self.hd_ttt_enabled:
+            raise ValueError("hd_learned_write_gate requires hd_ttt_enabled=True")
         for name in (
             "hd_hca_weight",
             "hd_h2l_weight",
