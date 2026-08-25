@@ -102,6 +102,31 @@ def test_long_horizon_window_cap_is_deterministic_and_episode_balanced() -> None
     assert sequences.window_specs[2] == (100, 16)
 
 
+def test_history_warmup_masks_prefix_but_keeps_it_in_the_recurrent_window() -> None:
+    class _ActionDataset(_EpisodeDataset):
+        def __getitem__(self, index: int) -> dict[str, torch.Tensor | int]:
+            return {
+                "frame_index": index,
+                "action": torch.zeros(3, 2),
+                "action_is_pad": torch.zeros(3, dtype=torch.bool),
+            }
+
+    dataset = _ActionDataset([20])
+    sequences = TailPreservingSequenceDataset(
+        dataset,
+        sequence_length=4,
+        sequence_stride=4,
+        history_warmup_length=3,
+    )
+
+    # The second target window starts at frame 4 and receives frames 1..4 as
+    # [warm-up 1,2,3, target 4]. Warm-up updates state but has no loss.
+    samples = sequences[1]
+    assert [sample["frame_index"] for sample in samples] == [1, 2, 3, 4, 5, 6, 7]
+    assert all(bool(samples[index]["action_is_pad"].all()) for index in range(3))
+    assert all(not bool(samples[index]["action_is_pad"].any()) for index in range(3, 7))
+
+
 def test_gate_is_fixed_during_ttt_only_stage() -> None:
     config = SmolVLATTTConfig(ttt_training_stage="ttt_only")
     layer = TTTMLPLayer(

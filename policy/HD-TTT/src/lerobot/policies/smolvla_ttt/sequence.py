@@ -20,6 +20,7 @@ import torch
 from torch.utils.data import Dataset
 
 from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.constants import ACTION
 
 SEQUENCE_SHAPE_KEY = "_lerobot_sequence_shape"
 
@@ -73,6 +74,7 @@ class TailPreservingSequenceDataset(Dataset):
         sequence_length: int,
         sequence_stride: int,
         max_windows_per_episode: int | None = None,
+        history_warmup_length: int = 0,
     ) -> None:
         if sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
@@ -82,11 +84,15 @@ class TailPreservingSequenceDataset(Dataset):
             raise ValueError("sequence_stride cannot exceed sequence_length because that would drop frames")
         if max_windows_per_episode is not None and max_windows_per_episode <= 0:
             raise ValueError("max_windows_per_episode must be positive when provided")
+        if history_warmup_length < 0:
+            raise ValueError("history_warmup_length must be non-negative")
 
         self.dataset = dataset
         self.sequence_length = sequence_length
         self.sequence_stride = sequence_stride
+        self.history_warmup_length = int(history_warmup_length)
         self.window_specs: list[tuple[int, int]] = []
+        self.history_specs: list[tuple[int, int]] = []
 
         episode_start = 0
         for episode_length in _dataset_episode_lengths(dataset):
@@ -107,7 +113,10 @@ class TailPreservingSequenceDataset(Dataset):
                 offsets = [offsets[int(position)] for position in sorted(set(positions))]
             for offset in offsets:
                 window_length = min(sequence_length, episode_length - offset)
-                self.window_specs.append((episode_start + offset, window_length))
+                target_start = episode_start + offset
+                self.window_specs.append((target_start, window_length))
+                history_start = max(episode_start, target_start - self.history_warmup_length)
+                self.history_specs.append((history_start, target_start))
             episode_start += episode_length
 
         if episode_start != len(dataset):
@@ -122,7 +131,27 @@ class TailPreservingSequenceDataset(Dataset):
 
     def __getitem__(self, index: int) -> list[dict[str, Any]]:
         start_index, window_length = self.window_specs[index]
-        return [self.dataset[start_index + offset] for offset in range(window_length)]
+        history_start, target_start = self.history_specs[index]
+        if target_start != start_index:
+            raise RuntimeError("Internal history/target window bookkeeping is inconsistent")
+        samples: list[dict[str, Any]] = []
+        for absolute_index in range(history_start, start_index + window_length):
+            sample = dict(self.dataset[absolute_index])
+            # The warm-up is intentionally part of the recurrent computation,
+            # but it must not contribute an imitation or HD auxiliary loss.
+            # Reusing LeRobot's action padding convention lets the existing
+            # loss, TBPTT weighting, and HCA/H2L grounding masks handle this
+            # without introducing a second complementary-data field.
+            if absolute_index < target_start:
+                action_is_pad = sample.get("action_is_pad")
+                if isinstance(action_is_pad, torch.Tensor):
+                    sample["action_is_pad"] = torch.ones_like(action_is_pad, dtype=torch.bool)
+                elif ACTION in sample and isinstance(sample[ACTION], torch.Tensor):
+                    sample["action_is_pad"] = torch.ones(
+                        sample[ACTION].shape[:-1], dtype=torch.bool
+                    )
+            samples.append(sample)
+        return samples
 
 
 def sequence_collate_fn(batch: list[list[dict[str, Any]]]) -> dict[str, Any]:
