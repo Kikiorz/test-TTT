@@ -996,9 +996,9 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             metrics["hd_hca"] = float(hca.detach().item())
 
         # The deployable writer objective is computed directly inside each
-        # TTT layer.  It is a stop-gradient-target local K/V reconstruction
-        # (the value projection is the target, not a second predictor) and is
-        # intentionally returned as an un-gated [B,T] loss
+        # TTT layer.  It is the joint local K/V reconstruction exposed by the
+        # existing TTT API (the value projection remains differentiable) and
+        # is intentionally returned as an un-gated [B,T] loss
         # and weighted here by hindsight ``hd_write_gate`` plus the physical
         # writer-valid mask (which includes labeled history warm-up frames).
         # This removes the need for unavailable/offline ``hd_local_*`` labels.
