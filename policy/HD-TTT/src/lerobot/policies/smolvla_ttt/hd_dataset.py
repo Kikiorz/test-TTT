@@ -192,6 +192,10 @@ class HindsightLabelDataset(Dataset):
             self.label_metadata = dict(payload["metadata"])
             self.hd_window_local = bool(self.label_metadata.get("window_local", False))
         if isinstance(payload, Mapping) and "windows" in payload:
+            # A structural window list is unambiguous evidence of the
+            # window-local protocol.  Infer the flag for early artifacts that
+            # omitted it, so the sequence sampler still applies target masks.
+            self.hd_window_local = True
             self._ingest_window_records(payload["windows"])
             # A window artifact may also carry ordinary frame columns for
             # inspection/backward compatibility.  Do not send the structural
@@ -332,6 +336,10 @@ class HindsightLabelDataset(Dataset):
         source_indices = window["source_indices"]
         labels = window["labels"]
         result: dict[int, dict[str, Tensor]] = {}
+        # Check the source-index mapping against the exact contiguous span
+        # requested by the sampler; malformed/reordered artifacts must fail
+        # instead of silently leaving a row without HD labels.
+        expected_local_indices = list(range(history_start, history_start + int(window_length)))
         for row, source_index_value in enumerate(source_indices):
             source_index = _scalar_int(source_index_value, name="window global_index")
             local_index = self._source_to_local.get(source_index, source_index)
@@ -339,10 +347,18 @@ class HindsightLabelDataset(Dataset):
                 raise ValueError(
                     f"Window-local label source frame {source_index} is not in the selected dataset"
                 )
+            if local_index != expected_local_indices[row]:
+                raise ValueError(
+                    "Window-local source indices are not the exact contiguous "
+                    f"history span at row {row}: got local={local_index}, "
+                    f"expected={expected_local_indices[row]}"
+                )
             result[local_index] = {
                 key: _as_cpu_tensor(value)[row]
                 for key, value in labels.items()
             }
+        if list(result) != expected_local_indices:
+            raise ValueError("Window-local labels do not cover the requested history span exactly")
         return result
 
     # ------------------------------------------------------------------

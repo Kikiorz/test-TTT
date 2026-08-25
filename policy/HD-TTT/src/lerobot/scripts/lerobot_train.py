@@ -125,6 +125,8 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             "sequence_length": getattr(policy_cfg, "sequence_length", None),
             "sequence_stride": getattr(policy_cfg, "sequence_stride", None),
             "event_block_size": getattr(policy_cfg, "hd_event_block_size", None),
+            "action_chunk_size": getattr(policy_cfg, "chunk_size", None),
+            "max_action_dim": getattr(policy_cfg, "max_action_dim", None),
         }
         if labeled_dataset.hd_window_local:
             # ``None`` is meaningful here (full-history replay or no cap), so
@@ -140,6 +142,13 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
         }
         if mismatches:
             raise ValueError(f"HD label/window contract mismatch: {mismatches}")
+        artifact_repo = metadata.get("dataset_repo_id")
+        configured_repo = getattr(cfg.dataset, "repo_id", None)
+        if artifact_repo is not None and configured_repo is not None and str(artifact_repo) != str(configured_repo):
+            raise ValueError(
+                "HD label dataset mismatch: artifact was generated for "
+                f"{artifact_repo!r}, training dataset is {configured_repo!r}"
+            )
         if (
             labeled_dataset.hd_window_local
             and not labeled_dataset.hd_window_keyed

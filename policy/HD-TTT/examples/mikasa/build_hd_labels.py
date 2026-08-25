@@ -506,7 +506,8 @@ def _episode_labels(
         eligible_count = int(causal.sum().item())
         score = float(row.sum().item()) / max(eligible_count, 1) if eligible_count else float("-inf")
         selection_scores.append(score)
-        if eligible_count > 0 and (best_wrong is None or score > best_score):
+        positive_credit = float(row.sum().item()) > 0.0
+        if eligible_count > 0 and positive_credit and (best_wrong is None or score > best_score):
             best_score = score
             best_wrong = wrong_velocity
             best_gate = gate.detach().cpu()
