@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import fields
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -92,18 +93,68 @@ class SmolVLABaselineMikasaPolicy(SmolVLAMikasaPolicy):
         return action_chunk.detach().to(device="cpu", dtype=torch.float32).clamp(-1.0, 1.0)
 
 
-def _checkpoint_type(checkpoint: str) -> str | None:
-    """Read a local checkpoint discriminator without importing model code."""
+def _resolve_checkpoint_config(checkpoint: str) -> Path:
+    """Resolve a local or Hub checkpoint's ``config.json`` without choice parsing."""
 
-    config_path = Path(checkpoint) / "config.json"
-    if not config_path.is_file():
-        return None
+    checkpoint_path = Path(checkpoint)
+    if checkpoint_path.is_dir():
+        config_path = checkpoint_path / "config.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(f"config.json not found in checkpoint directory {checkpoint_path}")
+        return config_path
+
+    # ``hf_hub_download`` handles Hub IDs and uses HF_HOME/HF_HUB_CACHE in the
+    # same way as the policy weight loader.  Keep this import lazy so --help
+    # and the observation bridge remain usable without the Hub extra.
     try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(repo_id=checkpoint, filename="config.json"))
+    except Exception as error:
+        raise FileNotFoundError(
+            f"Could not resolve config.json for local checkpoint or Hub repo {checkpoint!r}: {error}"
+        ) from error
+
+
+def _decode_smolvla_checkpoint_config(checkpoint: str):
+    """Decode only the standard SmolVLA fields from a checkpoint config.
+
+    ``PreTrainedConfig.from_pretrained`` first dispatches through the global
+    choice registry.  That is convenient for training CLI parsing, but it can
+    fail when a local/Hub config's discriminator is interpreted against a
+    different installed registry (and it would also admit TTT-only fields).
+    Decode the JSON payload directly, exactly as the TTT loader does, while
+    retaining only fields accepted by ``SmolVLAConfig``.
+    """
+
+    import draccus
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    config_path = _resolve_checkpoint_config(checkpoint)
+    try:
+        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"Could not read checkpoint config {config_path}: {error}") from error
-    value = payload.get("type")
-    return str(value) if value is not None else None
+
+    config_type = raw_config.get("type")
+    if config_type == "smolvla_ttt":
+        raise ValueError(
+            f"Checkpoint {checkpoint!r} is type smolvla_ttt. "
+            "Use evaluate_smolvla_ttt.py for TTT/HD-TTT checkpoints; this "
+            "script is reserved for the original smolvla policy."
+        )
+    if config_type != "smolvla":
+        raise ValueError(
+            f"Checkpoint {checkpoint!r} declares unsupported policy type "
+            f"{config_type!r}; expected 'smolvla'."
+        )
+
+    valid_fields = {field.name for field in fields(SmolVLAConfig) if field.init}
+    values = {key: value for key, value in raw_config.items() if key in valid_fields}
+    try:
+        return draccus.decode(SmolVLAConfig, values)
+    except Exception as error:
+        raise ValueError(f"Could not decode standard SmolVLA config {config_path}: {error}") from error
 
 
 def _make_smolvla_config(args: argparse.Namespace):
@@ -115,24 +166,10 @@ def _make_smolvla_config(args: argparse.Namespace):
     SmolVLA checkpoint is not accidentally reconstructed with defaults.
     """
 
-    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-
-    source_type = _checkpoint_type(args.checkpoint)
-    if source_type == "smolvla_ttt":
-        raise ValueError(
-            f"Checkpoint {args.checkpoint!r} is type smolvla_ttt. "
-            "Use evaluate_smolvla_ttt.py for TTT/HD-TTT checkpoints; this "
-            "script is reserved for the original smolvla policy."
-        )
-    if source_type not in (None, "smolvla"):
-        raise ValueError(
-            f"Checkpoint {args.checkpoint!r} declares unsupported policy type "
-            f"{source_type!r}; expected 'smolvla'."
-        )
-
-    # Parse the source config for both local paths and Hub IDs.  The Hub form
-    # also ensures that a non-default checkpoint architecture is preserved.
-    config = SmolVLAConfig.from_pretrained(args.checkpoint)
+    # Decode the source config directly for both local paths and Hub IDs.  The
+    # filtered decode preserves non-default architecture fields without
+    # dispatching through the global ``type`` choice registry.
+    config = _decode_smolvla_checkpoint_config(args.checkpoint)
     config.pretrained_path = Path(args.checkpoint)
     config.device = args.device
     config.push_to_hub = False
