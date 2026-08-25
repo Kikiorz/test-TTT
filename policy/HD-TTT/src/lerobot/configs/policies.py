@@ -161,8 +161,13 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         return None
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+        # Encode the registered choice so draccus includes the concrete
+        # ``type`` discriminator.  ``from_pretrained`` needs that key to
+        # resolve the policy class; relying on ``dump(self)`` is
+        # version-dependent and can silently omit it.  Keep the call to the
+        # one-argument API shared by the supported draccus 0.8 environments.
+        with open(save_directory / CONFIG_NAME, "w") as f:
+            json.dump(draccus.encode(self), f, indent=4)
 
     @classmethod
     def from_pretrained(

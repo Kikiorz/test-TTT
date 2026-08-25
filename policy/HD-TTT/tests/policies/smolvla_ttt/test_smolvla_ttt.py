@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -51,6 +52,14 @@ def test_factory_registers_independent_smolvla_ttt_policy() -> None:
     assert isinstance(config, SmolVLATTTConfig)
     assert config.type == "smolvla_ttt"
     assert get_policy_class("smolvla_ttt") is SmolVLATTTPolicy
+
+
+def test_policy_config_serialization_keeps_choice_type(tmp_path: Path) -> None:
+    config = SmolVLATTTConfig(device="cpu")
+    config._save_pretrained(tmp_path)
+
+    payload = json.loads((tmp_path / "config.json").read_text())
+    assert payload["type"] == "smolvla_ttt"
 
 
 def test_default_ttt_layers_match_last_four_smolvla_expert_layers() -> None:
