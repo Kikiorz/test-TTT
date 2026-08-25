@@ -164,10 +164,22 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         # Encode the registered choice so draccus includes the concrete
         # ``type`` discriminator.  ``from_pretrained`` needs that key to
         # resolve the policy class; relying on ``dump(self)`` is
-        # version-dependent and can silently omit it.  Keep the call to the
-        # one-argument API shared by the supported draccus 0.8 environments.
+        # version-dependent and can silently omit it.  draccus 0.8 has two
+        # incompatible ``encode`` signatures in the environments supported by
+        # this project, so use the typed form when available and fall back to
+        # the one-argument form.  Finally fill the discriminator explicitly as
+        # a last guard against a registry encoder that omits it.
         with open(save_directory / CONFIG_NAME, "w") as f:
-            json.dump(draccus.encode(self), f, indent=4)
+            try:
+                encoded = draccus.encode(self, PreTrainedConfig)
+            except TypeError as error:
+                if "positional argument" not in str(error) and "takes 1" not in str(error):
+                    raise
+                encoded = draccus.encode(self)
+            if isinstance(encoded, dict) and not encoded.get("type"):
+                encoded = dict(encoded)
+                encoded["type"] = self.type
+            json.dump(encoded, f, indent=4)
 
     @classmethod
     def from_pretrained(

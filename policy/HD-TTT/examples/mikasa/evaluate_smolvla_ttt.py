@@ -109,10 +109,40 @@ def _load_policy(args: argparse.Namespace):
     from lerobot.policies.smolvla_ttt.processor_smolvla_ttt import make_smolvla_ttt_pre_post_processors
 
     metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
+
+    # ``_restore_checkpoint_model_fields`` deliberately treats a target
+    # ``False`` as an explicit HD opt-out.  Evaluation therefore must carry
+    # the source checkpoint's HD switches into the requested config; otherwise
+    # an HD checkpoint would silently be evaluated as clean TTT.  CLI values
+    # override the source flags and make clean-vs-HD ablations reproducible.
+    source_flags: dict[str, bool] = {}
+    checkpoint_config = args.checkpoint / "config.json"
+    if checkpoint_config.is_file():
+        try:
+            raw_config = json.loads(checkpoint_config.read_text(encoding="utf-8"))
+            source_flags = {
+                name: bool(raw_config.get(name, False))
+                for name in ("hd_ttt_enabled", "hd_learned_write_gate")
+            }
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Could not read checkpoint config {checkpoint_config}: {error}") from error
+    hd_enabled = source_flags.get("hd_ttt_enabled", False)
+    if args.hd_ttt_enabled is not None:
+        hd_enabled = bool(args.hd_ttt_enabled)
+    learned_gate = source_flags.get("hd_learned_write_gate", False)
+    if args.hd_learned_write_gate is not None:
+        learned_gate = bool(args.hd_learned_write_gate)
+    if learned_gate and not hd_enabled:
+        raise ValueError("--hd-learned-write-gate requires --hd-ttt-enabled")
     # ``make_policy`` first projects the dataset schema into policy features;
     # constructing ``from_pretrained`` directly would leave input_features
     # empty and silently drop the two MIKASA cameras.
-    config = SmolVLATTTConfig(device=args.device, pretrained_path=Path(args.checkpoint))
+    config = SmolVLATTTConfig(
+        device=args.device,
+        pretrained_path=Path(args.checkpoint),
+        hd_ttt_enabled=hd_enabled,
+        hd_learned_write_gate=learned_gate,
+    )
     policy = make_policy(config, ds_meta=metadata)
     preprocessor, postprocessor = make_smolvla_ttt_pre_post_processors(
         policy.config,
@@ -172,7 +202,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "obs_mode": "rgb",
             "wrapper_chain": "apply_mikasa_vla_wrappers(include_overlays=False)",
             "action_chunk_size": policy.chunk_size,
-            "model": {"checkpoint": str(args.checkpoint), "method": "HD-TTT"},
+            "model": {
+                "checkpoint": str(args.checkpoint),
+                "method": "HD-TTT" if bool(policy.policy.config.hd_ttt_enabled) else "clean-TTT",
+                "hd_ttt_enabled": bool(policy.policy.config.hd_ttt_enabled),
+                "hd_learned_write_gate": bool(policy.policy.config.hd_learned_write_gate),
+            },
             "episode_lengths": [int(ep.n_steps) for ep in episodes],
             "episode_seeds": [int(ep.seed) for ep in episodes],
         })
@@ -194,6 +229,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-seed", type=int, default=4242424242)
     parser.add_argument("--sim-backend", choices=("cpu", "gpu"), default="gpu")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--hd-ttt-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable HD-TTT explicitly; default auto-detects the checkpoint config",
+    )
+    parser.add_argument(
+        "--hd-learned-write-gate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable the deployable learned write gate; default auto-detects the checkpoint config",
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
