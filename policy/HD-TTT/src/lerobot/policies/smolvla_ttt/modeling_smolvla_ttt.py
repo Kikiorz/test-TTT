@@ -1247,8 +1247,19 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         reduction: str = "mean",
         noise: Tensor | None = None,
         time: Tensor | None = None,
+        *,
+        grounding_states: dict[str, TTTFastStates | None] | None = None,
     ) -> tuple[Tensor, dict, TTTFastStates]:
-        """Train one contiguous TBPTT segment and return its numerical fast state."""
+        """Train one contiguous TBPTT segment and return its numerical fast state.
+
+        ``grounding_states`` is an optional mutable pair of detached replay
+        states (``"true"``/``"wrong"``).  When provided, the two
+        counterfactual branches continue from their own previous segment
+        states.  This preserves full-episode causal interventions across
+        TBPTT boundaries while keeping the historical three-item return API.
+        The container is created and discarded by the sequence-level trainer;
+        it must never be reused across episodes/windows.
+        """
         batch_size, sequence_length = sequence_shape
         expected_flat_batch = batch_size * sequence_length
         if batch[ACTION].shape[0] != expected_flat_batch:
@@ -1360,6 +1371,15 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 "HD learned-gate training requires the frame-aligned 'hd_write_gate' label"
             )
         initial_fast_states = self._clone_fast_states(fast_states) if hd_labels_present else None
+
+        # The ordinary main state is carried by the TBPTT trainer.  Grounding
+        # needs two additional *independent* numerical trajectories so a
+        # zero-write intervention in an early segment remains in effect for
+        # every later segment.  The trainer owns the container lifetime; this
+        # function only updates its detached values in place.
+        if grounding_states is not None:
+            grounding_states.setdefault("true", None)
+            grounding_states.setdefault("wrong", None)
         if hd_enabled:
             # In the learned-gate variant hindsight ``u_i`` is a target, not
             # an online input.  The main writer therefore uses only its local
@@ -1416,15 +1436,21 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 # Re-run both memory branches with writer/inner-update graphs
                 # detached.  The numerical updates are identical, but the
                 # resulting grounding loss can only train query/readout/action
-                # pathways.  Each branch receives an independent copy of the
-                # same pre-segment state, and neither replay mutates the
-                # persistent ``fast_states`` returned above.
+                # pathways.  Each branch receives an independent copy of its
+                # own prior replay state (or the common pre-segment state on
+                # the first segment), and neither replay mutates the
+                # persistent main ``fast_states`` returned above.
+                true_branch_source = (
+                    grounding_states.get("true")
+                    if grounding_states is not None and grounding_states.get("true") is not None
+                    else initial_fast_states
+                )
                 grounding_initial_states = self._clone_fast_states(
-                    initial_fast_states,
+                    true_branch_source,
                     detach=True,
                     requires_grad=False,
                 )
-                grounding_student_velocity, _ = self.model.forward_with_state(
+                grounding_student_velocity, true_branch_next_states = self.model.forward_with_state(
                     images,
                     img_masks,
                     lang_tokens,
@@ -1446,12 +1472,25 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     return_velocity=True,
                     use_learned_write_gate=False,
                 )
+                if grounding_states is not None:
+                    # ``detach_writer=True`` already cuts the outer graph;
+                    # clone the returned state once more to avoid aliasing
+                    # temporary replay tensors across TBPTT segments.
+                    grounding_states["true"] = {
+                        layer_index: state.detach(requires_grad=False)
+                        for layer_index, state in true_branch_next_states.items()
+                    }
+                wrong_branch_source = (
+                    grounding_states.get("wrong")
+                    if grounding_states is not None and grounding_states.get("wrong") is not None
+                    else initial_fast_states
+                )
                 wrong_initial_states = self._clone_fast_states(
-                    initial_fast_states,
+                    wrong_branch_source,
                     detach=True,
                     requires_grad=False,
                 )
-                wrong_student_velocity, _ = self.model.forward_with_state(
+                wrong_student_velocity, wrong_branch_next_states = self.model.forward_with_state(
                     images,
                     img_masks,
                     lang_tokens,
@@ -1471,6 +1510,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     # a different counterfactual from the teacher artifact.
                     use_learned_write_gate=False,
                 )
+                if grounding_states is not None:
+                    grounding_states["wrong"] = {
+                        layer_index: state.detach(requires_grad=False)
+                        for layer_index, state in wrong_branch_next_states.items()
+                    }
             hd_aux_loss, hd_metrics = self._hd_auxiliary_losses(
                 batch,
                 sequence_shape,

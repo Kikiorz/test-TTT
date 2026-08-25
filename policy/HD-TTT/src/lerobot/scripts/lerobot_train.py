@@ -521,6 +521,20 @@ def update_policy_tbptt(
     unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
     batch_size, sequence_length = sequence_shape
     fast_states = None
+    # Hindsight grounding has two detached counterfactual trajectories.  Keep
+    # them across TBPTT segments of this one sequence so an early zero-write
+    # intervention remains present in later reads.  Ordinary TTT/clean batches
+    # do not carry these fields and retain the original call path.
+    grounding_states = None
+    if bool(getattr(getattr(unwrapped_policy, "config", None), "hd_ttt_enabled", False)) and all(
+        batch.get(key) is not None
+        for key in (
+            "hd_counterfactual_write_gate",
+            "hd_teacher_true_velocity",
+            "hd_teacher_wrong_velocity",
+        )
+    ):
+        grounding_states = {"true": None, "wrong": None}
     total_loss = torch.zeros((), device=accelerator.device)
     loss_per_dim = None
     num_segments = 0
@@ -550,10 +564,17 @@ def update_policy_tbptt(
         )
 
         with accelerator.autocast():
+            segment_kwargs = {
+                "sequence_shape": (batch_size, current_segment_length),
+                "fast_states": fast_states,
+            }
+            if grounding_states is not None:
+                # Only SmolVLA-TTT exposes the optional grounding container;
+                # PI0/PI05 sequence policies keep their historical signature.
+                segment_kwargs["grounding_states"] = grounding_states
             segment_loss, segment_output, fast_states = unwrapped_policy.forward_sequence_segment(
                 segment_batch,
-                sequence_shape=(batch_size, current_segment_length),
-                fast_states=fast_states,
+                **segment_kwargs,
             )
             segment_weight = segment_loss_weights[segment_index]
             weighted_segment_loss = segment_loss * segment_weight
