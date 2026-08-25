@@ -673,6 +673,54 @@ def test_checkpoint_restore_preserves_explicit_hd_opt_in_over_clean_ttt_source()
     assert target.hd_learned_write_gate is True
 
 
+def test_checkpoint_restore_preserves_explicit_hd_opt_out_over_hd_source() -> None:
+    """A clean/ablation config must be able to disable an HD checkpoint."""
+
+    source = SmolVLATTTConfig(
+        hd_ttt_enabled=True,
+        hd_learned_write_gate=True,
+        hd_hca_weight=0.7,
+    )
+    # This is the config produced when the user supplies
+    # ``--policy.hd_ttt_enabled=false --policy.hd_learned_write_gate=false``
+    # after the pretrained-path parser has read the source config.
+    target = SmolVLATTTConfig(
+        hd_ttt_enabled=False,
+        hd_learned_write_gate=False,
+    )
+    raw_config = {
+        "type": "smolvla_ttt",
+        "hd_ttt_enabled": True,
+        "hd_learned_write_gate": True,
+        "hd_hca_weight": 0.7,
+    }
+
+    _restore_checkpoint_model_fields(target, source, raw_config)
+
+    assert target.hd_ttt_enabled is False
+    assert target.hd_learned_write_gate is False
+    # The target's HD hyperparameters remain coherent with the disabled path;
+    # they must not be silently replaced by source-only values.
+    assert target.hd_hca_weight == 1.0
+
+
+def test_checkpoint_restore_keeps_source_hd_config_when_parser_did_not_override_it() -> None:
+    """A source-parsed config (the normal no-override path) remains HD-enabled."""
+
+    source = SmolVLATTTConfig(hd_ttt_enabled=True, hd_learned_write_gate=True)
+    target = SmolVLATTTConfig(hd_ttt_enabled=True, hd_learned_write_gate=True)
+    raw_config = {
+        "type": "smolvla_ttt",
+        "hd_ttt_enabled": True,
+        "hd_learned_write_gate": True,
+    }
+
+    _restore_checkpoint_model_fields(target, source, raw_config)
+
+    assert target.hd_ttt_enabled is True
+    assert target.hd_learned_write_gate is True
+
+
 def test_old_ttt_checkpoint_may_omit_the_optional_gate_but_hd_checkpoint_may_not() -> None:
     missing_gate = [
         "model.ttt_layers.12.write_gate_head.weight",

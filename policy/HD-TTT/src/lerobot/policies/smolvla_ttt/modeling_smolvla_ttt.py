@@ -128,10 +128,29 @@ def _restore_checkpoint_model_fields(
         requested_hd.get("hd_ttt_enabled", False)
         or requested_hd.get("hd_learned_write_gate", False)
     )
+    # ``PreTrainedConfig.from_pretrained`` parses the checkpoint config first
+    # and then applies CLI overrides.  Consequently an explicit
+    # ``--policy.hd_ttt_enabled=false`` is represented here by a target value
+    # that differs from the source value; a plain ``False`` value by itself is
+    # not enough to distinguish the two cases.  Treat a mismatch in any HD
+    # field as an explicit override as well.  This preserves both directions
+    # of the intended workflow:
+    #
+    #   clean TTT (false) -> HD fine-tuning (true), and
+    #   HD checkpoint (true) -> clean/disabled evaluation (false).
+    #
+    # When no CLI override is supplied, the parser copies the source values
+    # into ``config`` and this comparison is false, so checkpoint-owned HD
+    # settings continue to be restored normally.
+    explicit_hd_override = explicit_hd_opt_in or any(
+        name in raw_config
+        and getattr(source_config, name, None) != value
+        for name, value in requested_hd.items()
+    )
     for field_name in _CHECKPOINT_ARCHITECTURE_FIELDS:
         if field_name in raw_config:
             setattr(config, field_name, getattr(source_config, field_name))
-    if explicit_hd_opt_in:
+    if explicit_hd_override:
         for field_name, value in requested_hd.items():
             setattr(config, field_name, value)
     config.__post_init__()
