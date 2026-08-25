@@ -177,7 +177,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
     tasks = benchmarking.select_benchmark_tasks(env_ids=args.tasks)
     benchmark_commit_fn = getattr(benchmarking, "benchmark_commit", None)
-    benchmark_revision = benchmark_commit_fn() if benchmark_commit_fn is not None else None
+    benchmark_revision = benchmark_commit_fn() if callable(benchmark_commit_fn) else None
     if len(tasks) == 2:
         benchmark_subset = "two_task_subset"
     elif len(tasks) == 1:
@@ -215,6 +215,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "env_id": task.env_id,
             "split": task.split.title(),
             "memory_type": task.memory_type,
+            "data_source": task.data_source,
             "start_seed": args.start_seed,
             "n_episodes": args.num_episodes,
             "successes": successes,
