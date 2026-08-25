@@ -39,6 +39,11 @@ class DatasetConfig:
     # This reduces memory and speeds up DataLoader IPC. The training pipeline handles the conversion.
     return_uint8: bool = False
     streaming: bool = False
+    # Optional offline Hindsight-Distilled TTT annotations.  The artifact is
+    # loaded by ``lerobot-train`` and merged into each frame as ``hd_*``
+    # complementary data; it is intentionally not part of the LeRobot dataset
+    # feature schema or normalization statistics.
+    hd_label_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.episodes is not None:

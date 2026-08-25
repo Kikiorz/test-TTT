@@ -165,7 +165,65 @@ class TTTMLPLayer(nn.Module):
         state: TTTFastState,
         create_graph: bool,
         write_gate: Tensor | None = None,
+        detach_writer: bool = False,
     ) -> TTTFastState:
+        if detach_writer:
+            # Grounding is a reader-only objective.  The numerical fast-weight
+            # update is still carried out so the correct/wrong branches see
+            # the intended memories, but its K/V projections, inner gradient,
+            # learning-rate parameter, and initial fast weights are detached
+            # from the outer graph.  Query projection and the downstream
+            # action head remain differentiable.
+            detached_state = TTTFastState(
+                *(tensor.detach().clone().requires_grad_(True) for tensor in state.tensors()),
+                position=None if state.position is None else state.position.detach().clone(),
+            )
+            detached_keys = keys.detach()
+            detached_values = values.detach()
+            with torch.enable_grad():
+                prediction = self._fast_mlp(detached_keys, detached_state)
+                per_trajectory_loss = F.mse_loss(
+                    prediction,
+                    detached_values,
+                    reduction="none",
+                ).mean(dim=(1, 2))
+                gradients = torch.autograd.grad(
+                    per_trajectory_loss.sum(),
+                    detached_state.tensors(),
+                    create_graph=False,
+                    retain_graph=False,
+                )
+            inner_lr = self.inner_lr.detach()
+            updated_tensors = tuple(
+                (weight - inner_lr * gradient).detach().requires_grad_(True)
+                for weight, gradient in zip(detached_state.tensors(), gradients, strict=True)
+            )
+            if write_gate is not None:
+                # Labels/gates are intervention controls, never writer
+                # parameters in this branch.
+                gate = write_gate.detach().to(
+                    dtype=updated_tensors[0].dtype,
+                    device=updated_tensors[0].device,
+                )
+                if gate.ndim == 0:
+                    gate = gate.expand(detached_state.batch_size)
+                updated_tensors = tuple(
+                    (
+                        weight
+                        + gate.reshape(
+                            detached_state.batch_size,
+                            *([1] * (weight.ndim - 1)),
+                        )
+                        * (updated - weight)
+                    )
+                    .detach()
+                    .requires_grad_(True)
+                    for weight, updated in zip(
+                        detached_state.tensors(), updated_tensors, strict=True
+                    )
+                )
+            return TTTFastState(*updated_tensors, position=detached_state.position)
+
         prediction = self._fast_mlp(keys, state)
         per_trajectory_loss = F.mse_loss(prediction, values, reduction="none").mean(dim=(1, 2))
         gradients = torch.autograd.grad(
@@ -184,9 +242,10 @@ class TTTMLPLayer(nn.Module):
             gate = write_gate.to(dtype=updated_tensors[0].dtype, device=updated_tensors[0].device)
             if gate.ndim == 0:
                 gate = gate.expand(state.batch_size)
-            gate = gate.reshape(state.batch_size, *([1] * (updated_tensors[0].ndim - 1)))
             updated_tensors = tuple(
-                weight + gate * (updated - weight)
+                weight
+                + gate.reshape(state.batch_size, *([1] * (weight.ndim - 1)))
+                * (updated - weight)
                 for weight, updated in zip(state.tensors(), updated_tensors, strict=True)
             )
         return TTTFastState(*updated_tensors, position=state.position)
@@ -220,14 +279,18 @@ class TTTMLPLayer(nn.Module):
         update: bool = True,
         create_graph: bool | None = None,
         write_gate: Tensor | None = None,
+        detach_writer: bool = False,
         return_state_trace: bool = False,
     ) -> tuple[Tensor, TTTFastState] | tuple[Tensor, TTTFastState, tuple[TTTFastState, ...]]:
         """Process ``[batch, timesteps, tokens, dim]`` and return the next fast state.
 
         ``write_gate`` may be scalar, ``[batch]`` or ``[batch, timesteps]``. A
         zero gate skips a write exactly, while values in ``[0, 1]`` interpolate
-        the local K/V update. ``return_state_trace`` is used by hindsight replay
-        and is off on the normal path.
+        the local K/V update.  ``detach_writer`` keeps the numerical update but
+        cuts all outer gradients through K/V/inner-update fast weights; query
+        and downstream readout gradients remain active for reader-only
+        counterfactual grounding. ``return_state_trace`` is used by hindsight
+        replay and is off on the normal path.
         """
         if inputs.ndim != 4 or inputs.shape[-1] != self.dim:
             raise ValueError(
@@ -269,6 +332,16 @@ class TTTMLPLayer(nn.Module):
                     position=torch.full((state.batch_size,), -1, dtype=torch.int64, device=inputs.device),
                 )
 
+            if detach_writer:
+                # Even an initial state created by ``initial_state`` is an
+                # expanded view of trainable fast-weight parameters.  Detach a
+                # private copy before the first read/write so grounding cannot
+                # update those parameters through the state path.
+                state = TTTFastState(
+                    *(tensor.detach().clone().requires_grad_(True) for tensor in state.tensors()),
+                    position=None if state.position is None else state.position.detach().clone(),
+                )
+
             if write_gate is not None:
                 if write_gate.ndim == 0:
                     write_gate = write_gate.expand(inputs.shape[0], inputs.shape[1])
@@ -299,8 +372,18 @@ class TTTMLPLayer(nn.Module):
                 )
                 queries = self._apply_rope(self.q_proj(normalized_inputs), token_positions)
                 if update:
-                    keys = self._apply_rope(self.k_proj(normalized_inputs), token_positions)
-                    values = self.v_proj(normalized_inputs)
+                    if detach_writer:
+                        # K/V are used to compute the intervention's numerical
+                        # update, but their projections must not connect back to
+                        # the input/action expert or writer parameters.
+                        with torch.no_grad():
+                            keys = self._apply_rope(
+                                self.k_proj(normalized_inputs.detach()), token_positions
+                            )
+                            values = self.v_proj(normalized_inputs.detach())
+                    else:
+                        keys = self._apply_rope(self.k_proj(normalized_inputs), token_positions)
+                        values = self.v_proj(normalized_inputs)
                     timestep_gate = None if write_gate is None else write_gate[:, timestep_index]
                     state = self._update(
                         keys,
@@ -308,15 +391,25 @@ class TTTMLPLayer(nn.Module):
                         state,
                         create_graph=create_graph,
                         write_gate=timestep_gate,
+                        detach_writer=detach_writer,
                     )
                     state = TTTFastState(*state.tensors(), position=timestep_position)
 
                 ttt_output = self._fast_mlp(queries, state)
-                outputs.append(timestep_inputs + self.effective_gate * ttt_output)
+                residual_gate = self.effective_gate.detach() if detach_writer else self.effective_gate
+                outputs.append(timestep_inputs + residual_gate * ttt_output)
                 if return_state_trace:
                     state_trace.append(state.clone(detach=False, requires_grad=False))
 
             output = torch.stack(outputs, dim=1).to(dtype=input_dtype)
+            if detach_writer:
+                # Do not expose replay-only state leaves to the outer graph.
+                # They were kept differentiable internally so each timestep
+                # could compute its local update, but no caller should backprop
+                # through the returned grounding state.
+                state = state.detach(requires_grad=False)
+                if return_state_trace:
+                    state_trace = [trace.detach(requires_grad=False) for trace in state_trace]
             if not outer_grad_enabled:
                 output = output.detach()
                 state = state.detach(requires_grad=False)

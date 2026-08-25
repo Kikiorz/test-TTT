@@ -531,6 +531,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             return value.expand(batch_size, sequence_length)
         if value.shape[:2] == (batch_size, sequence_length):
             return value
+        if value.ndim == 1 and value.shape[0] == sequence_length:
+            # A shared per-time label is useful when every sample in a batch
+            # comes from the same precomputed episode window.
+            return value.unsqueeze(0).expand(batch_size, -1)
+        if value.ndim >= 2 and value.shape[0] == sequence_length and batch_size != sequence_length:
+            return value.unsqueeze(0).expand(batch_size, *value.shape)
         if value.shape[0] == batch_size * sequence_length:
             return value.reshape(batch_size, sequence_length, *value.shape[1:])
         if value.numel() == batch_size * sequence_length:
@@ -540,12 +546,184 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             f"or flattened B*T, got {tuple(value.shape)}"
         )
 
+    def _hd_active_action_dim(self, student: Tensor, teacher: Tensor | None = None) -> int:
+        """Return the action coordinates that are valid for an HD comparison.
+
+        SmolVLA internally pads the task action (MIKASA has seven coordinates)
+        to ``max_action_dim`` (normally 32).  HD labels are generated in the
+        task/action space, so comparing a seven-dimensional teacher directly to
+        the padded student is an error and padding the teacher with arbitrary
+        values would supervise nonexistent coordinates.  We therefore compare
+        only the active task coordinates, bounded by both tensors and the
+        configured action feature when it is available.
+        """
+
+        student_dim = int(student.shape[-1])
+        feature = getattr(self.config, "action_feature", None)
+        feature_shape = getattr(feature, "shape", None)
+        configured_dim = (
+            int(feature_shape[0])
+            if feature_shape and feature_shape[0] is not None
+            else student_dim
+        )
+        dims = [student_dim, configured_dim]
+        if teacher is not None:
+            dims.append(int(teacher.shape[-1]))
+        active_dim = min(dims)
+        if active_dim <= 0:
+            raise ValueError("HD action comparison requires a positive feature dimension")
+        return active_dim
+
     @staticmethod
-    def _clone_fast_states(fast_states: TTTFastStates | None) -> TTTFastStates | None:
+    def _hd_align_velocity_field(value: Tensor, target: Tensor, *, name: str) -> Tensor:
+        """Align a teacher/intervention velocity to ``target``'s prefix shape.
+
+        The canonical label is ``[B, T, chunk, D_task]`` while the model emits
+        ``[B, T, chunk, max_action_dim]``.  A per-observation label
+        ``[B, T, D_task]`` is also accepted and broadcast over the action
+        chunk.  Feature dimensions are intentionally left untouched here; the
+        caller slices both tensors to the active task dimension.
+        """
+
+        if value.ndim == 0 or target.ndim == 0:
+            raise ValueError(f"{name} must have a feature dimension")
+        aligned = value
+        if aligned.ndim == target.ndim - 1 and target.ndim >= 3:
+            # Per-time labels omit the chunk axis: [B,T,D] -> [B,T,1,D].
+            if aligned.shape[:2] == target.shape[:2]:
+                aligned = aligned.unsqueeze(-2)
+        if aligned.ndim < target.ndim:
+            # Permit leading singleton/batch-shared labels while preserving the
+            # final feature axis.  The common case above has already inserted
+            # the chunk dimension.
+            while aligned.ndim < target.ndim:
+                aligned = aligned.unsqueeze(0)
+        if aligned.ndim != target.ndim:
+            raise ValueError(
+                f"{name} rank {value.ndim} cannot be aligned to student rank {target.ndim}; "
+                f"got {tuple(value.shape)} vs {tuple(target.shape)}"
+            )
+        desired_shape = target.shape[:-1] + (aligned.shape[-1],)
+        try:
+            return torch.broadcast_to(aligned, desired_shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"{name} shape {tuple(value.shape)} is not broadcastable to student prefix "
+                f"{tuple(target.shape[:-1])}"
+            ) from exc
+
+    @staticmethod
+    def _hd_step_weight(
+        value: Tensor | None,
+        target_shape: tuple[int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        name: str,
+    ) -> Tensor | None:
+        """Reduce scalar, per-time, or ``[event,future]`` HD labels to ``[B,T]``.
+
+        Offline HCA may retain a sparse ``C[i,j]`` matrix, whereas the online
+        training batch normally stores its per-future aggregate.  This helper
+        turns either representation into a weight for the current future time:
+        matrices are summed over their event axis and any extra feature axes
+        are averaged.  It never relies on accidental PyTorch broadcasting (in
+        particular, ``[B,T,T]`` is not multiplied directly by ``[B,T]``).
+        """
+
+        if value is None:
+            return None
+        batch_size, sequence_length = target_shape
+        weight = value.to(device=device, dtype=dtype)
+        if weight.ndim == 0:
+            return weight.expand(batch_size, sequence_length)
+        if weight.shape[:2] != (batch_size, sequence_length):
+            try:
+                weight = torch.broadcast_to(weight, (batch_size, sequence_length, *weight.shape[2:]))
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"HD field {name!r} with shape {tuple(value.shape)} does not start with "
+                    f"[B,T]=[{batch_size},{sequence_length}]"
+                ) from exc
+        # Remove singleton axes first, then reduce retained event/action axes.
+        while weight.ndim > 2 and weight.shape[-1] == 1:
+            weight = weight.squeeze(-1)
+        if weight.ndim > 2:
+            if weight.ndim > 3:
+                # Keep the two sequence axes when this is a full C[e,j] label;
+                # otherwise collapse feature/chunk axes before deciding below.
+                weight = weight.mean(dim=tuple(range(3, weight.ndim)))
+            if weight.ndim == 3 and weight.shape[-2] == sequence_length and weight.shape[-1] == sequence_length:
+                # C[e,j] -> rho[j].  A generic per-time feature tensor
+                # [B,T,K] must instead be reduced over K below.
+                weight = weight.sum(dim=-2)
+            elif weight.ndim > 2:
+                weight = weight.mean(dim=tuple(range(2, weight.ndim)))
+        if weight.shape != (batch_size, sequence_length):
+            try:
+                weight = torch.broadcast_to(weight, (batch_size, sequence_length))
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"HD field {name!r} reduced to shape {tuple(weight.shape)}, expected "
+                    f"[{batch_size},{sequence_length}]"
+                ) from exc
+        return weight.clamp_min(0)
+
+    @staticmethod
+    def _hd_valid_step_weight(
+        batch: dict[str, Tensor],
+        sequence_shape: tuple[int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor | None:
+        """Return fractional non-padding weight for each physical timestep."""
+
+        action_is_pad = batch.get("action_is_pad")
+        if action_is_pad is None:
+            return None
+        pad = SmolVLATTTPolicy._reshape_hd_field(
+            action_is_pad, sequence_shape, name="action_is_pad"
+        ).to(device=device)
+        if pad.ndim <= 2:
+            valid = (~pad.bool()).to(dtype=dtype)
+        else:
+            valid = (~pad.bool()).to(dtype=dtype).mean(dim=tuple(range(2, pad.ndim)))
+        return valid
+
+    @staticmethod
+    def _hd_weighted_mean(
+        values: Tensor,
+        weights: Tensor | None = None,
+    ) -> Tensor:
+        """Average an HD loss with optional non-negative weights, safely."""
+
+        if weights is None:
+            return values.mean()
+        weights = weights.to(device=values.device, dtype=values.dtype).clamp_min(0)
+        while weights.ndim < values.ndim:
+            weights = weights.unsqueeze(-1)
+        weights = torch.broadcast_to(weights, values.shape)
+        denominator = weights.sum()
+        numerator = (values * weights).sum()
+        safe_denominator = denominator.clamp_min(1e-8)
+        return torch.where(
+            denominator > 1e-8,
+            numerator / safe_denominator,
+            values.new_zeros(()),
+        )
+
+    @staticmethod
+    def _clone_fast_states(
+        fast_states: TTTFastStates | None,
+        *,
+        detach: bool = False,
+        requires_grad: bool = True,
+    ) -> TTTFastStates | None:
         if fast_states is None:
             return None
         return {
-            layer_index: state.clone(detach=False, requires_grad=True)
+            layer_index: state.clone(detach=detach, requires_grad=requires_grad)
             for layer_index, state in fast_states.items()
         }
 
@@ -556,6 +734,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         *,
         student_velocity: Tensor,
         wrong_student_velocity: Tensor | None = None,
+        grounding_student_velocity: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         """Compute optional HD terms from training-only teacher/intervention labels.
 
@@ -563,15 +742,34 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         is a strict no-op for base SmolVLA/TTT training.  A hindsight data pass
         may attach flattened labels under the documented ``hd_*`` names; all
         teacher tensors are detached here before they can influence gradients.
+        Teacher/intervention velocities may use the task dimension (for example
+        ``[B*T, 50, 7]`` for MIKASA) while the model internally emits padded
+        ``[B*T, 50, 32]`` tensors.  Only the active task coordinates are compared;
+        per-future C/rho matrices are reduced to safe ``[B,T]`` weights.
         """
 
-        if not self.config.hd_ttt_enabled:
+        if not getattr(self.config, "hd_ttt_enabled", False):
             return student_velocity.new_zeros(()), {}
 
         B, T = sequence_shape
-        student_velocity = student_velocity.reshape(B, T, *student_velocity.shape[1:])
+        student_velocity = self._reshape_hd_field(
+            student_velocity,
+            sequence_shape,
+            name="student_velocity",
+        )
         total = student_velocity.new_zeros(())
         metrics: dict[str, float] = {}
+        hca_weight = float(getattr(self.config, "hd_hca_weight", 1.0))
+        h2l_weight = float(getattr(self.config, "hd_h2l_weight", 1.0))
+        grounding_weight = float(getattr(self.config, "hd_grounding_weight", 1.0))
+        invariance_weight = float(getattr(self.config, "hd_invariance_weight", 1.0))
+        counterfactual_margin = float(getattr(self.config, "hd_counterfactual_margin", 0.0))
+        valid_steps = self._hd_valid_step_weight(
+            batch,
+            sequence_shape,
+            device=student_velocity.device,
+            dtype=student_velocity.dtype,
+        )
 
         teacher_velocity = self._reshape_hd_field(
             batch.get("hd_teacher_velocity"), sequence_shape, name="hd_teacher_velocity"
@@ -580,20 +778,36 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             batch.get("hd_attribution"), sequence_shape, name="hd_attribution"
         )
         if teacher_velocity is not None:
-            teacher_velocity = teacher_velocity.to(device=student_velocity.device, dtype=student_velocity.dtype)
-            if teacher_velocity.shape != student_velocity.shape:
-                raise ValueError(
-                    f"hd_teacher_velocity shape {tuple(teacher_velocity.shape)} must match "
-                    f"student velocity {tuple(student_velocity.shape)}"
+            teacher_velocity = teacher_velocity.to(
+                device=student_velocity.device,
+                dtype=student_velocity.dtype,
+            )
+            teacher_velocity = self._hd_align_velocity_field(
+                teacher_velocity,
+                student_velocity,
+                name="hd_teacher_velocity",
+            )
+            active_dim = self._hd_active_action_dim(student_velocity, teacher_velocity)
+            student_active = student_velocity[..., :active_dim]
+            teacher_active = teacher_velocity[..., :active_dim].detach()
+            hca_error = (student_active - teacher_active).square()
+            hca_reduce_dims = tuple(range(2, hca_error.ndim))
+            per_step = hca_error.mean(dim=hca_reduce_dims) if hca_reduce_dims else hca_error
+            attribution_weight = self._hd_step_weight(
+                attribution,
+                (B, T),
+                device=per_step.device,
+                dtype=per_step.dtype,
+                name="hd_attribution",
+            )
+            if valid_steps is not None:
+                attribution_weight = (
+                    valid_steps
+                    if attribution_weight is None
+                    else attribution_weight * valid_steps
                 )
-            per_step = (student_velocity - teacher_velocity.detach()).square().mean(dim=(-1, -2))
-            if attribution is not None:
-                weight = attribution.to(device=per_step.device, dtype=per_step.dtype)
-                while weight.ndim < per_step.ndim:
-                    weight = weight.unsqueeze(-1)
-                per_step = per_step * weight.squeeze(-1)
-            hca = per_step.mean()
-            total = total + self.config.hd_hca_weight * hca
+            hca = self._hd_weighted_mean(per_step, attribution_weight)
+            total = total + hca_weight * hca
             metrics["hd_hca"] = float(hca.detach().item())
 
         # The writer gate is supplied by the hindsight teacher.  The local K/V
@@ -606,12 +820,37 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         )
         local_query = self._reshape_hd_field(batch.get("hd_local_query"), sequence_shape, name="hd_local_query")
         if local_key is not None and local_value is not None and local_prediction is not None:
+            local_key = local_key.to(device=student_velocity.device, dtype=student_velocity.dtype)
+            local_value = local_value.to(device=student_velocity.device, dtype=student_velocity.dtype)
+            local_prediction = local_prediction.to(
+                device=student_velocity.device,
+                dtype=student_velocity.dtype,
+            )
+            if local_query is not None:
+                local_query = local_query.to(
+                    device=student_velocity.device,
+                    dtype=student_velocity.dtype,
+                )
             local_gate = self._reshape_hd_field(batch.get("hd_write_gate"), sequence_shape, name="hd_write_gate")
+            if local_gate is not None:
+                local_gate = local_gate.to(
+                    device=student_velocity.device,
+                    dtype=student_velocity.dtype,
+                )
             kvb = local_kvb_loss(local_query, local_key, local_value, local_prediction, local_gate)
-            total = total + self.config.hd_h2l_weight * kvb
+            total = total + h2l_weight * kvb
             metrics["hd_h2l"] = float(kvb.detach().item())
 
         if wrong_student_velocity is not None:
+            grounding_student = (
+                student_velocity
+                if grounding_student_velocity is None
+                else self._reshape_hd_field(
+                    grounding_student_velocity,
+                    sequence_shape,
+                    name="grounding_student_velocity",
+                )
+            )
             teacher_true = self._reshape_hd_field(
                 batch.get("hd_teacher_true_velocity"), sequence_shape, name="hd_teacher_true_velocity"
             )
@@ -619,16 +858,76 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 batch.get("hd_teacher_wrong_velocity"), sequence_shape, name="hd_teacher_wrong_velocity"
             )
             rho = self._reshape_hd_field(batch.get("hd_rho"), sequence_shape, name="hd_rho")
-            if teacher_true is not None and teacher_wrong is not None and rho is not None:
-                grounding = counterfactual_grounding_loss(
-                    student_velocity,
-                    wrong_student_velocity.reshape(B, T, *wrong_student_velocity.shape[1:]),
-                    teacher_true.to(student_velocity).detach(),
-                    teacher_wrong.to(student_velocity).detach(),
-                    rho.to(student_velocity),
-                    margin=self.config.hd_counterfactual_margin,
+            if teacher_true is not None and teacher_wrong is not None:
+                grounding_student = grounding_student.to(
+                    device=student_velocity.device,
+                    dtype=student_velocity.dtype,
                 )
-                total = total + self.config.hd_grounding_weight * grounding
+                wrong_student_velocity = self._reshape_hd_field(
+                    wrong_student_velocity,
+                    sequence_shape,
+                    name="wrong_student_velocity",
+                )
+                wrong_student_velocity = self._hd_align_velocity_field(
+                    wrong_student_velocity,
+                    grounding_student,
+                    name="wrong_student_velocity",
+                )
+                teacher_true = teacher_true.to(
+                    device=student_velocity.device,
+                    dtype=student_velocity.dtype,
+                )
+                teacher_wrong = teacher_wrong.to(
+                    device=student_velocity.device,
+                    dtype=student_velocity.dtype,
+                )
+                teacher_true = self._hd_align_velocity_field(
+                    teacher_true,
+                    grounding_student,
+                    name="hd_teacher_true_velocity",
+                )
+                teacher_wrong = self._hd_align_velocity_field(
+                    teacher_wrong,
+                    grounding_student,
+                    name="hd_teacher_wrong_velocity",
+                )
+                active_dim = self._hd_active_action_dim(grounding_student, teacher_true)
+                student_true_active = grounding_student[..., :active_dim]
+                student_wrong_active = wrong_student_velocity[..., :active_dim]
+                teacher_true_active = teacher_true[..., :active_dim]
+                teacher_wrong_active = teacher_wrong[..., :active_dim]
+                rho_weight = self._hd_step_weight(
+                    rho,
+                    (B, T),
+                    device=student_velocity.device,
+                    dtype=student_velocity.dtype,
+                    name="hd_rho",
+                )
+                if rho_weight is None:
+                    rho_weight = student_velocity.new_ones((B, T))
+                else:
+                    # ``rho`` may be a raw column sum of C rather than a
+                    # pre-normalized dependency label.  Grounding interprets
+                    # it as a mixture coefficient in [0,1], so normalize per
+                    # sequence before the tensor utility clamps/broadcasts it.
+                    rho_max = rho_weight.amax(dim=-1, keepdim=True)
+                    rho_weight = rho_weight / rho_max.clamp_min(1e-8)
+                grounding_parts = counterfactual_grounding_loss(
+                    student_true_active,
+                    student_wrong_active,
+                    teacher_true_active,
+                    teacher_wrong_active,
+                    rho_weight,
+                    margin=counterfactual_margin,
+                    reduction="none",
+                    return_components=True,
+                )
+                grounding_per_token = grounding_parts.direction + (
+                    invariance_weight * grounding_parts.invariance
+                )
+                grounding_weights = valid_steps
+                grounding = self._hd_weighted_mean(grounding_per_token, grounding_weights)
+                total = total + grounding_weight * grounding
                 metrics["hd_grounding"] = float(grounding.detach().item())
 
         return total, metrics
@@ -671,6 +970,8 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         hd_write_gate = self._reshape_hd_field(
             batch.get("hd_write_gate"), sequence_shape, name="hd_write_gate"
         ) if hd_fields_present else None
+        if hd_write_gate is not None:
+            hd_write_gate = hd_write_gate.clamp(0, 1)
         initial_fast_states = self._clone_fast_states(fast_states) if hd_fields_present else None
         if hd_fields_present:
             student_velocity, fast_states = self.model.forward_with_state(
@@ -690,12 +991,52 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             flow_target = noise - actions
             losses = F.mse_loss(flow_target, student_velocity, reduction="none")
             wrong_student_velocity = None
+            grounding_student_velocity = None
             wrong_gate = self._reshape_hd_field(
                 batch.get("hd_counterfactual_write_gate"),
                 sequence_shape,
                 name="hd_counterfactual_write_gate",
             )
             if wrong_gate is not None:
+                wrong_gate = wrong_gate.clamp(0, 1)
+            has_grounding_labels = (
+                wrong_gate is not None
+                and batch.get("hd_teacher_true_velocity") is not None
+                and batch.get("hd_teacher_wrong_velocity") is not None
+            )
+            if has_grounding_labels:
+                # Re-run both memory branches with writer/inner-update graphs
+                # detached.  The numerical updates are identical, but the
+                # resulting grounding loss can only train query/readout/action
+                # pathways.  Each branch receives an independent copy of the
+                # same pre-segment state, and neither replay mutates the
+                # persistent ``fast_states`` returned above.
+                grounding_initial_states = self._clone_fast_states(
+                    initial_fast_states,
+                    detach=True,
+                    requires_grad=False,
+                )
+                grounding_student_velocity, _ = self.model.forward_with_state(
+                    images,
+                    img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    state,
+                    actions,
+                    noise,
+                    time,
+                    sequence_shape=sequence_shape,
+                    fast_states=grounding_initial_states,
+                    create_graph=False,
+                    write_gate=hd_write_gate,
+                    detach_writer=True,
+                    return_velocity=True,
+                )
+                wrong_initial_states = self._clone_fast_states(
+                    initial_fast_states,
+                    detach=True,
+                    requires_grad=False,
+                )
                 wrong_student_velocity, _ = self.model.forward_with_state(
                     images,
                     img_masks,
@@ -706,8 +1047,10 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     noise,
                     time,
                     sequence_shape=sequence_shape,
-                    fast_states=initial_fast_states,
+                    fast_states=wrong_initial_states,
+                    create_graph=False,
                     write_gate=wrong_gate,
+                    detach_writer=True,
                     return_velocity=True,
                 )
             hd_aux_loss, hd_metrics = self._hd_auxiliary_losses(
@@ -715,6 +1058,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 sequence_shape,
                 student_velocity=student_velocity,
                 wrong_student_velocity=wrong_student_velocity,
+                grounding_student_velocity=grounding_student_velocity,
             )
         else:
             losses, fast_states = self.model.forward_with_state(
@@ -1059,7 +1403,9 @@ class SmolVLATTTFlowMatching(nn.Module):
         update: bool,
         create_graph: bool | None,
         write_gate: Tensor | None = None,
+        detach_writer: bool = False,
     ):
+        """Build an expert callback, optionally in reader-only replay mode."""
         batch_size, sequence_length = sequence_shape
 
         def apply_ttt(layer_index: int, hidden_states: Tensor) -> Tensor:
@@ -1087,6 +1433,7 @@ class SmolVLATTTFlowMatching(nn.Module):
                 update=update,
                 create_graph=create_graph,
                 write_gate=layer_write_gate,
+                detach_writer=detach_writer,
             )
             fast_states[layer_index] = next_state
             return sequence.reshape_as(hidden_states)
@@ -1382,8 +1729,10 @@ class SmolVLATTTFlowMatching(nn.Module):
         fast_states: TTTFastStates | None = None,
         create_graph: bool | None = None,
         write_gate: Tensor | None = None,
+        detach_writer: bool = False,
         return_velocity: bool = False,
     ) -> tuple[Tensor, TTTFastStates]:
+        """Run flow matching while optionally detaching TTT writer updates."""
         fast_states = {} if fast_states is None else dict(fast_states)
         callback = self._make_expert_layer_callback(
             sequence_shape,
@@ -1391,6 +1740,7 @@ class SmolVLATTTFlowMatching(nn.Module):
             update=True,
             create_graph=create_graph,
             write_gate=write_gate,
+            detach_writer=detach_writer,
         )
         losses = self.forward(
             images,

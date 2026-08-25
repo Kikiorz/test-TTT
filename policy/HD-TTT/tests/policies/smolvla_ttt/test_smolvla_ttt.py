@@ -129,6 +129,42 @@ def test_zero_write_gate_skips_fast_weight_mutation_but_advances_position() -> N
     assert skipped.position.tolist() == [2]
 
 
+def test_detach_writer_keeps_query_gradient_but_blocks_writer_gradient() -> None:
+    """Reader-only grounding must not update K/V or fast-weight parameters."""
+
+    torch.manual_seed(7)
+    layer = TTTMLPLayer(
+        dim=8,
+        hidden_dim=16,
+        effective_gate_init=0.05,
+        gate_trainable=True,
+        second_order=True,
+    )
+    inputs = torch.randn(1, 2, 3, 8, requires_grad=True)
+    outputs, _ = layer(
+        inputs,
+        update=True,
+        create_graph=True,
+        detach_writer=True,
+    )
+    outputs.square().mean().backward()
+
+    assert inputs.grad is not None
+    assert layer.q_proj.weight.grad is not None
+    parameters = dict(layer.named_parameters())
+    for parameter_name in (
+        "k_proj.weight",
+        "v_proj.weight",
+        "fast_w1_init",
+        "fast_b1_init",
+        "fast_w2_init",
+        "fast_b2_init",
+        "log_inner_lr_multiplier",
+        "gate",
+    ):
+        assert parameters[parameter_name].grad is None
+
+
 def test_hindsight_attribution_is_causal_and_counterfactual_reader_is_teacher_detached() -> None:
     full = torch.zeros(1, 4, 4)
     masked = full.clone()

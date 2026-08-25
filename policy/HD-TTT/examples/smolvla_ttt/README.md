@@ -39,4 +39,29 @@ HCA intervention labels are training-only. Deployment keeps the ordinary SmolVLA
 one update-then-apply fast-weight write per physical observation, and the recurrent state reset
 at episode boundaries.
 
+### Loading offline labels
+
+Pass `--dataset.hd_label_path=/path/to/labels.pt` (or a directory containing
+`labels.pt`, `labels.npz`, or `labels.json`) together with the SmolVLA-TTT
+dataset. The loader accepts one row per dataset frame, episode/frame records,
+or episode-packed columns. Canonical columns are `hd_teacher_velocity`,
+`hd_teacher_true_velocity`, `hd_teacher_wrong_velocity`, `hd_attribution`,
+`hd_rho`, `hd_write_gate`, `hd_counterfactual_write_gate`, and the optional
+`hd_local_{key,value,prediction,query}` tensors. Short aliases such as `rho`,
+`u`, `write_gate`, `C`, `hd_u`, and `hd_C` are accepted; a full `C[event,future]` matrix is
+reduced to one future-time attribution weight before batching. Labels are
+attached after episode selection and flow through the processor as
+complementary `hd_*` data, so they are not normalized with observations/actions.
+
+For example:
+
+```bash
+lerobot-train \
+  --policy.type=smolvla_ttt \
+  --policy.hd_ttt_enabled=true \
+  --dataset.repo_id=<USER>/<DATASET> \
+  --dataset.hd_label_path=/data/<DATASET>/hd_labels.pt \
+  --batch_size=1
+```
+
 For the second stage, load the first-stage checkpoint and set `--policy.ttt_training_stage=action_head`. Call `policy.reset()` between evaluation episodes so recurrent fast weights never cross episode boundaries.

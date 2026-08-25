@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .configuration_smolvla_ttt import SmolVLATTTConfig
+from .hd_dataset import HindsightLabelDataset
 from .hd_ttt import (
     HindsightAttribution,
     HindsightAttributionComputer,
@@ -31,6 +32,7 @@ __all__ = [
     "SmolVLATTTPolicy",
     "HindsightAttribution",
     "HindsightAttributionComputer",
+    "HindsightLabelDataset",
     "TTTFastState",
     "TTTMLPLayer",
     "compute_hindsight_attribution",

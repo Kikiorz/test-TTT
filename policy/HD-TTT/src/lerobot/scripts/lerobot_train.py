@@ -60,6 +60,7 @@ from lerobot.policies.pi05_ttt.sequence import (
     sequence_collate_fn as pi05_ttt_sequence_collate_fn,
 )
 from lerobot.policies.smolvla_ttt.configuration_smolvla_ttt import SmolVLATTTConfig
+from lerobot.policies.smolvla_ttt.hd_dataset import HindsightLabelDataset
 from lerobot.policies.smolvla_ttt.sequence import (
     TailPreservingSequenceDataset as SmolVLATTTSequenceDataset,
     sequence_collate_fn as smolvla_ttt_sequence_collate_fn,
@@ -78,6 +79,29 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+
+def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool):
+    """Attach offline HD-TTT labels while preserving the LeRobot dataset API.
+
+    Labels are loaded after ``make_dataset`` has resolved episode subsets and
+    delta-timestamp action chunks.  This keeps the artifact indexed by the
+    exact frame order consumed by the trainer and lets the normal processor
+    pipeline carry ``hd_*`` fields as complementary data.  The wrapper is
+    deliberately restricted to SmolVLA-TTT so a typo cannot silently alter a
+    baseline or a different policy's input schema.
+    """
+
+    label_path = getattr(cfg.dataset, "hd_label_path", None)
+    if not label_path:
+        return dataset
+    if not is_smolvla_ttt:
+        raise ValueError(
+            "dataset.hd_label_path is only supported with policy.type=smolvla_ttt; "
+            "remove it for baseline/PI0 training"
+        )
+    logging.info("Loading HD-TTT hindsight labels from %s", label_path)
+    return HindsightLabelDataset(dataset, label_path, strict=True)
 
 
 def update_policy(
@@ -481,12 +505,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
+        dataset = _attach_hd_labels(dataset, cfg, is_smolvla_ttt=is_smolvla_ttt)
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+        dataset = _attach_hd_labels(dataset, cfg, is_smolvla_ttt=is_smolvla_ttt)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,

@@ -171,12 +171,16 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     """Extract complementary data from a batch dictionary.
 
     Includes padding flags (any key containing ``_is_pad``) plus the fixed
-    set of metadata / language keys defined in ``_COMPLEMENTARY_KEYS`` —
-    each only when present in ``batch``.
+    set of metadata / language keys defined in ``_COMPLEMENTARY_KEYS`` and
+    every ``hd_*`` hindsight-supervision field — each only when present in
+    ``batch``.  HD labels are intentionally complementary data rather than
+    observations: they must survive the transition conversion, device move,
+    and tokenizer steps without entering feature normalization.
     """
     pad_keys = {k: v for k, v in batch.items() if "_is_pad" in k}
     extras = {k: batch[k] for k in _COMPLEMENTARY_KEYS if k in batch}
-    return {**pad_keys, **extras}
+    hd_keys = {k: v for k, v in batch.items() if isinstance(k, str) and k.startswith("hd_")}
+    return {**pad_keys, **extras, **hd_keys}
 
 
 def create_transition(
