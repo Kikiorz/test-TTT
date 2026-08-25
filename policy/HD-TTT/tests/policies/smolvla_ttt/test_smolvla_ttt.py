@@ -70,6 +70,19 @@ def test_default_ttt_layers_match_last_four_smolvla_expert_layers() -> None:
     assert config.n_action_steps == 1
 
 
+def test_legacy_null_hd_flags_decode_as_clean_checkpoint() -> None:
+    source = SmolVLATTTPolicy._decode_source_config(
+        {
+            "type": "smolvla_ttt",
+            "hd_ttt_enabled": None,
+            "hd_learned_write_gate": None,
+        }
+    )
+
+    assert source.hd_ttt_enabled is False
+    assert source.hd_learned_write_gate is False
+
+
 def test_config_allows_disabling_register_tokens_and_rejects_negative_count() -> None:
     assert SmolVLATTTConfig(ttt_num_register_tokens=0).ttt_num_register_tokens == 0
     with pytest.raises(ValueError, match="ttt_num_register_tokens must be non-negative"):
@@ -118,6 +131,18 @@ def test_long_horizon_window_cap_is_deterministic_and_episode_balanced() -> None
     # one-frame tail that would be produced by the raw stride offsets.
     assert sequences.window_specs[1] == (84, 16)
     assert sequences.window_specs[3] == (119, 16)
+
+
+def test_full_history_single_window_rejects_capacity_truncation() -> None:
+    dataset = _EpisodeDataset([17])
+    with pytest.raises(ValueError, match="full-history replay"):
+        TailPreservingSequenceDataset(
+            dataset,
+            sequence_length=16,
+            sequence_stride=16,
+            max_windows_per_episode=1,
+            history_warmup_length=None,
+        )
 
 
 def test_history_warmup_masks_prefix_but_keeps_it_in_the_recurrent_window() -> None:

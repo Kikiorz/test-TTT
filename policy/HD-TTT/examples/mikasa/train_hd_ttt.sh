@@ -26,7 +26,10 @@ MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-4}"
 TBPTT_SEGMENT_LENGTH="${TBPTT_SEGMENT_LENGTH:-32}"
 HISTORY_WARMUP_LENGTH="${HISTORY_WARMUP_LENGTH:-64}"
 if [[ "${HISTORY_WARMUP_LENGTH}" == "full" ]]; then
-  HISTORY_WARMUP_ARG="None"
+  # draccus decodes Optional[int] from JSON null, not the Python spelling
+  # ``None``.  Keep the shell sentinel human-readable, but pass a value the
+  # training CLI can actually decode.
+  HISTORY_WARMUP_ARG="null"
 else
   HISTORY_WARMUP_ARG="${HISTORY_WARMUP_LENGTH}"
 fi
@@ -52,7 +55,8 @@ export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-/workspace/data_mikasa_robo}"
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 
 if [[ "${MAX_WINDOWS_PER_EPISODE}" == "none" ]]; then
-  MAX_WINDOWS_ARG="None"
+  # Same Optional[int] contract as ttt_history_warmup_length above.
+  MAX_WINDOWS_ARG="null"
 else
   MAX_WINDOWS_ARG="${MAX_WINDOWS_PER_EPISODE}"
 fi
@@ -69,7 +73,7 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 root = Path(sys.argv[1])
 length = int(sys.argv[2])
 stride = int(sys.argv[3])
-cap = None if sys.argv[4] == "None" else int(sys.argv[4])
+cap = None if sys.argv[4] in {"None", "null"} else int(sys.argv[4])
 selected = None
 if sys.argv[5]:
     selected = {int(value) for value in json.loads(sys.argv[5].replace("'", '"'))}

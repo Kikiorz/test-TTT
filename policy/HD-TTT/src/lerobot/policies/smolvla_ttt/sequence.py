@@ -115,6 +115,22 @@ class TailPreservingSequenceDataset(Dataset):
         for episode_length in _dataset_episode_lengths(dataset):
             if episode_length <= 0:
                 raise ValueError("Episode lengths must be positive")
+            if (
+                max_windows_per_episode == 1
+                and self.history_warmup_length is None
+                and episode_length > sequence_length
+            ):
+                # A single full-history window is an explicit recurrent-state
+                # contract: silently selecting the first prefix would discard
+                # the suffix and make the learned memory/evaluation protocol
+                # depend on an implementation detail.  The shell recipe also
+                # performs this check before distributed launch; keep the
+                # dataset-level guard for callers that construct it directly.
+                raise ValueError(
+                    "full-history replay with max_windows_per_episode=1 requires "
+                    f"sequence_length >= every episode length; got episode_length={episode_length} "
+                    f"and sequence_length={sequence_length}"
+                )
             offsets = list(range(0, episode_length, sequence_stride))
             if max_windows_per_episode is not None and len(offsets) > max_windows_per_episode:
                 # Deterministic, episode-local coverage: retain evenly spaced

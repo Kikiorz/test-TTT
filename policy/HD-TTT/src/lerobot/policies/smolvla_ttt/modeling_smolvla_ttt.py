@@ -397,6 +397,14 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             raise TypeError(f"smolvla_ttt can only load SmolVLA-family checkpoints, got {config_type!r}")
         valid_fields = {field.name for field in fields(SmolVLATTTConfig) if field.init}
         values = {key: value for key, value in raw_config.items() if key in valid_fields}
+        # Early clean SmolVLA/TTT checkpoints serialized the optional HD
+        # switches as JSON ``null``.  ``draccus`` cannot decode that legacy
+        # spelling into a non-optional bool, even though the semantic value
+        # is the disabled/clean path.  Normalize only these historical flags;
+        # every other malformed field must still fail loudly during decoding.
+        for flag_name in ("hd_ttt_enabled", "hd_learned_write_gate"):
+            if values.get(flag_name) is None:
+                values[flag_name] = False
         if config_type == "smolvla":
             # Base checkpoints often cache a full action chunk. TTT must observe
             # every environment decision and therefore executes one action at a time.
