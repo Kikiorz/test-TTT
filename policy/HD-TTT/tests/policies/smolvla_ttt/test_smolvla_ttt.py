@@ -627,6 +627,7 @@ def test_old_ttt_checkpoint_may_omit_the_optional_gate_but_hd_checkpoint_may_not
         missing_gate,
         [],
         source_is_ttt=True,
+        strict=False,
         source_has_learned_write_gate=False,
     )
     with pytest.raises(RuntimeError, match="Incompatible SmolVLA checkpoint"):
@@ -634,6 +635,7 @@ def test_old_ttt_checkpoint_may_omit_the_optional_gate_but_hd_checkpoint_may_not
             missing_gate,
             [],
             source_is_ttt=True,
+            strict=False,
             source_has_learned_write_gate=True,
         )
 
