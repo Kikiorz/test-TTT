@@ -59,7 +59,7 @@ fi
 
 # Count the exact sequence windows consumed by TailPreservingSequenceDataset
 # so ``steps`` really denotes the requested number of dataset epochs.
-WINDOWS="$(${PYTHON_BIN} - "${DATASET_ROOT}" "${SEQUENCE_LENGTH}" "${SEQUENCE_STRIDE}" "${MAX_WINDOWS_ARG}" "${DATASET_EPISODES}" <<'PY'
+WINDOW_STATS="$(${PYTHON_BIN} - "${DATASET_ROOT}" "${SEQUENCE_LENGTH}" "${SEQUENCE_STRIDE}" "${MAX_WINDOWS_ARG}" "${DATASET_EPISODES}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -76,10 +76,22 @@ if sys.argv[5]:
 meta = LeRobotDatasetMetadata(root.name, root=root)
 episodes = meta.episodes
 total = 0
+min_episode_length = None
+max_episode_length = 0
 for episode_index, row in enumerate(episodes):
     if selected is not None and episode_index not in selected:
         continue
     n = int(row["dataset_to_index"]) - int(row["dataset_from_index"])
+    min_episode_length = n if min_episode_length is None else min(min_episode_length, n)
+    max_episode_length = max(max_episode_length, n)
+    # The one-window full-history recipe must not silently discard a suffix if
+    # a future dataset contains an episode longer than the configured replay
+    # capacity. Fail before launching distributed training.
+    if cap == 1 and n > length:
+        raise SystemExit(
+            "max_windows_per_episode=1 requires sequence_length >= every selected "
+            f"episode length; episode {episode_index} has {n} frames but sequence_length={length}"
+        )
     offsets = list(range(0, n, stride))
     if cap is not None and len(offsets) > cap:
         last_full_offset = max(n - length, 0)
@@ -91,13 +103,16 @@ for episode_index, row in enumerate(episodes):
         positions = [round(i * (len(full_offsets) - 1) / (cap - 1)) for i in range(cap)] if cap > 1 else [0]
         offsets = [full_offsets[position] for position in sorted(set(positions))]
     total += len(offsets)
-print(total)
+print(total, min_episode_length, max_episode_length)
 PY
 )"
+WINDOWS="$("${PYTHON_BIN}" -c 'import sys; print(sys.argv[1].split()[0])' "${WINDOW_STATS}")"
+MIN_EPISODE_LENGTH="$("${PYTHON_BIN}" -c 'import sys; print(sys.argv[1].split()[1])' "${WINDOW_STATS}")"
+MAX_EPISODE_LENGTH="$("${PYTHON_BIN}" -c 'import sys; print(sys.argv[1].split()[2])' "${WINDOW_STATS}")"
 STEPS_PER_EPOCH=$(( (WINDOWS + NUM_PROCESSES - 1) / NUM_PROCESSES ))
 STEPS=$(( STEPS_PER_EPOCH * EPOCHS ))
 
-echo "MIKASA HD-TTT: windows=${WINDOWS}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}"
+echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}"
 
 COMMON_ARGS=(
   --dataset.repo_id="${DATASET_REPO_ID}"
