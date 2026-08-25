@@ -32,7 +32,7 @@ import argparse
 import json
 from dataclasses import fields
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -305,7 +305,27 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    if args.official_output_dir:
+        _write_official_outputs(results, summary, args.official_output_dir)
     return payload
+
+
+def _write_official_outputs(
+    results: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+    output_dir: Path,
+) -> None:
+    """Write native MIKASA files while retaining the adapter envelope."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for result in results:
+        env_id = str(result["env_id"])
+        (output_dir / f"{env_id}.json").write_text(
+            json.dumps(dict(result), indent=2) + "\n", encoding="utf-8"
+        )
+    (output_dir / "summary.json").write_text(
+        json.dumps(dict(summary), indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -327,6 +347,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sim-backend", choices=("cpu", "gpu"), default="gpu")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--official-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Also write native MIKASA <ENV_ID>.json and summary.json files to "
+            "this directory; --output keeps the adapter envelope."
+        ),
+    )
     return parser.parse_args()
 
 
