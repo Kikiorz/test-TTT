@@ -175,7 +175,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     from mikasa_robo_suite.vla import benchmarking
 
     tasks = benchmarking.select_benchmark_tasks(env_ids=args.tasks)
-    benchmark_revision = benchmarking.benchmark_commit()
+    benchmark_commit_fn = getattr(benchmarking, "benchmark_commit", None)
+    benchmark_revision = benchmark_commit_fn() if callable(benchmark_commit_fn) else None
+    if len(tasks) == 2:
+        benchmark_subset = "two_task_subset"
+    elif len(tasks) == 1:
+        benchmark_subset = "single_task"
+    else:
+        benchmark_subset = "selected_task_set"
     policy = _load_policy(args)
     results: list[dict[str, Any]] = []
 
@@ -213,6 +220,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 "env_id": task.env_id,
                 "split": task.split.title(),
                 "memory_type": task.memory_type,
+                "data_source": task.data_source,
                 "start_seed": args.start_seed,
                 "n_episodes": args.num_episodes,
                 "successes": successes,
@@ -224,7 +232,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 "sim_backend": args.sim_backend,
                 "reward_mode": "normalized_dense",
                 "benchmark_protocol": "MIKASA-Robo-VLA official runner",
-                "benchmark_subset": "two_task_subset",
+                "benchmark_subset": benchmark_subset,
+                "requested_tasks": [task.env_id for task in tasks],
                 "benchmark_commit": benchmark_revision,
                 "wrapper_chain": "apply_mikasa_vla_wrappers(include_overlays=False)",
                 # Unlike TTT, the original policy's native action horizon is
