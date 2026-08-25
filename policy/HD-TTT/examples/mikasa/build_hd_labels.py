@@ -455,8 +455,10 @@ def _episode_labels(
     # exactly zero instead of producing NaNs or an arbitrary write signal.
     rho_scale = rho_raw.max().clamp_min(1e-8)
     rho = rho_raw / rho_scale if float(rho_raw.max()) > 0 else rho_raw
-    u_scale = event_u_raw.max().clamp_min(1e-8)
-    event_u = event_u_raw / u_scale if event_u_raw.numel() and float(event_u_raw.max()) > 0 else event_u_raw
+    if event_u_raw.numel() and float(event_u_raw.max()) > 0:
+        event_u = event_u_raw / event_u_raw.max().clamp_min(1e-8)
+    else:
+        event_u = event_u_raw
     # Unobserved event blocks (when ``max_events`` is a positive sampling cap)
     # retain the ordinary writer rather than being silently trained as
     # permanent skips.  Every block is therefore either assigned its measured
