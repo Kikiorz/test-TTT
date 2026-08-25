@@ -191,6 +191,124 @@ def test_fast_state_carries_across_detached_tbptt_segments() -> None:
     assert split_state.position.tolist() == joint_state.position.tolist() == [5]
 
 
+def test_grounding_branches_carry_their_own_state_across_tbptt_segments() -> None:
+    """An early blocked write must remain absent in every later segment."""
+
+    class _ReplayState:
+        def __init__(self, position: int) -> None:
+            self.position = torch.tensor([position], dtype=torch.int64)
+
+        def clone(self, *, detach: bool = False, requires_grad: bool = True):
+            del detach, requires_grad
+            return _ReplayState(int(self.position.item()))
+
+        def detach(self, requires_grad: bool = True):
+            del requires_grad
+            return _ReplayState(int(self.position.item()))
+
+    class _ReplayModel:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int, bool, bool]] = []
+
+        def forward_with_state(
+            self,
+            *args,
+            sequence_shape,
+            fast_states=None,
+            detach_writer=False,
+            write_gate=None,
+            return_local_loss=False,
+            **kwargs,
+        ):
+            del args, kwargs
+            sequence_length = sequence_shape[1]
+            previous_position = (
+                -1
+                if fast_states is None
+                else int(next(iter(fast_states.values())).position.item())
+            )
+            self.calls.append(
+                (previous_position, sequence_length, detach_writer, write_gate is None)
+            )
+            velocity = torch.zeros(sequence_length, 1, 1, requires_grad=True)
+            next_states = {
+                0: _ReplayState(previous_position + sequence_length),
+            }
+            if return_local_loss:
+                local_loss = torch.zeros(1, sequence_length, requires_grad=True)
+                return velocity, next_states, local_loss
+            return velocity, next_states
+
+    policy = SmolVLATTTPolicy.__new__(SmolVLATTTPolicy)
+    policy.config = SimpleNamespace(
+        adapt_to_pi_aloha=False,
+        action_feature=SimpleNamespace(shape=(1,)),
+        hd_ttt_enabled=True,
+        hd_learned_write_gate=False,
+        hd_phase_mode="deployment",
+    )
+    policy.model = _ReplayModel()
+    policy.prepare_images = lambda batch: (
+        [torch.zeros(2, 1, 1, 1)],
+        [torch.ones(2, 1, dtype=torch.bool)],
+    )
+    policy.prepare_state = lambda batch: torch.zeros(2, 1)
+    policy.prepare_action = lambda batch: batch["action"]
+    # This test isolates numerical branch-state bookkeeping.  The tensor
+    # utilities and grounding gradients are covered by dedicated tests below.
+    policy._hd_auxiliary_losses = lambda *args, **kwargs: (
+        torch.zeros((), requires_grad=True),
+        {},
+    )
+
+    def segment_batch() -> dict[str, torch.Tensor]:
+        return {
+            "action": torch.zeros(2, 1, 1),
+            "observation.state": torch.zeros(2, 1),
+            "observation.language.tokens": torch.zeros(2, 1, dtype=torch.long),
+            "observation.language.attention_mask": torch.ones(2, 1, dtype=torch.bool),
+            "action_is_pad": torch.zeros(2, 1, dtype=torch.bool),
+            "hd_teacher_velocity": torch.zeros(2, 1, 1),
+            "hd_teacher_true_velocity": torch.zeros(2, 1, 1),
+            "hd_teacher_wrong_velocity": torch.zeros(2, 1, 1),
+            "hd_write_gate": torch.ones(2),
+            "hd_counterfactual_write_gate": torch.ones(2),
+        }
+
+    grounding_states = {"true": None, "wrong": None}
+    noise = torch.zeros(2, 1, 1)
+    time = torch.ones(2)
+    _, _, main_states = policy.forward_sequence_segment(
+        segment_batch(),
+        (1, 2),
+        noise=noise,
+        time=time,
+        grounding_states=grounding_states,
+    )
+    _, _, _ = policy.forward_sequence_segment(
+        segment_batch(),
+        (1, 2),
+        fast_states={index: state.detach() for index, state in main_states.items()},
+        noise=noise,
+        time=time,
+        grounding_states=grounding_states,
+    )
+
+    # Each segment performs main, true/all-write, then wrong/intervened replay.
+    # Both counterfactual branches must begin segment two at position 1, the
+    # state returned by their own first segment, not from a fresh position -1.
+    assert policy.model.calls == [
+        (-1, 2, False, False),
+        (-1, 2, True, True),
+        (-1, 2, True, False),
+        (1, 2, False, False),
+        (1, 2, True, True),
+        (1, 2, True, False),
+    ]
+    assert grounding_states["true"][0].position.tolist() == [3]
+    assert grounding_states["wrong"][0].position.tolist() == [3]
+
+
 def test_frozen_teacher_still_computes_local_fast_weight_updates() -> None:
     """Freezing outer parameters must not disable the deployment-time inner loop."""
 
