@@ -100,13 +100,16 @@ class SmolVLAMikasaPolicy:
 
 def _load_policy(args: argparse.Namespace):
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from lerobot.policies.factory import make_policy
     from lerobot.policies.smolvla_ttt.configuration_smolvla_ttt import SmolVLATTTConfig
-    from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import SmolVLATTTPolicy
     from lerobot.policies.smolvla_ttt.processor_smolvla_ttt import make_smolvla_ttt_pre_post_processors
 
     metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
+    # ``make_policy`` first projects the dataset schema into policy features;
+    # constructing ``from_pretrained`` directly would leave input_features
+    # empty and silently drop the two MIKASA cameras.
     config = SmolVLATTTConfig(device=args.device, pretrained_path=Path(args.checkpoint))
-    policy = SmolVLATTTPolicy.from_pretrained(args.checkpoint, config=config)
+    policy = make_policy(config, ds_meta=metadata)
     preprocessor, postprocessor = make_smolvla_ttt_pre_post_processors(
         policy.config,
         dataset_stats=metadata.stats,

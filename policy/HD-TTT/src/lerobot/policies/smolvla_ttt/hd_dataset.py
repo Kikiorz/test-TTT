@@ -609,7 +609,7 @@ class HindsightLabelDataset(Dataset):
             return
 
         raise ValueError(
-            f"HD label columns have {row_count} rows but dataset has {len(self.dataset)} frames; "
+            f"HD labels do not cover the dataset: columns have {row_count} rows but dataset has {len(self.dataset)} frames; "
             "include index/episode_index+frame_index metadata or save one row per frame"
         )
 

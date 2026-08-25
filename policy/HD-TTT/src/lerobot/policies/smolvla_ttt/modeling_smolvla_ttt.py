@@ -959,14 +959,52 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         actions = self.prepare_action(batch)
-        if noise is None:
-            noise = self.model.sample_noise(actions.shape, actions.device)
-        if time is None:
-            time = self.model.sample_time(actions.shape[0], actions.device)
-
         hd_fields_present = self.config.hd_ttt_enabled and any(
             key.startswith("hd_") for key in batch
         )
+        # A hindsight collector may store the exact flow phase/noise used by
+        # its causal teacher.  Reusing them makes HCA distillation phase
+        # matched; ordinary TTT batches continue to sample fresh values.
+        if noise is None and hd_fields_present and batch.get("hd_noise") is not None:
+            labeled_noise = self._reshape_hd_field(
+                batch["hd_noise"], sequence_shape, name="hd_noise"
+            )
+            labeled_noise = labeled_noise.to(device=actions.device, dtype=actions.dtype)
+            if labeled_noise.ndim == actions.ndim - 1:
+                labeled_noise = labeled_noise.unsqueeze(-2)
+            if labeled_noise.ndim != actions.ndim:
+                raise ValueError(
+                    f"hd_noise shape {tuple(labeled_noise.shape)} must match action rank {actions.ndim}"
+                )
+            if labeled_noise.shape[:-1] != actions.shape[:-1]:
+                try:
+                    labeled_noise = torch.broadcast_to(
+                        labeled_noise, actions.shape[:-1] + (labeled_noise.shape[-1],)
+                    )
+                except RuntimeError as exc:
+                    raise ValueError(
+                        f"hd_noise prefix {tuple(labeled_noise.shape[:-1])} does not match "
+                        f"actions {tuple(actions.shape[:-1])}"
+                    ) from exc
+            if labeled_noise.shape[-1] < actions.shape[-1]:
+                labeled_noise = F.pad(labeled_noise, (0, actions.shape[-1] - labeled_noise.shape[-1]))
+            elif labeled_noise.shape[-1] > actions.shape[-1]:
+                labeled_noise = labeled_noise[..., : actions.shape[-1]]
+            noise = labeled_noise.reshape_as(actions)
+        if noise is None:
+            noise = self.model.sample_noise(actions.shape, actions.device)
+        if time is None and hd_fields_present and batch.get("hd_time") is not None:
+            labeled_time = self._reshape_hd_field(
+                batch["hd_time"], sequence_shape, name="hd_time"
+            ).to(device=actions.device, dtype=torch.float32)
+            time = labeled_time.reshape(-1)
+            if time.shape[0] != actions.shape[0]:
+                raise ValueError(
+                    f"hd_time has {time.shape[0]} values but flattened action batch has {actions.shape[0]}"
+                )
+        if time is None:
+            time = self.model.sample_time(actions.shape[0], actions.device)
+
         hd_write_gate = self._reshape_hd_field(
             batch.get("hd_write_gate"), sequence_shape, name="hd_write_gate"
         ) if hd_fields_present else None
