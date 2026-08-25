@@ -1003,6 +1003,16 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # is intentionally returned as an un-gated [B,T] loss
         # and weighted here by hindsight ``hd_write_gate`` plus the physical
         # writer-valid mask (which includes labeled history warm-up frames).
+        #
+        # ``hd_write_gate_observed`` is intentionally *not* multiplied into
+        # this local objective.  With ``max_events > 0`` the collector only
+        # replays a sampled subset of causal blocks and assigns unobserved
+        # blocks the safe default gate=1.0.  Keeping those rows in H2L is the
+        # deliberate all-write fallback: the local writer still learns its
+        # ordinary deployment objective on every valid interaction, while the
+        # observed mask gates only hindsight gate distillation below.  Masking
+        # H2L by observed would be a different compute-budget ablation and
+        # would turn unsampled rows into no-supervision rows.
         # This removes the need for unavailable/offline ``hd_local_*`` labels.
         if local_ttt_loss is not None:
             local_loss = self._reshape_hd_field(
@@ -1055,6 +1065,9 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                         device=student_velocity.device,
                         dtype=student_velocity.dtype,
                     )
+                # Keep the same all-write fallback as the differentiable
+                # ``local_ttt_loss`` path above; observed replay coverage is
+                # only a gate-target validity signal.
                 if writer_valid_steps is not None:
                     local_gate = (
                         writer_valid_steps

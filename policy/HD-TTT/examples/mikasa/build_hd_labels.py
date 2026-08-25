@@ -69,7 +69,15 @@ LOGGER = logging.getLogger("build_hd_labels")
 
 
 def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
-    """Require a trained SmolVLA-TTT teacher rather than random TTT weights."""
+    """Require a trained *clean* SmolVLA-TTT teacher.
+
+    The offline replay below explicitly controls the ordinary TTT write gate
+    and does not call the learned HD gate path.  An HD-enabled checkpoint would
+    therefore be silently replayed as a clean/all-write teacher, which makes
+    its provenance and the resulting hindsight labels misleading.  Keep this
+    guard here (rather than relying on the caller's config overrides) and
+    record both HD switches in the returned contract.
+    """
 
     checkpoint_text = str(checkpoint)
     checkpoint_path = Path(checkpoint_text).expanduser()
@@ -93,10 +101,30 @@ def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
         raise ValueError(f"Could not read teacher config {config_path}: {error}") from error
     if raw.get("type") != "smolvla_ttt":
         raise ValueError(
-            "HD hindsight labels require a trained clean/HD SmolVLA-TTT teacher "
+            "HD hindsight labels require a trained clean SmolVLA-TTT teacher "
             f"(config.type='smolvla_ttt'), got {raw.get('type')!r} from {checkpoint_text!r}. "
             "Train clean-TTT first; a standard SmolVLA checkpoint would leave "
             "the TTT/register weights randomly initialized."
+        )
+    teacher_hd_ttt_enabled = raw.get("hd_ttt_enabled", False)
+    teacher_hd_learned_write_gate = raw.get("hd_learned_write_gate", False)
+    # Generated draccus configs use JSON booleans.  Reject malformed values
+    # instead of allowing e.g. the string ``"false"`` to become truthy and
+    # bypass the clean-teacher guard.
+    if (
+        type(teacher_hd_ttt_enabled) is not bool
+        or type(teacher_hd_learned_write_gate) is not bool
+    ):
+        raise ValueError(
+            f"Teacher config {config_path} has malformed HD switches; "
+            "hd_ttt_enabled and hd_learned_write_gate must be JSON booleans"
+        )
+    if teacher_hd_ttt_enabled or teacher_hd_learned_write_gate:
+        raise ValueError(
+            "HD hindsight replay requires a clean SmolVLA-TTT teacher with "
+            "hd_ttt_enabled=false and hd_learned_write_gate=false. The label "
+            "replay currently uses the clean/all-write path and does not invoke "
+            "the learned HD gate; regenerate with a clean-TTT checkpoint."
         )
     if "ttt_layer_indices" not in raw or "ttt_num_register_tokens" not in raw:
         raise ValueError(
@@ -137,6 +165,8 @@ def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "ttt_layer_indices": layer_indices,
         "ttt_num_register_tokens": register_tokens,
+        "hd_ttt_enabled": teacher_hd_ttt_enabled,
+        "hd_learned_write_gate": teacher_hd_learned_write_gate,
         "config_path": str(config_path),
     }
 
@@ -710,6 +740,8 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         "teacher_config_sha256",
         "teacher_ttt_layer_indices",
         "teacher_ttt_num_register_tokens",
+        "teacher_hd_ttt_enabled",
+        "teacher_hd_learned_write_gate",
         "seed",
         "phase_mode",
         "history_mode",
@@ -962,6 +994,8 @@ def _build_shard(args: argparse.Namespace) -> None:
         "teacher_config_sha256": teacher_info["config_sha256"],
         "teacher_ttt_layer_indices": list(teacher_info["ttt_layer_indices"]),
         "teacher_ttt_num_register_tokens": int(teacher_info["ttt_num_register_tokens"]),
+        "teacher_hd_ttt_enabled": bool(teacher_info["hd_ttt_enabled"]),
+        "teacher_hd_learned_write_gate": bool(teacher_info["hd_learned_write_gate"]),
         "fps": fps,
         "episode_start": args.episode_start,
         "episode_end": args.episode_end,
