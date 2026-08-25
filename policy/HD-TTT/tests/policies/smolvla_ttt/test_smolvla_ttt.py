@@ -118,6 +118,7 @@ def test_history_warmup_masks_prefix_but_keeps_it_in_the_recurrent_window() -> N
                 "frame_index": index,
                 "action": torch.zeros(3, 2),
                 "action_is_pad": torch.zeros(3, dtype=torch.bool),
+                "hd_write_gate": torch.tensor(1.0),
             }
 
     dataset = _ActionDataset([20])
@@ -765,7 +766,9 @@ def test_tbptt_writer_mask_keeps_history_only_segment_trainable() -> None:
         weight_by_valid_actions=True,
         include_writer_valid=True,
     )
-    assert weights == pytest.approx([0.5, 0.5])
+    # The first segment has two writer interactions but no action targets; the
+    # second has four action targets, so union/max weighting is 2:4.
+    assert weights == pytest.approx([1 / 3, 2 / 3])
 
 
 def test_ttt_hook_runs_after_expert_attention_residual_and_before_mlp() -> None:
