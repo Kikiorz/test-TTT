@@ -70,8 +70,10 @@ class TailPreservingSequenceDataset(Dataset):
 
     Starts advance by ``sequence_stride``. Each final window ends exactly at the
     episode boundary, so short episodes and non-divisible tails remain training
-    examples instead of being filtered out. The formal four-GPU recipe uses
-    ``sequence_length == sequence_stride == 256``, which covers every frame once.
+    examples instead of being filtered out. The MIKASA recipes choose the
+    sequence capacity explicitly: bounded-window runs use a short context,
+    while the full-history Shuffle protocol sets it to the longest selected
+    episode and consumes one complete window per episode.
     """
 
     def __init__(
