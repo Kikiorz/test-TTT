@@ -80,6 +80,14 @@ class SmolVLAMikasaPolicy:
         rgb = rgb if torch.is_tensor(rgb) else torch.as_tensor(rgb)
         if rgb.ndim != 4 or rgb.shape[0] != 1 or rgb.shape[-1] != 6:
             raise ValueError(f"Expected MIKASA rgb shape [1,H,W,6], got {tuple(rgb.shape)}")
+        # The official VLA wrapper fixes both cameras at 128x128.  Failing
+        # here is preferable to silently resizing a malformed observation and
+        # then reporting a score that is not comparable with the benchmark.
+        if tuple(rgb.shape[1:3]) != (128, 128):
+            raise ValueError(
+                "Expected official MIKASA camera resolution [1,128,128,6], "
+                f"got {tuple(rgb.shape)}"
+            )
         top = self._to_chw(rgb[..., :3])
         wrist = self._to_chw(rgb[..., 3:])
         proprio = obs["proprio"]
@@ -87,6 +95,13 @@ class SmolVLAMikasaPolicy:
         if proprio.ndim == 2 and proprio.shape[0] == 1:
             proprio = proprio[0]
         proprio = proprio.to(dtype=torch.float32)
+        if tuple(proprio.shape) != (7,):
+            raise ValueError(
+                "Expected official MIKASA proprio shape [1,7] (or [7] after "
+                f"batch removal), got {tuple(proprio.shape)}"
+            )
+        if not torch.isfinite(proprio).all():
+            raise ValueError("MIKASA proprio observation contains NaN or Inf")
         return {
             "observation.images.top": top,
             "observation.images.wrist": wrist,
@@ -109,8 +124,26 @@ class SmolVLAMikasaPolicy:
         processed = self.preprocessor(raw)
         action = self.policy.select_action(processed)
         action = self.postprocessor(action)
+        action = action if torch.is_tensor(action) else torch.as_tensor(action)
+        if action.ndim not in (1, 2):
+            raise ValueError(
+                "SmolVLA-TTT select_action must return [7] or [1,7] for MIKASA, "
+                f"got {tuple(action.shape)}"
+            )
         if action.ndim == 2:
+            if tuple(action.shape) != (1, 7):
+                raise ValueError(
+                    "SmolVLA-TTT select_action must return [1,7] for a single "
+                    f"MIKASA environment, got {tuple(action.shape)}"
+                )
             action = action[0]
+        elif tuple(action.shape) != (7,):
+            raise ValueError(
+                "SmolVLA-TTT select_action must return a 7D MIKASA action, "
+                f"got {tuple(action.shape)}"
+            )
+        if not torch.isfinite(action).all():
+            raise ValueError("SmolVLA-TTT produced a NaN/Inf action")
         # MIKASA's canonical action space is bounded to [-1, 1].  A freshly
         # initialized/partially fine-tuned flow head can briefly leave that
         # range after unnormalization; the official runner expects the policy

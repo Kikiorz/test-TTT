@@ -81,11 +81,18 @@ class SmolVLABaselineMikasaPolicy(SmolVLAMikasaPolicy):
                 "SmolVLA predict_action_chunk must return [1,K,D] or [K,D], "
                 f"got {tuple(action_chunk.shape)}"
             )
+        if action_chunk.shape[1] != 7:
+            raise ValueError(
+                "MIKASA's canonical action space has 7 dimensions, "
+                f"but SmolVLA returned D={action_chunk.shape[1]}"
+            )
         if action_chunk.shape[0] != self.chunk_size:
             raise ValueError(
                 "The original SmolVLA baseline must expose its complete "
                 f"50-step chunk, got K={action_chunk.shape[0]}"
             )
+        if not torch.isfinite(action_chunk).all():
+            raise ValueError("SmolVLA produced a NaN/Inf action chunk")
 
         # MIKASA's action space is [-1, 1].  Keep the environment contract at
         # the adapter boundary after unnormalization, just as the TTT adapter
