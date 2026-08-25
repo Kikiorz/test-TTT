@@ -735,6 +735,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         student_velocity: Tensor,
         wrong_student_velocity: Tensor | None = None,
         grounding_student_velocity: Tensor | None = None,
+        local_ttt_loss: Tensor | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         """Compute optional HD terms from training-only teacher/intervention labels.
 
@@ -810,36 +811,60 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             total = total + hca_weight * hca
             metrics["hd_hca"] = float(hca.detach().item())
 
-        # The writer gate is supplied by the hindsight teacher.  The local K/V
-        # objective itself can optionally be logged/optimized when a collector
-        # stores the projected key/value/prediction tensors.
-        local_key = self._reshape_hd_field(batch.get("hd_local_key"), sequence_shape, name="hd_local_key")
-        local_value = self._reshape_hd_field(batch.get("hd_local_value"), sequence_shape, name="hd_local_value")
-        local_prediction = self._reshape_hd_field(
-            batch.get("hd_local_prediction"), sequence_shape, name="hd_local_prediction"
-        )
-        local_query = self._reshape_hd_field(batch.get("hd_local_query"), sequence_shape, name="hd_local_query")
-        if local_key is not None and local_value is not None and local_prediction is not None:
-            local_key = local_key.to(device=student_velocity.device, dtype=student_velocity.dtype)
-            local_value = local_value.to(device=student_velocity.device, dtype=student_velocity.dtype)
-            local_prediction = local_prediction.to(
+        # The deployable writer objective is computed directly inside each
+        # TTT layer.  It is intentionally returned as an un-gated [B,T] loss
+        # and weighted here by hindsight ``hd_write_gate`` plus action padding.
+        # This removes the need for unavailable/offline ``hd_local_*`` labels.
+        if local_ttt_loss is not None:
+            local_loss = self._reshape_hd_field(
+                local_ttt_loss,
+                sequence_shape,
+                name="local_ttt_loss",
+            ).to(device=student_velocity.device, dtype=student_velocity.dtype)
+            local_gate = self._hd_step_weight(
+                self._reshape_hd_field(batch.get("hd_write_gate"), sequence_shape, name="hd_write_gate"),
+                (B, T),
                 device=student_velocity.device,
                 dtype=student_velocity.dtype,
+                name="hd_write_gate",
             )
-            if local_query is not None:
-                local_query = local_query.to(
-                    device=student_velocity.device,
-                    dtype=student_velocity.dtype,
-                )
-            local_gate = self._reshape_hd_field(batch.get("hd_write_gate"), sequence_shape, name="hd_write_gate")
-            if local_gate is not None:
-                local_gate = local_gate.to(
-                    device=student_velocity.device,
-                    dtype=student_velocity.dtype,
-                )
-            kvb = local_kvb_loss(local_query, local_key, local_value, local_prediction, local_gate)
+            if valid_steps is not None:
+                local_gate = valid_steps if local_gate is None else local_gate * valid_steps
+            kvb = self._hd_weighted_mean(local_loss, local_gate)
             total = total + h2l_weight * kvb
             metrics["hd_h2l"] = float(kvb.detach().item())
+        else:
+            # Backward-compatible fallback for old checkpoints/collectors that
+            # explicitly stored projected local K/V tensors.  New HD training
+            # never depends on these fields because ``forward_with_state``
+            # supplies ``local_ttt_loss`` above.
+            local_key = self._reshape_hd_field(batch.get("hd_local_key"), sequence_shape, name="hd_local_key")
+            local_value = self._reshape_hd_field(batch.get("hd_local_value"), sequence_shape, name="hd_local_value")
+            local_prediction = self._reshape_hd_field(
+                batch.get("hd_local_prediction"), sequence_shape, name="hd_local_prediction"
+            )
+            local_query = self._reshape_hd_field(batch.get("hd_local_query"), sequence_shape, name="hd_local_query")
+            if local_key is not None and local_value is not None and local_prediction is not None:
+                local_key = local_key.to(device=student_velocity.device, dtype=student_velocity.dtype)
+                local_value = local_value.to(device=student_velocity.device, dtype=student_velocity.dtype)
+                local_prediction = local_prediction.to(
+                    device=student_velocity.device,
+                    dtype=student_velocity.dtype,
+                )
+                if local_query is not None:
+                    local_query = local_query.to(
+                        device=student_velocity.device,
+                        dtype=student_velocity.dtype,
+                    )
+                local_gate = self._reshape_hd_field(batch.get("hd_write_gate"), sequence_shape, name="hd_write_gate")
+                if local_gate is not None:
+                    local_gate = local_gate.to(
+                        device=student_velocity.device,
+                        dtype=student_velocity.dtype,
+                    )
+                kvb = local_kvb_loss(local_query, local_key, local_value, local_prediction, local_gate)
+                total = total + h2l_weight * kvb
+                metrics["hd_h2l"] = float(kvb.detach().item())
 
         if wrong_student_velocity is not None:
             grounding_student = (
@@ -970,6 +995,15 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 batch["hd_noise"], sequence_shape, name="hd_noise"
             )
             labeled_noise = labeled_noise.to(device=actions.device, dtype=actions.dtype)
+            # HD fields are grouped as ``[B,T,chunk,D]`` after sequence
+            # collation, while the action expert consumes flattened
+            # ``[B*T,chunk,D]`` tensors.  Flatten the sequence axes before the
+            # rank/prefix checks below; otherwise a perfectly valid per-frame
+            # phase label is rejected as rank four versus action rank three.
+            if labeled_noise.ndim >= 2 and labeled_noise.shape[:2] == (batch_size, sequence_length):
+                labeled_noise = labeled_noise.reshape(
+                    expected_flat_batch, *labeled_noise.shape[2:]
+                )
             if labeled_noise.ndim == actions.ndim - 1:
                 labeled_noise = labeled_noise.unsqueeze(-2)
             if labeled_noise.ndim != actions.ndim:
@@ -1012,7 +1046,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             hd_write_gate = hd_write_gate.clamp(0, 1)
         initial_fast_states = self._clone_fast_states(fast_states) if hd_fields_present else None
         if hd_fields_present:
-            student_velocity, fast_states = self.model.forward_with_state(
+            student_velocity, fast_states, local_ttt_loss = self.model.forward_with_state(
                 images,
                 img_masks,
                 lang_tokens,
@@ -1025,6 +1059,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 fast_states=fast_states,
                 write_gate=hd_write_gate,
                 return_velocity=True,
+                return_local_loss=True,
             )
             flow_target = noise - actions
             losses = F.mse_loss(flow_target, student_velocity, reduction="none")
@@ -1097,6 +1132,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 student_velocity=student_velocity,
                 wrong_student_velocity=wrong_student_velocity,
                 grounding_student_velocity=grounding_student_velocity,
+                local_ttt_loss=local_ttt_loss,
             )
         else:
             losses, fast_states = self.model.forward_with_state(
@@ -1449,8 +1485,17 @@ class SmolVLATTTFlowMatching(nn.Module):
         create_graph: bool | None,
         write_gate: Tensor | None = None,
         detach_writer: bool = False,
+        return_local_loss: bool = False,
+        local_loss_accumulator: list[Tensor] | None = None,
     ):
-        """Build an expert callback, optionally in reader-only replay mode."""
+        """Build an expert callback, optionally collecting H2L writer losses.
+
+        ``return_local_loss`` is opt-in so every existing callback invocation
+        keeps its original output/state API.  When enabled, each selected TTT
+        layer appends a ``[B,T]`` raw inner K/V loss to
+        ``local_loss_accumulator``; :meth:`forward_with_state` averages these
+        layer-wise losses before returning them.
+        """
         batch_size, sequence_length = sequence_shape
 
         def apply_ttt(layer_index: int, hidden_states: Tensor) -> Tensor:
@@ -1472,14 +1517,21 @@ class SmolVLATTTFlowMatching(nn.Module):
                         "write_gate must match the callback sequence shape "
                         f"{(batch_size, sequence_length)}, got {tuple(layer_write_gate.shape)}"
                     )
-            sequence, next_state = self.ttt_layers[layer_key](
+            layer_output = self.ttt_layers[layer_key](
                 sequence,
                 fast_states.get(layer_index),
                 update=update,
                 create_graph=create_graph,
                 write_gate=layer_write_gate,
                 detach_writer=detach_writer,
+                return_local_loss=return_local_loss,
             )
+            if return_local_loss:
+                sequence, next_state, local_loss = layer_output
+                if local_loss_accumulator is not None:
+                    local_loss_accumulator.append(local_loss)
+            else:
+                sequence, next_state = layer_output
             fast_states[layer_index] = next_state
             return sequence.reshape_as(hidden_states)
 
@@ -1776,9 +1828,19 @@ class SmolVLATTTFlowMatching(nn.Module):
         write_gate: Tensor | None = None,
         detach_writer: bool = False,
         return_velocity: bool = False,
-    ) -> tuple[Tensor, TTTFastStates]:
-        """Run flow matching while optionally detaching TTT writer updates."""
+        return_local_loss: bool = False,
+    ) -> tuple[Tensor, TTTFastStates] | tuple[Tensor, TTTFastStates, Tensor]:
+        """Run flow matching while optionally exposing the local H2L loss.
+
+        The default two-item return is unchanged.  With
+        ``return_local_loss=True``, a third ``[B,T]`` tensor is returned.  It
+        is the mean raw inner K/V prediction loss over selected TTT layers,
+        before any hindsight ``write_gate`` weighting.  This keeps the local
+        objective available without requiring precomputed ``hd_local_*``
+        tensors in the dataset.
+        """
         fast_states = {} if fast_states is None else dict(fast_states)
+        local_loss_parts: list[Tensor] | None = [] if return_local_loss else None
         callback = self._make_expert_layer_callback(
             sequence_shape,
             fast_states,
@@ -1786,6 +1848,8 @@ class SmolVLATTTFlowMatching(nn.Module):
             create_graph=create_graph,
             write_gate=write_gate,
             detach_writer=detach_writer,
+            return_local_loss=return_local_loss,
+            local_loss_accumulator=local_loss_parts,
         )
         losses = self.forward(
             images,
@@ -1799,7 +1863,13 @@ class SmolVLATTTFlowMatching(nn.Module):
             expert_layer_callback=callback,
             return_velocity=return_velocity,
         )
-        return losses, fast_states
+        if not return_local_loss:
+            return losses, fast_states
+        if local_loss_parts:
+            local_loss = torch.stack(local_loss_parts, dim=0).mean(dim=0)
+        else:
+            local_loss = losses.new_zeros(sequence_shape)
+        return losses, fast_states, local_loss
 
     def sample_actions(
         self,
