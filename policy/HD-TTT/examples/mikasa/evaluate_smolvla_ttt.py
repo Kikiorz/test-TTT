@@ -176,6 +176,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     from mikasa_robo_suite.vla import benchmarking
 
     tasks = benchmarking.select_benchmark_tasks(env_ids=args.tasks)
+    benchmark_revision = benchmarking.benchmark_commit()
     policy = _load_policy(args)
     results: list[dict[str, Any]] = []
     for task in tasks:
@@ -219,6 +220,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "reward_mode": "normalized_dense",
             "benchmark_protocol": "MIKASA-Robo-VLA official runner",
             "benchmark_subset": "two_task_subset",
+            "benchmark_commit": benchmark_revision,
             "wrapper_chain": "apply_mikasa_vla_wrappers(include_overlays=False)",
             # The adapter executes one action at a time so recurrent TTT state
             # is updated at every environment step.  SmolVLA still predicts
