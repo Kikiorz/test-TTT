@@ -134,9 +134,10 @@ class SmolVLATTTConfig(PreTrainedConfig):
     ttt_second_order: bool = True
     ttt_start_layer: int = 12
     ttt_layer_indices: list[int] | None = field(default=None)
-    # Learned expert-side tokens prepended before the action tokens. Registers
-    # and actions exchange information within each timestep while the original
-    # causal action-action pattern is retained. Set to 0 for the no-register path.
+    # Learned expert-side tokens prepended before the action tokens. Register
+    # queries may read the complete action suffix, while action queries cannot
+    # directly read register columns and retain the original causal
+    # action-action pattern. Set to 0 for the no-register path.
     ttt_num_register_tokens: int = 16
     ttt_training_stage: str = "ttt_only"
 
