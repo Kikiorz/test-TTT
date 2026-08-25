@@ -108,7 +108,8 @@ def _load_policy(args: argparse.Namespace):
     from lerobot.policies.smolvla_ttt.configuration_smolvla_ttt import SmolVLATTTConfig
     from lerobot.policies.smolvla_ttt.processor_smolvla_ttt import make_smolvla_ttt_pre_post_processors
 
-    metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
+    dataset_repo_id = args.dataset_repo_id or args.dataset_root.name
+    metadata = LeRobotDatasetMetadata(dataset_repo_id, root=args.dataset_root)
 
     # ``_restore_checkpoint_model_fields`` deliberately treats a target
     # ``False`` as an explicit HD opt-out.  Evaluation therefore must carry
@@ -229,7 +230,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--dataset-repo-id", default="mikasa/shell_game")
+    parser.add_argument(
+        "--dataset-repo-id",
+        default=None,
+        help="LeRobot repo id; defaults to the local dataset directory name",
+    )
     parser.add_argument("--task", dest="tasks", action="append", required=True)
     parser.add_argument("--num-episodes", type=int, default=50)
     parser.add_argument("--start-seed", type=int, default=4242424242)

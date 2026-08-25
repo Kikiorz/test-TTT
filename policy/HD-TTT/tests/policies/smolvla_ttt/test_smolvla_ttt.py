@@ -752,6 +752,27 @@ def test_old_ttt_checkpoint_may_omit_the_optional_gate_but_hd_checkpoint_may_not
         )
 
 
+def test_hd_gate_context_head_can_be_dropped_for_explicit_clean_ablation() -> None:
+    context_head = ["model.ttt_layers.12.write_gate_context_head.weight"]
+    _validate_checkpoint_keys(
+        [],
+        context_head,
+        source_is_ttt=True,
+        strict=False,
+        source_has_learned_write_gate=True,
+        target_has_learned_write_gate=False,
+    )
+    with pytest.raises(RuntimeError, match="Incompatible SmolVLA checkpoint"):
+        _validate_checkpoint_keys(
+            [],
+            context_head,
+            source_is_ttt=True,
+            strict=False,
+            source_has_learned_write_gate=True,
+            target_has_learned_write_gate=True,
+        )
+
+
 def test_ttt_checkpoint_missing_keys_are_always_rejected() -> None:
     missing = ["model.ttt_layers.12.q_proj.weight", "model.register_tokens"]
 

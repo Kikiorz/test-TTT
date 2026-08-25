@@ -163,6 +163,7 @@ def _validate_checkpoint_keys(
     source_is_ttt: bool,
     strict: bool,
     source_has_learned_write_gate: bool = False,
+    target_has_learned_write_gate: bool | None = None,
 ) -> None:
     """Allow new TTT tensors to be absent only when converting a base SmolVLA checkpoint."""
     allowed_base_missing = [
@@ -187,9 +188,15 @@ def _validate_checkpoint_keys(
     # action-token head and the new context head.  Ignore only that known
     # obsolete tensor family when loading it into the production
     # context-only architecture; all other unexpected keys remain fatal.
-    allowed_legacy_unexpected = {
-        key for key in unexpected_keys if ".write_gate_head." in key
-    }
+    allowed_legacy_unexpected = {key for key in unexpected_keys if ".write_gate_head." in key}
+    # A clean/TTT ablation may intentionally disable a gate that was present
+    # in the HD source checkpoint.  The optional context head is then absent
+    # from the target module and appears as an unexpected tensor; it is safe
+    # to discard only in this explicit source-HD -> target-clean conversion.
+    if source_has_learned_write_gate and target_has_learned_write_gate is False:
+        allowed_legacy_unexpected.update(
+            key for key in unexpected_keys if ".write_gate_context_head." in key
+        )
     disallowed_unexpected = [key for key in unexpected_keys if key not in allowed_legacy_unexpected]
     require_exact_checkpoint = source_is_ttt or strict
     if disallowed_unexpected or disallowed_missing or (
@@ -470,6 +477,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             source_has_learned_write_gate=bool(
                 raw_config.get("hd_learned_write_gate", False)
             ),
+            target_has_learned_write_gate=bool(getattr(config, "hd_learned_write_gate", False)),
         )
         if missing_keys:
             logging.info(
