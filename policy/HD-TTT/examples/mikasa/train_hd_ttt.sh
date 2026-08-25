@@ -33,6 +33,10 @@ HD_ENABLED="${HD_ENABLED:-false}"
 SAVE_FREQ="${SAVE_FREQ:-500}"
 LOG_FREQ="${LOG_FREQ:-50}"
 SEED="${SEED:-1000}"
+# Optional comma-free JSON/list syntax understood by draccus, e.g. ``[0]`` or
+# ``[0,1,2]``.  This is useful for a bounded smoke run and for reproducible
+# per-shard experiments; when unset all 250 demonstrations are used.
+DATASET_EPISODES="${DATASET_EPISODES:-}"
 
 export HF_HOME="${HF_HOME:-/workspace/hf_cache}"
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-/workspace/data_mikasa_robo}"
@@ -46,7 +50,7 @@ fi
 
 # Count the exact sequence windows consumed by TailPreservingSequenceDataset
 # so ``steps`` really denotes the requested number of dataset epochs.
-WINDOWS="$(${PYTHON_BIN} - "${DATASET_ROOT}" "${SEQUENCE_LENGTH}" "${SEQUENCE_STRIDE}" "${MAX_WINDOWS_ARG}" <<'PY'
+WINDOWS="$(${PYTHON_BIN} - "${DATASET_ROOT}" "${SEQUENCE_LENGTH}" "${SEQUENCE_STRIDE}" "${MAX_WINDOWS_ARG}" "${DATASET_EPISODES}" <<'PY'
 import json
 import math
 import sys
@@ -58,10 +62,15 @@ root = Path(sys.argv[1])
 length = int(sys.argv[2])
 stride = int(sys.argv[3])
 cap = None if sys.argv[4] == "None" else int(sys.argv[4])
+selected = None
+if sys.argv[5]:
+    selected = {int(value) for value in json.loads(sys.argv[5].replace("'", '"'))}
 meta = LeRobotDatasetMetadata(root.name, root=root)
 episodes = meta.episodes
 total = 0
-for row in episodes:
+for episode_index, row in enumerate(episodes):
+    if selected is not None and episode_index not in selected:
+        continue
     n = int(row["dataset_to_index"]) - int(row["dataset_from_index"])
     windows = math.ceil(n / stride)
     if cap is not None:
@@ -111,6 +120,9 @@ COMMON_ARGS=(
 
 if [[ -n "${LABEL_PATH}" ]]; then
   COMMON_ARGS+=(--dataset.hd_label_path="${LABEL_PATH}")
+fi
+if [[ -n "${DATASET_EPISODES}" ]]; then
+  COMMON_ARGS+=(--dataset.episodes="${DATASET_EPISODES}")
 fi
 
 LAUNCH=(
