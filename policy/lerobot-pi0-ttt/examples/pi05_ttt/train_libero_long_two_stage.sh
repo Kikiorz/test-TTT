@@ -11,6 +11,7 @@ PHASE1_OUTPUT="${PHASE1_OUTPUT:-/workspace/outputs/train/pi05_ttt_libero_long_c2
 PHASE2_OUTPUT="${PHASE2_OUTPUT:-/workspace/outputs/train/pi05_ttt_libero_long_c256_stage2_s5000_seed1000}"
 PHASE1_STEPS="${PHASE1_STEPS:-5000}"
 PHASE2_STEPS="${PHASE2_STEPS:-5000}"
+PHASE1_CHECKPOINT_OVERRIDE="${PHASE1_CHECKPOINT_OVERRIDE:-}"
 SAVE_FREQ="${SAVE_FREQ:-1000}"
 SEED="${SEED:-1000}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
@@ -89,10 +90,14 @@ run_stage() {
     --output_dir="${output_dir}"
 }
 
-run_stage "${MODEL_ROOT}" ttt_only 2e-5 2e-6 "${PHASE1_STEPS}" "${PHASE1_OUTPUT}" \
-  "${PHASE1_TBPTT_SEGMENT_LENGTH}"
+if [[ -n "${PHASE1_CHECKPOINT_OVERRIDE}" ]]; then
+  PHASE1_CHECKPOINT="${PHASE1_CHECKPOINT_OVERRIDE%/}"
+else
+  run_stage "${MODEL_ROOT}" ttt_only 2e-5 2e-6 "${PHASE1_STEPS}" "${PHASE1_OUTPUT}" \
+    "${PHASE1_TBPTT_SEGMENT_LENGTH}"
+  PHASE1_CHECKPOINT="${PHASE1_OUTPUT}/checkpoints/$(printf '%06d' "${PHASE1_STEPS}")/pretrained_model"
+fi
 
-PHASE1_CHECKPOINT="${PHASE1_OUTPUT}/checkpoints/$(printf '%06d' "${PHASE1_STEPS}")/pretrained_model"
 if [[ ! -f "${PHASE1_CHECKPOINT}/model.safetensors" ]]; then
   echo "Stage-1 checkpoint is missing: ${PHASE1_CHECKPOINT}" >&2
   exit 3
