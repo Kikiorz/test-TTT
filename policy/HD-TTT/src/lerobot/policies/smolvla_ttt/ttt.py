@@ -166,7 +166,8 @@ class TTTMLPLayer(nn.Module):
         create_graph: bool,
         write_gate: Tensor | None = None,
         detach_writer: bool = False,
-    ) -> TTTFastState:
+        return_loss: bool = False,
+    ) -> TTTFastState | tuple[TTTFastState, Tensor]:
         if detach_writer:
             # Grounding is a reader-only objective.  The numerical fast-weight
             # update is still carried out so the correct/wrong branches see
@@ -191,7 +192,7 @@ class TTTMLPLayer(nn.Module):
                     per_trajectory_loss.sum(),
                     detached_state.tensors(),
                     create_graph=False,
-                    retain_graph=False,
+                    retain_graph=return_loss,
                 )
             inner_lr = self.inner_lr.detach()
             updated_tensors = tuple(
@@ -222,7 +223,8 @@ class TTTMLPLayer(nn.Module):
                         detached_state.tensors(), updated_tensors, strict=True
                     )
                 )
-            return TTTFastState(*updated_tensors, position=detached_state.position)
+            next_state = TTTFastState(*updated_tensors, position=detached_state.position)
+            return (next_state, per_trajectory_loss) if return_loss else next_state
 
         prediction = self._fast_mlp(keys, state)
         per_trajectory_loss = F.mse_loss(prediction, values, reduction="none").mean(dim=(1, 2))
@@ -230,7 +232,11 @@ class TTTMLPLayer(nn.Module):
             per_trajectory_loss.sum(),
             state.tensors(),
             create_graph=create_graph,
-            retain_graph=create_graph,
+            # ``return_loss`` exposes the pre-update objective to the outer
+            # H2L loss. Keep its graph alive even for first-order TTT;
+            # otherwise autograd.grad would consume it before the caller can
+            # backpropagate the returned local loss.
+            retain_graph=create_graph or return_loss,
         )
         updated_tensors = tuple(
             weight - self.inner_lr * gradient
@@ -248,7 +254,8 @@ class TTTMLPLayer(nn.Module):
                 * (updated - weight)
                 for weight, updated in zip(state.tensors(), updated_tensors, strict=True)
             )
-        return TTTFastState(*updated_tensors, position=state.position)
+        next_state = TTTFastState(*updated_tensors, position=state.position)
+        return (next_state, per_trajectory_loss) if return_loss else next_state
 
     def _apply_rope(self, inputs: Tensor, positions: Tensor) -> Tensor:
         rotary_dim = self.dim - self.dim % 2
@@ -281,7 +288,13 @@ class TTTMLPLayer(nn.Module):
         write_gate: Tensor | None = None,
         detach_writer: bool = False,
         return_state_trace: bool = False,
-    ) -> tuple[Tensor, TTTFastState] | tuple[Tensor, TTTFastState, tuple[TTTFastState, ...]]:
+        return_local_loss: bool = False,
+    ) -> (
+        tuple[Tensor, TTTFastState]
+        | tuple[Tensor, TTTFastState, Tensor]
+        | tuple[Tensor, TTTFastState, tuple[TTTFastState, ...]]
+        | tuple[Tensor, TTTFastState, tuple[TTTFastState, ...], Tensor]
+    ):
         """Process ``[batch, timesteps, tokens, dim]`` and return the next fast state.
 
         ``write_gate`` may be scalar, ``[batch]`` or ``[batch, timesteps]``. A
@@ -290,7 +303,11 @@ class TTTMLPLayer(nn.Module):
         cuts all outer gradients through K/V/inner-update fast weights; query
         and downstream readout gradients remain active for reader-only
         counterfactual grounding. ``return_state_trace`` is used by hindsight
-        replay and is off on the normal path.
+        replay and is off on the normal path. When ``return_local_loss`` is
+        true, the optional extra return is a ``[batch, timesteps]`` tensor
+        containing the raw (ungated) inner K/V prediction loss for each
+        timestep. Callers can apply a hindsight write gate outside the layer.
+        The default return signature is unchanged.
         """
         if inputs.ndim != 4 or inputs.shape[-1] != self.dim:
             raise ValueError(
@@ -369,6 +386,7 @@ class TTTMLPLayer(nn.Module):
 
             outputs = []
             state_trace: list[TTTFastState] = []
+            local_losses: list[Tensor] = []
             for timestep_index, timestep_inputs in enumerate(projected_inputs.unbind(dim=1)):
                 normalized_inputs = F.layer_norm(timestep_inputs, (self.dim,))
                 timestep_position = state.position + 1 if update else state.position.clamp_min(0)
@@ -391,15 +409,24 @@ class TTTMLPLayer(nn.Module):
                         keys = self._apply_rope(self.k_proj(normalized_inputs), token_positions)
                         values = self.v_proj(normalized_inputs)
                     timestep_gate = None if write_gate is None else write_gate[:, timestep_index]
-                    state = self._update(
+                    update_result = self._update(
                         keys,
                         values,
                         state,
                         create_graph=create_graph,
                         write_gate=timestep_gate,
                         detach_writer=detach_writer,
+                        return_loss=return_local_loss,
                     )
+                    if return_local_loss:
+                        state, timestep_local_loss = update_result
+                        local_losses.append(timestep_local_loss)
+                    else:
+                        state = update_result
                     state = TTTFastState(*state.tensors(), position=timestep_position)
+                elif return_local_loss:
+                    # A read-only timestep has no inner writer objective.
+                    local_losses.append(projected_inputs.new_zeros(inputs.shape[0]))
 
                 ttt_output = self._fast_mlp(queries, state)
                 residual_gate = self.effective_gate.detach() if detach_writer else self.effective_gate
@@ -422,6 +449,14 @@ class TTTMLPLayer(nn.Module):
                 if return_state_trace:
                     state_trace = [trace.detach(requires_grad=False) for trace in state_trace]
 
+            local_loss = torch.stack(local_losses, dim=1) if return_local_loss else None
+            if return_local_loss and not outer_grad_enabled:
+                local_loss = local_loss.detach()
+
+        if return_state_trace and return_local_loss:
+            return output, state, tuple(state_trace), local_loss
         if return_state_trace:
             return output, state, tuple(state_trace)
+        if return_local_loss:
+            return output, state, local_loss
         return output, state

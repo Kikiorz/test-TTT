@@ -197,6 +197,71 @@ def test_detach_writer_keeps_query_gradient_but_blocks_writer_gradient() -> None
         assert parameters[parameter_name].grad is None
 
 
+def test_ttt_can_return_per_timestep_local_kv_loss() -> None:
+    """The opt-in H2L API exposes raw inner losses without changing defaults."""
+
+    torch.manual_seed(8)
+    layer = TTTMLPLayer(dim=8, hidden_dim=16, second_order=False)
+    inputs = torch.randn(2, 3, 2, 8, requires_grad=True)
+    outputs, state, local_loss = layer(
+        inputs,
+        update=True,
+        create_graph=False,
+        return_local_loss=True,
+    )
+
+    assert outputs.shape == inputs.shape
+    assert state.position.tolist() == [2, 2]
+    assert local_loss.shape == (2, 3)
+    assert torch.isfinite(local_loss).all()
+    assert local_loss.requires_grad
+    local_loss.mean().backward()
+    assert layer.k_proj.weight.grad is not None
+    assert layer.v_proj.weight.grad is not None
+
+
+def test_flow_forward_with_state_forwards_optional_local_loss() -> None:
+    """FlowMatching returns one local loss per physical sequence timestep."""
+
+    flow = SmolVLATTTFlowMatching.__new__(SmolVLATTTFlowMatching)
+    torch.nn.Module.__init__(flow)
+    flow.ttt_layers = torch.nn.ModuleDict(
+        {"0": TTTMLPLayer(dim=4, hidden_dim=8, second_order=False)}
+    )
+
+    def fake_forward(
+        self,
+        *args,
+        expert_layer_callback=None,
+        return_velocity=False,
+        **kwargs,
+    ):
+        del self, args, kwargs, return_velocity
+        hidden = torch.randn(2, 3, 4, requires_grad=True)
+        expert_layer_callback(0, hidden)
+        return torch.zeros(2, 2, 3)
+
+    flow.forward = MethodType(fake_forward, flow)
+    losses, fast_states, local_loss = flow.forward_with_state(
+        None,
+        None,
+        None,
+        None,
+        torch.zeros(2, 1),
+        torch.zeros(2, 2, 3),
+        torch.zeros(2, 2, 3),
+        torch.zeros(2),
+        sequence_shape=(1, 2),
+        return_velocity=True,
+        return_local_loss=True,
+    )
+
+    assert losses.shape == (2, 2, 3)
+    assert 0 in fast_states
+    assert local_loss.shape == (1, 2)
+    assert torch.isfinite(local_loss).all()
+
+
 def test_hindsight_attribution_is_causal_and_counterfactual_reader_is_teacher_detached() -> None:
     full = torch.zeros(1, 4, 4)
     masked = full.clone()
