@@ -805,7 +805,12 @@ def _validate_eval_record(
             "use an explicit CreditTTT method marker or a clean checkpoint"
         )
     benchmark_protocol = str(result.get("benchmark_protocol") or "")
-    if benchmark_protocol and OFFICIAL_PROTOCOL not in benchmark_protocol:
+    if not benchmark_protocol:
+        raise ValueError(
+            f"{path}: missing benchmark_protocol; only the official MIKASA runner "
+            "is admissible for the frozen protocol"
+        )
+    if OFFICIAL_PROTOCOL not in benchmark_protocol:
         raise ValueError(
             f"{path}: unsupported benchmark_protocol={benchmark_protocol!r}; "
             f"expected {OFFICIAL_PROTOCOL!r}"
@@ -819,7 +824,25 @@ def _validate_eval_record(
     successes = result.get("successes")
     if not isinstance(successes, list) or not successes:
         raise ValueError(f"{path}: successes must be a non-empty per-episode list")
-    successes_bool = [bool(value) for value in successes]
+    # JSON ``bool`` values are the canonical schema.  Accept numeric 0/1 for
+    # interoperability with a few metric exporters, but reject arbitrary
+    # truthy strings (for example ``"false"``), which would silently turn a
+    # failed episode into a success under Python's ``bool`` conversion.
+    successes_bool: list[bool] = []
+    for index, value in enumerate(successes):
+        if isinstance(value, bool):
+            successes_bool.append(value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric not in (0.0, 1.0):
+                raise ValueError(
+                    f"{path}: successes[{index}] must be bool or numeric 0/1, got {value!r}"
+                )
+            successes_bool.append(bool(int(numeric)))
+        else:
+            raise ValueError(
+                f"{path}: successes[{index}] must be bool or numeric 0/1, got {value!r}"
+            )
     seeds = result.get("episode_seeds")
     if seeds is None:
         start = result.get("start_seed")
@@ -836,9 +859,14 @@ def _validate_eval_record(
             f"set {sorted(expected_set)[:3]}..."
         )
     chunk = result.get("action_chunk_size")
-    if expected_method == "native_smolvla" and chunk is not None and int(chunk) != 50:
+    if chunk is None:
+        raise ValueError(
+            f"{path}: missing action_chunk_size; cadence must be explicit for the "
+            "Native-SmolVLA versus TTT comparison"
+        )
+    if expected_method == "native_smolvla" and int(chunk) != 50:
         raise ValueError(f"{path}: Native-SmolVLA must report canonical action_chunk_size=50, got {chunk}")
-    if expected_method in {"clean_ttt", "credit_ttt", "utility_kvb"} and chunk is not None and int(chunk) != 1:
+    if expected_method in {"clean_ttt", "credit_ttt", "utility_kvb"} and int(chunk) != 1:
         raise ValueError(f"{path}: TTT methods must report action_chunk_size=1, got {chunk}")
     order = np.argsort(np.asarray(seeds_int, dtype=np.int64))
     return {
