@@ -80,6 +80,87 @@ def test_published_four_task_profile_schema(tmp_path: Path) -> None:
     assert len(manifest["commands"]) == 16
 
 
+def test_task_checkpoint_maps_are_frozen_per_task(tmp_path: Path) -> None:
+    parser = benchmark._build_parser()
+    task_ids = [task["id"] for task in benchmark.PUBLISHED_COMPARABLE_TASKS]
+    maps = {
+        "native": {task_id: f"/ckpt/native/{task_id}" for task_id in task_ids},
+        "clean": {task_id: f"/ckpt/clean/{task_id}" for task_id in task_ids},
+        "credit": {task_id: f"/ckpt/credit/{task_id}" for task_id in task_ids},
+    }
+    map_paths = {}
+    for name, payload in maps.items():
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        map_paths[name] = path
+    args = parser.parse_args(
+        [
+            "manifest",
+            "--output",
+            str(tmp_path / "mapped_manifest.json"),
+            "--repo-root",
+            str(tmp_path),
+            "--python-bin",
+            "python",
+            "--task-set",
+            "published_four",
+            "--n-episodes",
+            "1",
+            "--train-seeds",
+            "1000",
+            "--native-checkpoints-json",
+            str(map_paths["native"]),
+            "--clean-checkpoints-json",
+            str(map_paths["clean"]),
+            "--credit-checkpoints-json",
+            str(map_paths["credit"]),
+        ]
+    )
+    manifest = benchmark.build_manifest(args)
+    assert manifest["checkpoint_scope"]["native_smolvla"] == "per_task"
+    assert manifest["checkpoint_scope"]["clean_ttt"] == "per_task"
+    assert manifest["checkpoint_scope"]["credit_ttt"] == "per_task"
+    for command in manifest["commands"]:
+        method = command["method_id"]
+        task_id = command["task_id"]
+        expected_prefix = {
+            "native_smolvla": "/ckpt/native/",
+            "native_smolvla_k1": "/ckpt/native/",
+            "clean_ttt": "/ckpt/clean/",
+            "credit_ttt": "/ckpt/credit/",
+        }[method]
+        checkpoint = command["argv"][command["argv"].index("--checkpoint") + 1]
+        assert checkpoint == expected_prefix + task_id
+        assert manifest["checkpoints_by_task"][method][task_id] == checkpoint
+
+
+def test_incomplete_task_checkpoint_map_fails_closed(tmp_path: Path) -> None:
+    parser = benchmark._build_parser()
+    partial = tmp_path / "partial.json"
+    partial.write_text(json.dumps({"shell_touch": "/ckpt/shell"}), encoding="utf-8")
+    args = parser.parse_args(
+        [
+            "manifest",
+            "--output",
+            str(tmp_path / "manifest.json"),
+            "--repo-root",
+            str(tmp_path),
+            "--python-bin",
+            "python",
+            "--task-set",
+            "published_four",
+            "--clean-checkpoints-json",
+            str(partial),
+        ]
+    )
+    try:
+        benchmark.build_manifest(args)
+    except ValueError as exc:
+        assert "incomplete" in str(exc)
+    else:  # pragma: no cover - defensive assertion for the test itself
+        raise AssertionError("partial task checkpoint map was accepted")
+
+
 def test_manifest_separates_native_cadences(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     methods = {item["id"]: item for item in manifest["methods"]}

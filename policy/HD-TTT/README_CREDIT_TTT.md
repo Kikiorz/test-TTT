@@ -427,6 +427,32 @@ counted as deployed inference cost.
 
 ### 8.3 Commands (plan first)
 
+The benchmark manifest defaults to the four published-comparable MIKASA task
+profile: `shell_touch` (SGT), `intercept_medium` (IM), `remember_color3`
+(RC3), and `remember_color9` (RC9).  To replay the original color/shuffle
+experiment envelope, pass `--task-set legacy_two`; old manifests with the
+two-task protocol ID remain readable.
+
+Student checkpoints are task-local in the recommended protocol because action
+normalization statistics are task-local.  The legacy singular checkpoint flags
+remain valid for an intentionally shared/multitask model.  For independently
+trained tasks, pass a JSON object (a file path or inline object) mapping stable
+task IDs to checkpoints, for example:
+
+```json
+{
+  "shell_touch": "/workspace/checkpoints/credit_shell_touch",
+  "intercept_medium": "/workspace/checkpoints/credit_intercept_medium",
+  "remember_color3": "/workspace/checkpoints/credit_remember_color3",
+  "remember_color9": "/workspace/checkpoints/credit_remember_color9"
+}
+```
+
+Use `--clean-checkpoints-json` and `--credit-checkpoints-json` (and, when
+needed, `--native-checkpoints-json`) with `manifest`.  The frozen manifest
+records `checkpoint_scope` and `checkpoints_by_task`; an incomplete map is
+rejected instead of silently falling back to a different task's checkpoint.
+
 All paths below are placeholders; replace them with real checkpoint and dataset
 paths.  The launcher never fabricates an evaluation JSON.
 
@@ -463,6 +489,7 @@ python examples/mikasa/benchmark_credit_ttt_v3.py self-check
 python examples/mikasa/benchmark_credit_ttt_v3.py manifest \
   --output benchmark_results/credit_ttt_v3/manifest.json \
   --repo-root "$PWD" \
+  --task-set legacy_two \
   --native-checkpoint /workspace/checkpoints/native_smolvla \
   --clean-checkpoint /workspace/checkpoints/clean_ttt \
   --credit-checkpoint /workspace/outputs/credit_ttt_v3/shuffle_long/student/checkpoints/last/pretrained_model

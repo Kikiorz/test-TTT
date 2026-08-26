@@ -796,6 +796,70 @@ def _union_delay_bins(tasks: Sequence[Mapping[str, Any]]) -> list[str]:
     return [item for item in _DELAY_BIN_ORDER if item in present]
 
 
+def _load_task_checkpoint_map(
+    raw: Any,
+    tasks: Sequence[Mapping[str, Any]],
+    *,
+    option_name: str,
+) -> dict[str, str] | None:
+    """Parse and validate a task-id → checkpoint JSON mapping.
+
+    ``raw`` may be a path to a JSON file or an inline JSON object.  Every task
+    in the selected profile must be present when a map is supplied; silently
+    falling back to a common checkpoint for one task would make a benchmark
+    comparison ambiguous.  Environment IDs are accepted as keys as a
+    convenience, but the manifest always stores canonical task IDs.
+    """
+
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    source = Path(text).expanduser()
+    if source.is_file():
+        payload = _read_json(source)
+    else:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{option_name} must be a JSON object or path to a JSON file; "
+                f"could not parse {text!r}"
+            ) from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{option_name} must contain a JSON object")
+
+    task_ids = {str(task["id"]) for task in tasks}
+    env_to_id = {str(task["env_id"]): str(task["id"]) for task in tasks}
+    result: dict[str, str] = {}
+    unknown: list[str] = []
+    for raw_key, value in payload.items():
+        key = str(raw_key)
+        task_id = key if key in task_ids else env_to_id.get(key)
+        if task_id is None:
+            unknown.append(key)
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"{option_name}[{key!r}] must be a non-empty checkpoint path/string"
+            )
+        if task_id in result:
+            raise ValueError(f"{option_name} contains duplicate task key for {task_id!r}")
+        result[task_id] = value
+    if unknown:
+        raise ValueError(
+            f"{option_name} contains unknown task key(s): {sorted(unknown)}; "
+            f"expected task IDs {sorted(task_ids)}"
+        )
+    missing = sorted(task_ids.difference(result))
+    if missing:
+        raise ValueError(
+            f"{option_name} is incomplete; missing checkpoint(s) for task(s): {missing}"
+        )
+    return result
+
+
 def _method_specs(include_optional: bool) -> list[dict[str, Any]]:
     return [dict(method) for method in METHODS if include_optional or not method["optional"]]
 
@@ -879,8 +943,44 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     tasks = _task_specs(args)
     methods = _method_specs(args.include_optional)
     protocol_id = TASK_SET_PROTOCOL_IDS[task_set]
+    # Native SmolVLA is normally one frozen base checkpoint.  Student methods
+    # are often trained independently for each task because LeRobot action
+    # normalization statistics are task-local.  Optional maps make that
+    # distinction explicit while retaining the historical common-checkpoint
+    # command-line arguments for shared/multitask runs.
+    checkpoint_map_inputs = {
+        NATIVE_VARIANT_CHUNK: getattr(args, "native_checkpoints_json", None),
+        NATIVE_VARIANT_K1: getattr(args, "native_checkpoints_json", None),
+        "clean_ttt": getattr(args, "clean_checkpoints_json", None),
+        "credit_ttt": getattr(args, "credit_checkpoints_json", None),
+        "utility_kvb": getattr(args, "utility_checkpoints_json", None),
+    }
+    task_checkpoint_maps: dict[str, dict[str, str]] = {}
+    checkpoint_scope: dict[str, str] = {}
+    common_checkpoints = {
+        NATIVE_VARIANT_CHUNK: str(args.native_checkpoint),
+        NATIVE_VARIANT_K1: str(args.native_checkpoint),
+        "clean_ttt": str(args.clean_checkpoint),
+        "credit_ttt": str(args.credit_checkpoint),
+    }
+    if args.include_optional:
+        common_checkpoints["utility_kvb"] = str(args.utility_checkpoint)
+    for method_id in common_checkpoints:
+        mapped = _load_task_checkpoint_map(
+            checkpoint_map_inputs.get(method_id),
+            tasks,
+            option_name=f"{method_id}_checkpoints_json",
+        )
+        if mapped is None:
+            task_checkpoint_maps[method_id] = {
+                str(task["id"]): common_checkpoints[method_id] for task in tasks
+            }
+            checkpoint_scope[method_id] = "shared"
+        else:
+            task_checkpoint_maps[method_id] = mapped
+            checkpoint_scope[method_id] = "per_task"
     checkpoint_map = {
-        "native_smolvla": str(args.native_checkpoint),
+        NATIVE_VARIANT_CHUNK: str(args.native_checkpoint),
         # Same frozen native checkpoint as K=50; this map entry changes only
         # runner cadence, not model weights or architecture.
         NATIVE_VARIANT_K1: str(args.native_checkpoint),
@@ -904,6 +1004,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "tasks": tasks,
         "methods": methods,
         "checkpoints": checkpoint_map,
+        # Commands consume this task-specific map.  The legacy ``checkpoints``
+        # field remains as the common-checkpoint fallback for old tooling.
+        "checkpoints_by_task": task_checkpoint_maps,
+        "checkpoint_scope": checkpoint_scope,
         "evaluation": {
             "n_episodes": int(args.n_episodes),
             "start_seed": int(args.start_seed),
@@ -1028,7 +1132,6 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     commands: list[dict[str, Any]] = []
     for method in methods:
         method_id = str(method["id"])
-        checkpoint = checkpoint_map[method_id]
         method_seeds: Sequence[str | int]
         if method.get("replicate_policy") == "fixed_checkpoint":
             # Native-SmolVLA is a single fixed checkpoint, not three
@@ -1039,6 +1142,8 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         else:
             method_seeds = train_seeds
         for task in tasks:
+            task_id = str(task["id"])
+            checkpoint = task_checkpoint_maps[method_id][task_id]
             for train_seed in method_seeds:
                 argv = _eval_command(
                     repo_root=str(args.repo_root),
@@ -1056,7 +1161,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 commands.append(
                     {
                         "method_id": method_id,
-                        "task_id": str(task["id"]),
+                        "task_id": task_id,
                         "train_seed": train_seed,
                         "argv": argv,
                         "shell": shlex.join(argv),
@@ -1069,6 +1174,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
 
 def _print_manifest_plan(manifest: Mapping[str, Any]) -> None:
     print(f"protocol={manifest['protocol_id']} version={manifest['protocol_version']}")
+    if manifest.get("task_set"):
+        print(f"task_set={manifest['task_set']}")
+    if manifest.get("checkpoint_scope"):
+        print(f"checkpoint_scope={json.dumps(manifest['checkpoint_scope'], sort_keys=True)}")
     print(f"manifest_sha256={manifest['manifest_sha256']}")
     evaluation = manifest["evaluation"]
     print(
@@ -2047,6 +2156,7 @@ def _load_manifest(path: Path) -> dict[str, Any]:
         path=f"{path}:credit_ttt_protocol",
     )
     _validate_cadence_manifest(manifest, path=path)
+    _validate_checkpoint_manifest(manifest, path=path)
     return dict(manifest)
 
 
@@ -2098,6 +2208,55 @@ def _validate_cadence_manifest(manifest: Mapping[str, Any], *, path: Path | str)
         raise ValueError(
             f"{path}: primary_baselines must include K=1 and exclude native K=50"
         )
+
+
+def _validate_checkpoint_manifest(manifest: Mapping[str, Any], *, path: Path | str) -> None:
+    """Validate optional per-task checkpoint provenance in a frozen manifest.
+
+    Older manifests predate ``checkpoints_by_task`` and remain valid; new
+    manifests carry both the map and an explicit ``checkpoint_scope`` so a
+    reviewer can tell whether one student checkpoint was intentionally shared
+    or independently trained for each task.
+    """
+
+    raw_maps = manifest.get("checkpoints_by_task")
+    raw_scope = manifest.get("checkpoint_scope")
+    if raw_maps is None and raw_scope is None:
+        return
+    if not isinstance(raw_maps, Mapping) or not isinstance(raw_scope, Mapping):
+        raise ValueError(f"{path}: checkpoints_by_task and checkpoint_scope must both be objects")
+    raw_tasks = manifest.get("tasks")
+    if not isinstance(raw_tasks, Sequence) or isinstance(raw_tasks, (str, bytes)):
+        raise ValueError(f"{path}: cannot validate checkpoint map without tasks")
+    task_ids = {str(task["id"]) for task in raw_tasks if isinstance(task, Mapping) and "id" in task}
+    if not task_ids:
+        raise ValueError(f"{path}: manifest has no task IDs for checkpoint map")
+    required_methods = {
+        str(item["id"])
+        for item in manifest.get("methods", [])
+        if isinstance(item, Mapping) and item.get("id") is not None
+    }
+    for method_id in required_methods:
+        scope = raw_scope.get(method_id)
+        if scope not in {"shared", "per_task"}:
+            raise ValueError(
+                f"{path}: checkpoint_scope[{method_id!r}] must be 'shared' or 'per_task'"
+            )
+        mapping = raw_maps.get(method_id)
+        if not isinstance(mapping, Mapping):
+            raise ValueError(f"{path}: checkpoints_by_task[{method_id!r}] must be an object")
+        keys = {str(key) for key in mapping}
+        if keys != task_ids:
+            raise ValueError(
+                f"{path}: checkpoint map for {method_id!r} must cover exactly task IDs "
+                f"{sorted(task_ids)}, got {sorted(keys)}"
+            )
+        if any(not isinstance(value, str) or not value.strip() for value in mapping.values()):
+            raise ValueError(f"{path}: checkpoint map for {method_id!r} contains an empty path")
+        if scope == "shared" and len(set(str(value) for value in mapping.values())) != 1:
+            raise ValueError(
+                f"{path}: checkpoint_scope={scope!r} for {method_id!r} but paths differ"
+            )
 
 
 def _cmd_manifest(args: argparse.Namespace) -> int:
@@ -2219,6 +2378,8 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
     ) == CANONICAL_V3_PROTOCOL_IDENTITY
     assert manifest["task_set"] == "legacy_two"
     assert manifest["protocol_id"] == LEGACY_TWO_TASK_PROTOCOL_ID
+    assert all(scope == "shared" for scope in manifest["checkpoint_scope"].values())
+    _validate_checkpoint_manifest(manifest, path="self-check manifest")
     assert sum(command["method_id"] == NATIVE_VARIANT_CHUNK for command in manifest["commands"]) == 2
     assert sum(command["method_id"] == NATIVE_VARIANT_K1 for command in manifest["commands"]) == 2
     assert all(
@@ -2432,6 +2593,26 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--clean-checkpoint", default="<CHECKPOINT_CLEAN_TTT>")
     manifest.add_argument("--credit-checkpoint", default="<CHECKPOINT_CREDIT_TTT>")
     manifest.add_argument("--utility-checkpoint", default="<CHECKPOINT_UTILITY_KVB>")
+    manifest.add_argument(
+        "--native-checkpoints-json",
+        default=None,
+        help="Optional JSON object/file mapping task_id (or env_id) to native checkpoint paths.",
+    )
+    manifest.add_argument(
+        "--clean-checkpoints-json",
+        default=None,
+        help="Optional JSON object/file mapping task_id (or env_id) to Clean-TTT checkpoints.",
+    )
+    manifest.add_argument(
+        "--credit-checkpoints-json",
+        default=None,
+        help="Optional JSON object/file mapping task_id (or env_id) to CreditTTT checkpoints.",
+    )
+    manifest.add_argument(
+        "--utility-checkpoints-json",
+        default=None,
+        help="Optional JSON object/file mapping task_id (or env_id) to Utility-KVB checkpoints.",
+    )
     manifest.add_argument("--color-dataset-root", default=None)
     manifest.add_argument("--shuffle-dataset-root", default=None)
     manifest.add_argument("--shell-touch-dataset-root", default=None)
