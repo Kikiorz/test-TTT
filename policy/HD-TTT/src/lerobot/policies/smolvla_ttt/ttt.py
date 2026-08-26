@@ -421,7 +421,16 @@ class TTTMLPLayer(nn.Module):
 
             self._record_nonfinite(prediction, target)
 
-            per_token = F.mse_loss(prediction, target, reduction="none").mean(dim=-1)
+            # ``v`` is produced by the trainable value projection.  The local
+            # K/V objective is a deployable *writer* target, so it must use a
+            # stop-gradient copy of ``v`` (the same ``sg(v)`` convention used
+            # by ``local_kvb_loss`` below).  Without this detach, returning
+            # ``per_trajectory_loss`` for H2L would let the outer optimizer
+            # move ``v_proj``/the target representation together with the
+            # fast map, turning the intended reconstruction into a trivial
+            # co-adaptation path and making the implementation differ from
+            # the documented objective.
+            per_token = F.mse_loss(prediction, target.detach(), reduction="none").mean(dim=-1)
             if writer_mask is None:
                 return per_token.mean(dim=1)
             denominator = writer_mask.sum(dim=1).clamp_min(1.0)

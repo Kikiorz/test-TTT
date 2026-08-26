@@ -989,7 +989,7 @@ def test_detach_writer_keeps_query_gradient_but_blocks_writer_gradient() -> None
 
 
 def test_ttt_can_return_per_timestep_local_kv_loss() -> None:
-    """The opt-in H2L API exposes raw inner losses without changing defaults."""
+    """The opt-in H2L API exposes a writer loss with a detached value target."""
 
     torch.manual_seed(8)
     layer = TTTMLPLayer(dim=8, hidden_dim=16, second_order=False)
@@ -1008,7 +1008,10 @@ def test_ttt_can_return_per_timestep_local_kv_loss() -> None:
     assert local_loss.requires_grad
     local_loss.mean().backward()
     assert layer.k_proj.weight.grad is not None
-    assert layer.v_proj.weight.grad is not None
+    # The value projection supplies ``sg(v)`` as the local target.  It must
+    # not receive an outer H2L gradient; otherwise K/V can co-adapt by
+    # collapsing the target instead of learning a useful fast-weight write.
+    assert layer.v_proj.weight.grad is None
 
 
 def test_prefix_only_writer_updates_from_writer_inputs_not_read_noise() -> None:
