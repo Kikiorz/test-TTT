@@ -1479,6 +1479,76 @@ def _tbptt_segment_loss_weights(
     return [valid_count / total_valid_count for valid_count in segment_valid_counts]
 
 
+def _sequence_valid_action_slots(
+    batch: Mapping[str, Any] | dict[str, Any], sequence_shape: tuple[int, int]
+) -> int:
+    """Count valid action slots in one flattened sequence batch.
+
+    ``TailPreservingSequenceDataset`` keeps the time axis flattened as
+    ``B*T``.  The flow loss averages over valid action *slots* (the chunk axis)
+    and then over feature dimensions, so this is the measure that must be used
+    when combining unequal-length ranks.  Keeping the count in one helper also
+    makes the distributed weighting contract match
+    :func:`_tbptt_segment_loss_weights` exactly.
+    """
+
+    batch_size, sequence_length = sequence_shape
+    expected_flat_batch = batch_size * sequence_length
+    action_is_pad = batch.get("action_is_pad")
+    if action_is_pad is None:
+        return expected_flat_batch
+    if not isinstance(action_is_pad, torch.Tensor):
+        raise TypeError("action_is_pad must be a tensor for TTT sequence training")
+    if action_is_pad.ndim < 2 or action_is_pad.shape[0] != expected_flat_batch:
+        raise ValueError(
+            "action_is_pad must have flattened batch-major shape "
+            f"[{expected_flat_batch}, ...], got {tuple(action_is_pad.shape)}"
+        )
+    return int((~action_is_pad.bool()).reshape(expected_flat_batch, -1).sum().item())
+
+
+def _ddp_frame_weighted_flow_scale(
+    batch: Mapping[str, Any] | dict[str, Any],
+    sequence_shape: tuple[int, int],
+    accelerator: "Accelerator",
+    *,
+    enabled: bool,
+) -> tuple[float, int, int]:
+    """Return a rank scale that makes a variable-length DDP flow mean exact.
+
+    ``EqualLengthBatchSampler`` guarantees equal ``T`` *within* each rank,
+    but its global batch stream can assign different length buckets to ranks
+    at the same optimizer step.  A plain mean of rank-local losses would then
+    give a short trajectory the same weight as a long one.  If enabled, scale
+    rank ``r``'s local flow mean by ``P*n_r/N`` before the trainer's explicit
+    DDP gradient mean, where ``n_r`` is its valid action-slot count and ``N``
+    is the all-rank count.  The resulting gradient is exactly the global
+    frame/slot-weighted mean.  B=1 and non-equal-length paths never call this
+    helper, preserving their historical semantics.
+
+    The returned tuple is ``(rank_scale, local_count, global_count)``.  Counts
+    are integers for provenance/diagnostics; the scale is a Python float so it
+    can be multiplied into the existing per-segment weights without adding a
+    tensor to the autograd graph.
+    """
+
+    local_count = _sequence_valid_action_slots(batch, sequence_shape)
+    if not enabled or accelerator.num_processes <= 1:
+        return 1.0, local_count, local_count
+
+    count_tensor = torch.tensor(
+        float(local_count), dtype=torch.float32, device=accelerator.device
+    )
+    global_tensor = accelerator.reduce(count_tensor, reduction="sum")
+    if not isinstance(global_tensor, torch.Tensor):
+        raise RuntimeError("Accelerator.reduce must return a tensor for flow-slot weighting")
+    global_count = int(round(float(global_tensor.detach().item())))
+    if global_count <= 0:
+        raise ValueError("Distributed TTT sequence batches contain no valid action slots")
+    rank_scale = float(accelerator.num_processes * local_count / global_count)
+    return rank_scale, local_count, global_count
+
+
 def update_policy_tbptt(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -1580,6 +1650,37 @@ def update_policy_tbptt(
             )
         ),
     )
+    # Exact-length batching keeps every local batch rectangular, but the
+    # sampler may still hand different physical ``T`` buckets to different
+    # DDP ranks at one optimizer step.  For the ordinary flow objective (and
+    # V3, whose auxiliary terms are already normalized per complete window),
+    # combine those rank-local means by valid action-slot count.  The trainer
+    # performs an explicit mean reduction of gradients below, so multiplying
+    # rank ``r`` by ``P*n_r/N`` yields the global frame-weighted mean.  Keep
+    # this opt-in to ``B>1`` equal-length runs: historical B=1 and legacy HD
+    # paths retain their exact weighting and loss decomposition.
+    frame_weighted_ddp = bool(
+        batch_size > 1
+        and accelerator.num_processes > 1
+        and getattr(policy_config, "equal_length_batching", False)
+        and getattr(unwrapped_policy, "tbptt_loss_weighting", None) == "valid_actions"
+        and (
+            not bool(getattr(policy_config, "hd_ttt_enabled", False))
+            or use_global_hd_normalization
+        )
+    )
+    if frame_weighted_ddp:
+        flow_rank_scale, _, _ = _ddp_frame_weighted_flow_scale(
+            batch,
+            sequence_shape,
+            accelerator,
+            enabled=True,
+        )
+    else:
+        # Do not even inspect ``action_is_pad`` on historical paths.  Apart
+        # from avoiding an unnecessary host sync, this keeps malformed or
+        # legacy auxiliary metadata from changing B=1 behavior.
+        flow_rank_scale = 1.0
     hd_normalization_denominator = (
         float(batch_size * sequence_length) if use_global_hd_normalization else None
     )
@@ -1649,8 +1750,10 @@ def update_policy_tbptt(
                     # Only SmolVLA-TTT exposes the optional grounding container;
                     # PI0/PI05 sequence policies keep their historical signature.
                     segment_kwargs["grounding_states"] = grounding_states
-                if use_global_hd_normalization:
-                    segment_kwargs["flow_loss_weight"] = segment_loss_weights[segment_index]
+                if use_global_hd_normalization or frame_weighted_ddp:
+                    segment_kwargs["flow_loss_weight"] = (
+                        segment_loss_weights[segment_index] * flow_rank_scale
+                    )
                     segment_kwargs["hd_normalization_denominator"] = hd_normalization_denominator
                     segment_kwargs["effect_normalization_floor"] = effect_normalization_floor
                 if _HD_ATTRIBUTION_PROTOCOL_V3 == str(
@@ -1667,12 +1770,13 @@ def update_policy_tbptt(
                     **segment_kwargs,
                 )
                 segment_weight = segment_loss_weights[segment_index]
+                metric_segment_weight = segment_weight * flow_rank_scale
                 # In the v2 path the policy has already separated and normalized
                 # the two objectives.  Multiplying the combined scalar here would
                 # attenuate warm-up/effect supervision by the action-valid mask.
                 weighted_segment_loss = (
                     segment_loss
-                    if use_global_hd_normalization
+                    if use_global_hd_normalization or frame_weighted_ddp
                     else segment_loss * segment_weight
                 )
             last_segment_output = segment_output
@@ -1716,9 +1820,9 @@ def update_policy_tbptt(
                 segment_output["loss_per_dim"], device=accelerator.device
             )
             if loss_per_dim is None:
-                loss_per_dim = segment_loss_per_dim * segment_weight
+                loss_per_dim = segment_loss_per_dim * metric_segment_weight
             else:
-                loss_per_dim += segment_loss_per_dim * segment_weight
+                loss_per_dim += segment_loss_per_dim * metric_segment_weight
             for metric_name, metric_value in segment_output.items():
                 if metric_name.startswith("hd_"):
                     # Ratios are recomputed from the sequence-level sums below;

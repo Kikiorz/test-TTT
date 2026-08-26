@@ -413,6 +413,11 @@ print(json.dumps({
     "global_batch_size": batch_size * num_replicas,
     "equal_length_batching": equal_length,
     "sampler": "EqualLengthBatchSampler" if equal_length else "accelerate_default",
+    "ddp_flow_weighting": (
+        "valid_action_slots"
+        if equal_length and batch_size > 1 and num_replicas > 1
+        else "historical_rank_mean"
+    ),
     "no_temporal_padding": equal_length or batch_size == 1,
     "stats_available": True,
     "offset_domains": 1,

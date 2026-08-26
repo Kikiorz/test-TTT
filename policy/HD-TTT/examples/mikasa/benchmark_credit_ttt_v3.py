@@ -799,6 +799,15 @@ def build_training_batch_metadata(
         "global_batch_size": batch_size * replicas,
         "equal_length_batching": equal,
         "sampler": "EqualLengthBatchSampler" if equal else "accelerate_default",
+        # Equal-length B>1 DDP uses valid-action-slot weighting in the trainer
+        # when ranks receive different physical T buckets.  Record the rule
+        # explicitly so a manifest explains the objective aggregation rather
+        # than only the sampler arithmetic.
+        "ddp_flow_weighting": (
+            "valid_action_slots"
+            if equal and batch_size > 1 and replicas > 1
+            else "historical_rank_mean"
+        ),
         # The legacy TTT path is B=1, so it also carries no temporal padding;
         # exact-length mode is what permits that invariant for B>1.
         "no_temporal_padding": bool(equal or batch_size == 1),

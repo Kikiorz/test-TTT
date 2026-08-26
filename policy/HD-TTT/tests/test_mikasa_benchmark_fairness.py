@@ -70,6 +70,7 @@ def test_training_batch_metadata_matches_equal_length_sampler_arithmetic() -> No
     )
     assert metadata["schema"] == benchmark.TRAINING_BATCH_METADATA_SCHEMA
     assert metadata["global_batch_size"] == 8
+    assert metadata["ddp_flow_weighting"] == "valid_action_slots"
     assert metadata["bucket_count"] == 3
     assert metadata["groups_before_ddp"] == 4  # 2 + 1 + 1
     assert metadata["ddp_repeated_groups"] == 0
@@ -95,6 +96,16 @@ def test_training_batch_metadata_records_ddp_padding() -> None:
     assert metadata["total_repeated_rows"] == 27
     assert metadata["effective_rows"] == 32
     assert metadata["steps_per_epoch_per_rank"] == 2
+
+
+def test_training_batch_metadata_keeps_b1_historical_rank_mean() -> None:
+    metadata = benchmark.build_training_batch_metadata(
+        per_device_batch_size=1,
+        world_size=4,
+        equal_length_batching=False,
+        episode_lengths=[11, 12, 13],
+    )
+    assert metadata["ddp_flow_weighting"] == "historical_rank_mean"
 
 
 def test_manifest_embeds_training_batch_sidecar(tmp_path: Path) -> None:
