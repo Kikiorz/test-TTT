@@ -55,11 +55,13 @@ except ImportError as exc:  # pragma: no cover - project runtime always has nump
 PROTOCOL_ID = "credit_ttt_v3_mikasa_two_task"
 PROTOCOL_VERSION = "credit_ttt_v3_baseline_protocol_1"
 # Checkpoint/label implementations may serialize the same method under one
-# of these names.  The first is this coordinator's manifest version; the
-# latter two are the canonical strings used by the CreditTTT policy module.
+# of these names.  Keep the benchmark manifest version out of this set: it is
+# an experiment-envelope identifier, not proof that a model used the V3
+# policy.  Otherwise an arbitrary result could inherit
+# ``protocol_version=credit_ttt_v3_baseline_protocol_1`` from an envelope and
+# be misclassified as CreditTTT without canonical model metadata.
 V3_PROTOCOL_MARKERS = {
     "credit_ttt_v3",
-    "credit_ttt_v3_baseline_protocol_1",
     "credit_ttt_v3_query_effect",
     "creditttt_qh2l_v3",
 }
@@ -1502,6 +1504,33 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
         Path("legacy.json"),
     )
     assert legacy_method == "legacy_rejected"
+    # The benchmark envelope's own version must not be sufficient to relabel
+    # an otherwise unproven model as CreditTTT.  Only canonical model markers
+    # (or the explicit CreditTTT method plus one of them) qualify.
+    try:
+        envelope_only = {
+            "model": {"method": "CreditTTT"},
+            "protocol_version": "credit_ttt_v3_baseline_protocol_1",
+        }
+        _method_from_metadata(envelope_only, Path("envelope_only.json"))
+        _validate_eval_record(
+            {
+                **envelope_only,
+                "benchmark_protocol": OFFICIAL_PROTOCOL,
+                "env_id": DEFAULT_TASKS[0]["env_id"],
+                "successes": [True],
+                "episode_seeds": [DEFAULT_START_SEED],
+                "action_chunk_size": 1,
+            },
+            path=Path("envelope_only.json"),
+            expected_method="credit_ttt",
+            expected_task=DEFAULT_TASKS[0],
+            expected_episode_seeds=[DEFAULT_START_SEED],
+        )
+    except ValueError:
+        pass
+    else:  # pragma: no cover - defensive assertion for the self-check itself
+        raise AssertionError("benchmark envelope version must not authenticate a V3 model")
     print("CreditTTT V3 benchmark self-check: PASS")
     return 0
 
