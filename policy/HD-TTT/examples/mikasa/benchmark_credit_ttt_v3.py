@@ -1274,7 +1274,11 @@ def _find_alias(flattened: Mapping[str, float], aliases: Sequence[str]) -> tuple
             return normalized[alias_norm]
         # Accept a nested key ending in the declared metric name, but reject
         # ambiguous matches rather than silently selecting a random field.
-        matches = [item for key, item in normalized.items() if key.endswith("." + alias_norm)]
+        matches = [
+            item
+            for key, item in normalized.items()
+            if key.endswith("_" + alias_norm) or key.endswith("." + alias_norm)
+        ]
         if len(matches) == 1:
             return matches[0]
     return None
