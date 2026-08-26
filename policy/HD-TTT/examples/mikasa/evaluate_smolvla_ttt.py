@@ -351,9 +351,39 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "execution_action_steps": int(policy.policy.config.n_action_steps),
             "model": {
                 "checkpoint": str(args.checkpoint),
-                "method": "HD-TTT" if bool(policy.policy.config.hd_ttt_enabled) else "clean-TTT",
+                # Keep legacy/clean labels stable, but give the final method
+                # an explicit provenance marker.  This is metadata only: the
+                # evaluator's action path and environment protocol are
+                # unchanged.  The benchmark coordinator rejects an HD-TTT
+                # result without this marker instead of relabeling it as
+                # CreditTTT.
+                "method": (
+                    "CreditTTT"
+                    if bool(getattr(policy.policy.config, "credit_ttt_enabled", False))
+                    else (
+                        "HD-TTT"
+                        if bool(policy.policy.config.hd_ttt_enabled)
+                        else "clean-TTT"
+                    )
+                ),
+                "policy_type": "smolvla_ttt",
                 "hd_ttt_enabled": bool(policy.policy.config.hd_ttt_enabled),
                 "hd_learned_write_gate": bool(policy.policy.config.hd_learned_write_gate),
+                "hd_attribution_protocol": getattr(
+                    policy.policy.config, "hd_attribution_protocol", None
+                ),
+                "ttt_writer_mode": getattr(policy.policy.config, "ttt_writer_mode", None),
+                "ttt_second_order": bool(getattr(policy.policy.config, "ttt_second_order", False)),
+                "protocol_version": (
+                    "creditttt_qh2l_v3"
+                    if bool(getattr(policy.policy.config, "credit_ttt_enabled", False))
+                    else None
+                ),
+                "protocol_id": (
+                    "credit_ttt_v3"
+                    if bool(getattr(policy.policy.config, "credit_ttt_enabled", False))
+                    else None
+                ),
             },
             "episode_lengths": [int(ep.n_steps) for ep in episodes],
             "episode_seeds": [int(ep.seed) for ep in episodes],
