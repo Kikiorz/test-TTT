@@ -16,6 +16,14 @@ HD-TTT 在 SmolVLA 的 action expert 中加入可跨物理时刻保存的 TTT fa
 
 > `hd_ttt_enabled=false` 只关闭 HD 辅助目标和 HD gate，保留 SmolVLA-TTT 的 fast-weight 路径。它不是原生无 TTT 的 SmolVLA。原生 SmolVLA 应使用单独的 baseline policy/evaluator。
 
+### 当前研究边界（不要过度解读）
+
+当前版本的 clean teacher 是“从 episode 开始做完整因果 fast-weight replay”的冻结 SmolVLA-TTT teacher，不是额外训练的、显式读取全部历史的 oracle Transformer/SSM。因此 HCA 严格测量的是**某段 fast-weight write path 被移除后对未来预测的影响**；论文中不应把它表述成已经解决了任意历史信息的 oracle credit assignment。
+
+同样，当前 H2L 是 hindsight-credit-weighted local K/V objective 加 causal write-gate distillation，尚未提供独立的 content/address target 来直接指定 fast weights 应存储什么。counterfactual grounding 约束 reader 使用 true/wrong memory，但不等同于完整的 content distillation。
+
+实现里 gate 的输入是 prefix-only；TTT 的 K/V writer 则作用于 expert suffix hidden states，所以当前部署 writer 仍可能受 action/time/noise 表示影响。这是需要单独报告的 noise-sensitivity 实验问题，而不是可由固定随机种子自动排除的事实。正式结果还应报告：50-slot 与实际执行 slot-0 的 attribution 口径、`max-events=8` 相对 exhaustive 的召回率、以及相同总训练预算的 clean-continued 对照。
+
 ## 1. 代码范围和保护边界
 
 本算法的 base code 全部位于：
