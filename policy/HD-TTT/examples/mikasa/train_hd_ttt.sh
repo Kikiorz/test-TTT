@@ -59,7 +59,13 @@ fi
 TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
 REGISTER_TOKENS="${REGISTER_TOKENS:-16}"
-TTT_WRITER_MODE="${TTT_WRITER_MODE:-suffix}"
+# Leave the mode unresolved until ``HD_ENABLED`` is known below.  A plain
+# ``HD_ENABLED=true`` invocation must enter the paper's observation-only
+# writer; silently falling back to the legacy suffix writer would make the
+# resulting run action-noise dependent while still advertising the v2 label
+# protocol.  Explicit ``TTT_WRITER_MODE`` remains authoritative, and clean /
+# legacy runs retain the suffix compatibility default.
+TTT_WRITER_MODE="${TTT_WRITER_MODE:-}"
 # The formal HD/v2 recipe uses the bounded inner update by default.  Set this
 # to ``false`` only for an explicit legacy/clean ablation; v2 action-effect
 # supervision below rejects that combination because its labels must match the
@@ -83,6 +89,17 @@ HD_GROUNDING_WEIGHT="${HD_GROUNDING_WEIGHT:-}"
 HD_INVARIANCE_WEIGHT="${HD_INVARIANCE_WEIGHT:-0.25}"
 HD_WRITE_GATE_WEIGHT="${HD_WRITE_GATE_WEIGHT:-1.0}"
 HD_COUNTERFACTUAL_MARGIN="${HD_COUNTERFACTUAL_MARGIN:-0.0}"
+# Select the structural writer default only after the HD switch is available.
+# This is an entry-point safety rule, not a tunable algorithm parameter:
+# callers can still request the suffix path explicitly for a registered
+# ablation/legacy checkpoint.
+if [[ -z "${TTT_WRITER_MODE}" ]]; then
+  if [[ "${HD_ENABLED,,}" == "true" ]]; then
+    TTT_WRITER_MODE="prefix_only"
+  else
+    TTT_WRITER_MODE="suffix"
+  fi
+fi
 # Keep the old protocol for clean/legacy runs, but make an HD run safe by
 # defaulting to the paper v2 contract.  The ``+x`` test distinguishes an
 # omitted variable from an explicit legacy ablation.
