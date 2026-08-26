@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import asdict
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -336,6 +337,29 @@ def test_v2_effect_contract_rejects_incompatible_gate_and_order() -> None:
             ttt_second_order=True,
             hd_attribution_protocol="legacy",
         )
+
+
+def test_v3_conversion_preserves_explicit_second_order_from_clean_checkpoint() -> None:
+    """A V3 student must retain its writer meta-gradient when loading clean TTT."""
+
+    source = SmolVLATTTConfig(
+        device="cpu",
+        ttt_writer_mode="prefix_only",
+        ttt_second_order=False,
+        hd_ttt_enabled=False,
+        hd_attribution_protocol="legacy_raw_hinge_max",
+    )
+    target = SmolVLATTTConfig(
+        device="cpu",
+        ttt_writer_mode="prefix_only",
+        ttt_second_order=True,
+        hd_ttt_enabled=True,
+        hd_attribution_protocol="credit_ttt_v3_query_effect",
+        hd_effect_weight=0.0,
+    )
+    raw_source = asdict(source)
+    _restore_checkpoint_model_fields(target, source, raw_source)
+    assert target.ttt_second_order is True
 
 
 def test_config_rejects_layers_without_a_reduced_expert_layer() -> None:

@@ -360,6 +360,18 @@ def _restore_checkpoint_model_fields(
     preserve_second_order_for_effect = bool(
         requested_effect_weight > 0.0 and getattr(config, "ttt_second_order", False)
     )
+    # CreditTTT's QH2L objective also differentiates through the local
+    # fast-weight update, but unlike the legacy v2 effect path it deliberately
+    # keeps ``hd_effect_weight=0``.  When a V3 student is initialized from an
+    # ordinary first-order TTT checkpoint, the generic architecture restore
+    # would otherwise overwrite the explicit ``ttt_second_order=true`` CLI
+    # request with the source's ``false`` value and make the V3 config fail (or
+    # silently lose its writer meta-gradient in older callers).
+    preserve_second_order_for_credit = bool(
+        requested_hd.get("hd_attribution_protocol") == "credit_ttt_v3_query_effect"
+        and requested_hd.get("hd_ttt_enabled", False)
+        and getattr(config, "ttt_second_order", False)
+    )
     explicit_hd_opt_in = bool(
         requested_hd.get("hd_ttt_enabled", False)
         or requested_hd.get("hd_learned_write_gate", False)
@@ -386,7 +398,7 @@ def _restore_checkpoint_model_fields(
     for field_name in _CHECKPOINT_ARCHITECTURE_FIELDS:
         if field_name in raw_config:
             setattr(config, field_name, getattr(source_config, field_name))
-    if preserve_second_order_for_effect:
+    if preserve_second_order_for_effect or preserve_second_order_for_credit:
         config.ttt_second_order = True
     if explicit_hd_override:
         for field_name, value in requested_hd.items():
