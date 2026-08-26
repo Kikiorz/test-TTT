@@ -230,3 +230,158 @@ def test_ttt_bounded_trace_validates_indices_without_affecting_legacy_return() -
     assert state.position.tolist() == [1]
     with pytest.raises(ValueError, match="trace_indices"):
         layer(inputs, trace_indices=[2])
+
+
+def test_qh2l_reference_hybrid_routes_local_pairs_to_bounded_trace() -> None:
+    """Same-segment V3 pairs must not pay for a full-flow reference replay."""
+
+    pytest.importorskip("datasets")
+    pytest.importorskip("transformers")
+    from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import SmolVLATTTPolicy
+
+    class _FakeModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.action_out_proj = torch.nn.Linear(2, 2, bias=False)
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+            self.local_calls: list[tuple[list[int], list[int]]] = []
+
+        def v3_local_effects_from_trace(
+            self,
+            _trace_collector,
+            _final_hidden_collector,
+            _trace_indices,
+            event_indices: torch.Tensor,
+            future_indices: torch.Tensor,
+            _batch_indices: torch.Tensor,
+        ) -> torch.Tensor:
+            self.local_calls.append((event_indices.tolist(), future_indices.tolist()))
+            return torch.stack(
+                (event_indices.float(), future_indices.float()), dim=-1
+            ) * self.scale
+
+    class _Harness:
+        _v3_qh2l_loss = SmolVLATTTPolicy._v3_qh2l_loss
+
+        def __init__(self) -> None:
+            self.model = _FakeModel()
+            self.config = type("Config", (), {"hd_v3_null_weight": 0.25})()
+            self.observed_student: torch.Tensor | None = None
+            self.cross_calls: list[tuple[list[int], list[int]]] = []
+
+        def _hd_active_action_dim(
+            self, student: torch.Tensor, teacher: torch.Tensor
+        ) -> int:
+            self.observed_student = student.detach().clone()
+            return min(student.shape[-1], teacher.shape[-1])
+
+        def _v3_reference_student_effects(
+            self,
+            *,
+            event_indices: torch.Tensor,
+            future_indices_global: torch.Tensor,
+            **_kwargs,
+        ) -> torch.Tensor:
+            self.cross_calls.append(
+                (event_indices.tolist(), future_indices_global.tolist())
+            )
+            return torch.stack(
+                (10.0 * event_indices.float(), 10.0 * future_indices_global.float()),
+                dim=-1,
+            ) * self.model.scale
+
+    harness = _Harness()
+    pair_labels = {
+        "valid": torch.ones(4, dtype=torch.bool),
+        "total_rows": torch.tensor(4),
+        "event_index": torch.tensor([0, 1, 2, 3]),
+        "future_index": torch.tensor([1, -1, 3, -1]),
+        "event_index_global": torch.tensor([10, 11, 12, 13]),
+        "future_index_global": torch.tensor([11, 16, 13, 18]),
+        "batch_index": torch.zeros(4, dtype=torch.long),
+        "utility": torch.tensor([1.0, 1.0, 0.0, 0.0]),
+        "teacher_effect": torch.zeros(4, 2),
+        "positive": torch.tensor([True, True, False, False]),
+        "null": torch.tensor([False, False, True, True]),
+        "delay": torch.tensor([1, 5, 1, 5]),
+        "cross_segment": torch.tensor([False, True, False, True]),
+    }
+    loss, metrics = harness._v3_qh2l_loss(
+        pair_labels,
+        trace_collector={10: object()},
+        final_hidden_collector={10: torch.zeros(1, 4, 2, 2)},
+        trace_indices=(0, 1, 2, 3),
+        reference_batch={},
+    )
+    assert torch.isfinite(loss)
+    assert harness.model.local_calls == [([0, 2], [1, 3])]
+    assert harness.cross_calls == [([1, 3], [16, 18])]
+    assert harness.observed_student is not None
+    torch.testing.assert_close(
+        harness.observed_student,
+        torch.tensor([[0.0, 1.0], [10.0, 160.0], [2.0, 3.0], [30.0, 180.0]]),
+    )
+    assert metrics["hd_v3_cross_segment_pairs"] == 2.0
+    loss.backward()
+    assert harness.model.scale.grad is not None
+    assert torch.isfinite(harness.model.scale.grad)
+
+
+def test_qh2l_reference_all_local_does_not_require_global_indices() -> None:
+    """A reference batch must not force full-flow-only metadata for local pairs."""
+
+    pytest.importorskip("datasets")
+    pytest.importorskip("transformers")
+    from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import SmolVLATTTPolicy
+
+    class _FakeModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.action_out_proj = torch.nn.Linear(2, 2, bias=False)
+            self.local_called = False
+
+        def v3_local_effects_from_trace(
+            self,
+            _trace_collector,
+            _final_hidden_collector,
+            _trace_indices,
+            event_indices: torch.Tensor,
+            future_indices: torch.Tensor,
+            _batch_indices: torch.Tensor,
+        ):
+            self.local_called = True
+            return torch.stack((event_indices.float(), future_indices.float()), dim=-1)
+
+    class _Harness:
+        _v3_qh2l_loss = SmolVLATTTPolicy._v3_qh2l_loss
+
+        def __init__(self) -> None:
+            self.model = _FakeModel()
+            self.config = type("Config", (), {"hd_v3_null_weight": 0.25})()
+
+        @staticmethod
+        def _hd_active_action_dim(student: torch.Tensor, teacher: torch.Tensor) -> int:
+            return min(student.shape[-1], teacher.shape[-1])
+
+    harness = _Harness()
+    pair_labels = {
+        "valid": torch.ones(2, dtype=torch.bool),
+        "total_rows": torch.tensor(2),
+        "event_index": torch.tensor([0, 1]),
+        "future_index": torch.tensor([1, 2]),
+        "batch_index": torch.zeros(2, dtype=torch.long),
+        "utility": torch.ones(2),
+        "teacher_effect": torch.zeros(2, 2),
+        "positive": torch.ones(2, dtype=torch.bool),
+        "null": torch.zeros(2, dtype=torch.bool),
+        "delay": torch.ones(2, dtype=torch.long),
+        "cross_segment": torch.zeros(2, dtype=torch.bool),
+    }
+    harness._v3_qh2l_loss(
+        pair_labels,
+        trace_collector={10: object()},
+        final_hidden_collector={10: torch.zeros(1, 3, 2, 2)},
+        trace_indices=(0, 1, 2),
+        reference_batch={},
+    )
+    assert harness.model.local_called

@@ -1777,20 +1777,80 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         selected_event = pair_labels["event_index"].index_select(0, indices)
         selected_batch = pair_labels["batch_index"].index_select(0, indices)
         if reference_batch is not None:
-            if "event_index_global" not in pair_labels or "future_index_global" not in pair_labels:
-                raise ValueError(
-                    "Cross-segment CreditTTT replay requires global event/future indices; "
-                    "regenerate labels with the V3 pair schema"
+            # A complete reference window is present whenever cross-segment
+            # pairs are allowed, but same-segment pairs already have all the
+            # information needed by the bounded trace path. Keep those pairs
+            # local: it avoids a second VLM/flow replay and preserves the
+            # original event-writer graph. Only futures outside this segment
+            # require gathering reference rows and running full-flow replay.
+            cross_segment = pair_labels.get("cross_segment")
+            if cross_segment is None:
+                # ``_prepare_v3_pair_labels`` always emits this field. The
+                # fallback keeps direct callers with older manually-built
+                # pair dictionaries compatible without changing the routing
+                # contract.
+                final_trace_hidden = final_hidden_collector.get(max(final_hidden_collector))
+                if final_trace_hidden is None:
+                    raise ValueError(
+                        "V3 pair routing without cross_segment requires final-layer hidden states"
+                    )
+                cross_segment = (pair_labels["future_index"] < 0) | (
+                    pair_labels["future_index"] >= int(final_trace_hidden.shape[1])
                 )
-            student_effect = self._v3_reference_student_effects(
-                reference_batch=reference_batch,
-                trace_collector=trace_collector,
-                event_indices=selected_event,
-                event_indices_global=pair_labels["event_index_global"].index_select(0, indices),
-                future_indices_global=pair_labels["future_index_global"].index_select(0, indices),
-                batch_indices=selected_batch,
-            )
-            replay_cross_count = int(pair_labels.get("cross_segment", torch.zeros_like(valid))[indices].sum().item())
+            cross_segment = cross_segment.index_select(0, indices).bool()
+            local_positions = (~cross_segment).nonzero(as_tuple=False).flatten()
+            cross_positions = cross_segment.nonzero(as_tuple=False).flatten()
+            effect_chunks: list[Tensor] = []
+            position_chunks: list[Tensor] = []
+
+            if local_positions.numel() > 0:
+                selected_future = pair_labels["future_index"].index_select(0, indices)
+                local_effect = self.model.v3_local_effects_from_trace(
+                    trace_collector,
+                    final_hidden_collector,
+                    trace_indices,
+                    selected_event.index_select(0, local_positions),
+                    selected_future.index_select(0, local_positions),
+                    selected_batch.index_select(0, local_positions),
+                )
+                effect_chunks.append(local_effect)
+                position_chunks.append(local_positions)
+
+            if cross_positions.numel() > 0:
+                if (
+                    "event_index_global" not in pair_labels
+                    or "future_index_global" not in pair_labels
+                ):
+                    raise ValueError(
+                        "Cross-segment CreditTTT replay requires global event/future indices; "
+                        "regenerate labels with the V3 pair schema"
+                    )
+                cross_effect = self._v3_reference_student_effects(
+                    reference_batch=reference_batch,
+                    trace_collector=trace_collector,
+                    event_indices=selected_event.index_select(0, cross_positions),
+                    event_indices_global=pair_labels["event_index_global"].index_select(
+                        0, indices
+                    ).index_select(0, cross_positions),
+                    future_indices_global=pair_labels["future_index_global"].index_select(
+                        0, indices
+                    ).index_select(0, cross_positions),
+                    batch_indices=selected_batch.index_select(0, cross_positions),
+                )
+                effect_chunks.append(cross_effect)
+                position_chunks.append(cross_positions)
+
+            if len(effect_chunks) == 1:
+                student_effect = effect_chunks[0]
+            else:
+                # Concatenate the two independently-computed paths, then
+                # restore the original pair order with differentiable tensor
+                # indexing. This keeps utility/stratum alignment exact while
+                # retaining gradients through both local and cross replays.
+                packed_effect = torch.cat(effect_chunks, dim=0)
+                packed_positions = torch.cat(position_chunks, dim=0)
+                student_effect = packed_effect.index_select(0, packed_positions.argsort())
+            replay_cross_count = int(cross_positions.numel())
         else:
             student_effect = self.model.v3_local_effects_from_trace(
                 trace_collector,
