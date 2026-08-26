@@ -243,6 +243,13 @@ class SmolVLATTTConfig(PreTrainedConfig):
     # distinction between the writer (QH2L) and reader (CMD) explicit without
     # introducing a collection of task-specific knobs.
     hd_v3_cmd_weight: float = 1.0
+    # In distributed B>1 sequence training, normalize each V3 stratum with
+    # the all-rank pair population (rather than a rank-local denominator).
+    # The trainer compensates for Accelerate's explicit gradient mean so the
+    # resulting objective is the global pair-weighted mean.  Single-process
+    # and historical B=1 paths are unchanged; setting this false is retained
+    # as an explicit compatibility/ablation switch.
+    hd_v3_global_pair_normalization: bool = True
     # Explicit objective-family selector for preregistered V3 ablations.
     # ``full`` is the canonical method; the two ablation names make a zero
     # loss weight auditable in a checkpoint instead of looking like an
@@ -287,6 +294,12 @@ class SmolVLATTTConfig(PreTrainedConfig):
         # the generic draccus path and the custom checkpoint loader agree.
         if self.ttt_stable_inner_update is None:
             self.ttt_stable_inner_update = False
+        if self.hd_v3_global_pair_normalization is None:
+            # Checkpoints written before this switch existed may contain an
+            # explicit JSON null for newly added booleans.  Preserve the
+            # canonical default rather than rejecting an otherwise compatible
+            # V3 configuration during resume.
+            self.hd_v3_global_pair_normalization = True
 
         """Input validation (not exhaustive)."""
         if self.n_action_steps > self.chunk_size:
@@ -312,6 +325,8 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("sequence_stride cannot exceed sequence_length because that would drop frames")
         if type(self.equal_length_batching) is not bool:
             raise ValueError("equal_length_batching must be a boolean")
+        if type(self.hd_v3_global_pair_normalization) is not bool:
+            raise ValueError("hd_v3_global_pair_normalization must be a boolean")
         if self.tbptt_segment_length <= 0:
             raise ValueError("tbptt_segment_length must be positive")
         if self.tbptt_segment_length > self.sequence_length:

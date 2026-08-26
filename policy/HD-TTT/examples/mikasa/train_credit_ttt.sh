@@ -62,6 +62,8 @@ Useful overrides:
   the selected episode windows),
   BATCH_SIZE=1 (per-device; set to 2 or 4 with EQUAL_LENGTH_BATCHING=1 for
   exact-length trajectory buckets),
+  GRADIENT_ACCUMULATION_STEPS=1 (sequence windows averaged per optimizer step;
+  default 1, fast state resets at every window),
   NUM_PROCESSES=4 (use all four GPUs on the reference server),
   TEACHER_EPISODE_BATCH_SIZE=1 (legacy default; set >1 to right-pad cached
   feature episodes with a valid_mask for higher teacher-fit throughput),
@@ -76,6 +78,8 @@ silently alter the benchmark manifest and must be recorded in the output
 directory/experiment name.
 
   V3_ABLATION=full|qh2l_only|cmd_only (sets the objective family and weights)
+  HD_V3_GLOBAL_PAIR_NORMALIZATION=1 (all-rank pair denominators for DDP;
+  default enabled, set 0 only for a named compatibility ablation)
 EOF
 }
 
@@ -201,6 +205,7 @@ _HD_V3_CMD_WEIGHT_SET="${HD_V3_CMD_WEIGHT+x}"
 HD_V3_LOCAL_WEIGHT="${HD_V3_LOCAL_WEIGHT:-1.0}"
 HD_V3_CMD_WEIGHT="${HD_V3_CMD_WEIGHT:-1.0}"
 HD_V3_NULL_WEIGHT="${HD_V3_NULL_WEIGHT:-0.25}"
+HD_V3_GLOBAL_PAIR_NORMALIZATION="${HD_V3_GLOBAL_PAIR_NORMALIZATION:-1}"
 V3_ABLATION="${V3_ABLATION:-full}"
 case "${V3_ABLATION}" in
   full)
@@ -228,6 +233,7 @@ EPOCHS="${EPOCHS:-150}"
 MIN_SEQUENCE_EPOCHS="${MIN_SEQUENCE_EPOCHS:-150}"
 ALLOW_SHORT_RUN="${ALLOW_SHORT_RUN:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 EQUAL_LENGTH_BATCHING="${EQUAL_LENGTH_BATCHING:-0}"
 BATCHING_METADATA_JSON="{}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
@@ -283,6 +289,14 @@ require_runtime_inputs() {
   fi
   if ! [[ "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "BATCH_SIZE must be a positive integer; got '${BATCH_SIZE}'" >&2
+    return 2
+  fi
+  if ! [[ "${GRADIENT_ACCUMULATION_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "GRADIENT_ACCUMULATION_STEPS must be a positive integer; got '${GRADIENT_ACCUMULATION_STEPS}'" >&2
+    return 2
+  fi
+  if [[ "${HD_V3_GLOBAL_PAIR_NORMALIZATION}" != "0" && "${HD_V3_GLOBAL_PAIR_NORMALIZATION}" != "1" ]]; then
+    echo "HD_V3_GLOBAL_PAIR_NORMALIZATION must be 0 or 1; got '${HD_V3_GLOBAL_PAIR_NORMALIZATION}'" >&2
     return 2
   fi
   if [[ "${EQUAL_LENGTH_BATCHING}" != "0" && "${EQUAL_LENGTH_BATCHING}" != "1" ]]; then
@@ -459,7 +473,16 @@ PY
     echo "Dataset metadata did not expose a positive fps" >&2
     return 2
   fi
-  STEPS_PER_EPOCH="${BATCHES_PER_RANK}"
+  # One optimizer update consumes exactly GRADIENT_ACCUMULATION_STEPS
+  # independent windows. Require an integral number of groups so every
+  # declared sequence epoch remains a complete sampler pass; carrying a
+  # partial group across epochs would make the epoch/step provenance unclear.
+  if (( BATCHES_PER_RANK % GRADIENT_ACCUMULATION_STEPS != 0 )); then
+    echo "BATCHES_PER_RANK=${BATCHES_PER_RANK} is not divisible by GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS}; choose a divisor to preserve complete sequence epochs" >&2
+    return 2
+  fi
+  MICRO_BATCHES_PER_EPOCH="${BATCHES_PER_RANK}"
+  STEPS_PER_EPOCH="$((BATCHES_PER_RANK / GRADIENT_ACCUMULATION_STEPS))"
   STEPS="${STEPS:-$((STEPS_PER_EPOCH * EPOCHS))}"
 }
 
@@ -484,6 +507,8 @@ write_training_metadata() {
     "${MIN_EPISODE_LENGTH}" \
     "${MAX_EPISODE_LENGTH}" \
     "${DATASET_FPS}" \
+    "${GRADIENT_ACCUMULATION_STEPS}" \
+    "${HD_V3_GLOBAL_PAIR_NORMALIZATION}" \
     "${V3_ABLATION}" \
     "${INTERVENTION}" \
     "${TTT_LAYERS}" \
@@ -509,6 +534,8 @@ from pathlib import Path
     min_episode_length,
     max_episode_length,
     fps,
+    gradient_accumulation_steps,
+    global_pair_normalization,
     ablation,
     intervention,
     ttt_layers,
@@ -530,6 +557,9 @@ payload = {
     "epochs": int(epochs),
     "steps": int(steps),
     "steps_per_epoch": int(steps_per_epoch),
+    "gradient_accumulation_steps": int(gradient_accumulation_steps),
+    "effective_batch_size": int(batching["global_batch_size"] * int(gradient_accumulation_steps)),
+    "hd_v3_global_pair_normalization": bool(int(global_pair_normalization)),
     "sequence_length": int(sequence_length),
     "sequence_stride": int(sequence_stride),
     "min_episode_length": int(min_episode_length),
@@ -647,6 +677,7 @@ student_command() {
     --policy.hd_v3_pair_k="${PAIR_K}"
     --policy.hd_v3_local_weight="${HD_V3_LOCAL_WEIGHT}"
     --policy.hd_v3_cmd_weight="${HD_V3_CMD_WEIGHT}"
+    --policy.hd_v3_global_pair_normalization="$([[ "${HD_V3_GLOBAL_PAIR_NORMALIZATION}" == "1" ]] && echo true || echo false)"
     --policy.hd_v3_ablation="${V3_ABLATION}"
     --policy.hd_v3_cmd_margin=0.05
     --policy.hd_v3_null_weight="${HD_V3_NULL_WEIGHT}"
@@ -655,6 +686,7 @@ student_command() {
     --policy.hd_v3_intervention="${INTERVENTION}"
     --policy.hd_v3_effect_layer=last_selected
     --batch_size="${BATCH_SIZE}"
+    --gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS}"
     --num_workers="${NUM_WORKERS}"
     --prefetch_factor="${PREFETCH_FACTOR}"
     --persistent_workers=true
@@ -758,7 +790,8 @@ print_protocol() {
   echo "task=${TASK_ID} dataset=${DATASET_REPO_ID} root=${DATASET_ROOT}"
   echo "episodes: features=${FEATURE_EPISODE_START}..$((FEATURE_EPISODE_END - 1)), train=${TRAIN_EPISODES_JSON}, validation_start=${VALIDATION_EPISODE_START}"
   echo "full-history window: sequence_length=${SEQUENCE_LENGTH} sequence_stride=${SEQUENCE_STRIDE} max_windows_per_episode=${MAX_WINDOWS_PER_EPISODE} history_warmup_length=${HISTORY_WARMUP_LENGTH}"
-  echo "trajectory batch: per_device=${BATCH_SIZE} equal_length=${EQUAL_LENGTH_BATCHING} processes=${NUM_PROCESSES} (no temporal padding)"
+  echo "trajectory batch: per_device=${BATCH_SIZE} equal_length=${EQUAL_LENGTH_BATCHING} processes=${NUM_PROCESSES} accumulation=${GRADIENT_ACCUMULATION_STEPS} (no temporal padding; fast state resets per window)"
+  echo "V3 DDP pair normalization: global_pair_weighted=${HD_V3_GLOBAL_PAIR_NORMALIZATION} (denominator all-reduced; B1/single-process unchanged)"
   echo "teacher fit: episode_batch_size=${TEACHER_EPISODE_BATCH_SIZE} (right-padded valid_mask; checkpoint execution provenance records this value)"
   echo "offset contract: episode-local origin; full window offset=0; TBPTT segment offset=window_offset+segment_start; reset at episode boundary"
   echo "stages: full-history teacher -> pair labels -> QH2L student; baseline commands are evaluation-only"
@@ -780,7 +813,7 @@ if [[ "${STAGE}" == "plan" ]]; then
     SEQUENCE_STRIDE="${SEQUENCE_LENGTH}"
   fi
   WINDOWS="<N_SELECTED_EPISODES>"
-  STEPS="<N_SELECTED_EPISODES*EPOCHS/world_size>"
+  STEPS="<N_SELECTED_EPISODES*EPOCHS/(world_size*gradient_accumulation_steps)>"
   student_command student
   echo "# teacher (stage 1)"
   print_cmd "${teacher[@]}"
@@ -837,7 +870,7 @@ mkdir -p "${OUTPUT_ROOT}"
 if [[ "${STAGE}" == "student" || "${STAGE}" == "all" ]]; then
   write_training_metadata
 fi
-echo "Resolved full-history windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, sequence=${SEQUENCE_LENGTH}, batch/device=${BATCH_SIZE}, processes=${NUM_PROCESSES}, steps/epoch=${STEPS_PER_EPOCH}, total_steps=${STEPS}"
+echo "Resolved full-history windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, sequence=${SEQUENCE_LENGTH}, batch/device=${BATCH_SIZE}, processes=${NUM_PROCESSES}, accumulation=${GRADIENT_ACCUMULATION_STEPS}, micro-batches/epoch=${MICRO_BATCHES_PER_EPOCH:-unknown}, optimizer-steps/epoch=${STEPS_PER_EPOCH}, total_steps=${STEPS}"
 
 run_cmd() {
   local label=$1

@@ -1625,6 +1625,76 @@ def _ddp_frame_weighted_flow_scale(
     return rank_scale, local_count, global_count
 
 
+def _v3_ddp_pair_normalizers(
+    policy: torch.nn.Module,
+    reference_batch: Mapping[str, Any] | None,
+    sequence_shape: tuple[int, int],
+    accelerator: "Accelerator",
+    *,
+    enabled: bool,
+) -> dict[str, torch.Tensor] | None:
+    """Return all-rank V3 stratum denominators for explicit DDP training.
+
+    The V3 primitives normalize each stratum by a detached complete-window
+    denominator.  With a trajectory batch, computing that scalar independently
+    on every rank makes the final explicit gradient mean an *average of local
+    ratios*.  When enabled, this helper sums the three local denominators over
+    ranks and returns ``global_denominator / world_size``.  Dividing by the
+    world size is deliberate: the sequence trainer reduces gradients with a
+    mean after the forward pass, so the two factors cancel and the resulting
+    gradient is the global pair-weighted numerator divided by the global
+    denominator.
+
+    The helper is deliberately a no-op for single-process/B=1 compatibility,
+    for missing reference windows, or when the policy switch is false.  It
+    invokes the model's existing private label-preparation routine instead of
+    reimplementing pair validity/utility rules, keeping the protocol identical
+    to the direct V3 path.  A missing pair artifact contributes zero
+    denominators but still participates in all three collectives, preventing a
+    rank-order mismatch if a malformed/empty batch reaches this boundary.
+    """
+
+    if not enabled or accelerator.num_processes <= 1 or reference_batch is None:
+        return None
+    prepare_labels = getattr(policy, "_prepare_v3_pair_labels", None)
+    normalizer_fn = getattr(policy, "_v3_pair_normalizers", None)
+    if not callable(prepare_labels) or not callable(normalizer_fn):
+        raise TypeError(
+            "Canonical V3 DDP normalization requires the SmolVLA policy pair-label helpers"
+        )
+    reference_shape_fn = getattr(policy, "_v3_reference_sequence_shape", None)
+    if callable(reference_shape_fn):
+        reference_shape = reference_shape_fn(reference_batch)
+    else:
+        reference_shape = sequence_shape
+    reference_offset = _sequence_offset_from_batch(reference_batch)
+    pair_labels = prepare_labels(
+        reference_batch,
+        reference_shape,
+        sequence_offset=reference_offset,
+        allow_cross_segment=True,
+    )
+    local_normalizers = normalizer_fn(pair_labels)
+    zero = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+    global_normalizers: dict[str, torch.Tensor] = {}
+    for name in ("full", "positive", "null"):
+        local_value = zero
+        if local_normalizers is not None and name in local_normalizers:
+            local_value = torch.as_tensor(
+                local_normalizers[name], device=accelerator.device, dtype=torch.float32
+            ).detach()
+            if local_value.numel() != 1:
+                raise ValueError(f"V3 pair normalizer {name!r} must be scalar")
+            local_value = local_value.reshape(())
+        reduced = accelerator.reduce(local_value, reduction="sum")
+        if not isinstance(reduced, torch.Tensor) or reduced.numel() != 1:
+            raise RuntimeError("Accelerator.reduce returned an invalid V3 pair normalizer")
+        global_normalizers[name] = (
+            reduced.detach() / float(accelerator.num_processes)
+        ).reshape(())
+    return global_normalizers
+
+
 def _ddp_reduce_gradients(
     policy: torch.nn.Module,
     accelerator: "Accelerator",
@@ -1800,6 +1870,10 @@ def update_policy_tbptt(
     accelerator: "Accelerator",
     lr_scheduler=None,
     lock=None,
+    *,
+    optimizer_step: bool = True,
+    zero_grad_before: bool = True,
+    gradient_scale: float = 1.0,
 ) -> tuple[MetricsTracker, dict]:
     """Update a TTT policy over one sequence while truncating gradients between segments.
 
@@ -1807,11 +1881,24 @@ def update_policy_tbptt(
     persistent PI0-TTT parameters are synchronized once, after all TBPTT segments have contributed
     gradients and before clipping/stepping the optimizer. This preserves trajectory-local memory while
     implementing data parallel training for the outer parameters.
+
+    ``optimizer_step=False`` is an explicit gradient-accumulation mode used by
+    the sequence trainer.  In that mode this function still executes exactly one
+    complete sequence window (including its own fast-state reset), but leaves its
+    outer gradients in ``optimizer`` for a later call.  The final call performs
+    the one DDP reduction, clipping, optimizer/scheduler step, and buffer update.
+    ``gradient_scale`` scales every backward contribution, including streamed
+    CreditTTT V3 replay callbacks, while leaving reported losses unscaled.
+    The defaults preserve the historical one-window/one-step behavior exactly.
     """
+
+    if not math.isfinite(float(gradient_scale)) or gradient_scale <= 0:
+        raise ValueError(f"gradient_scale must be finite and positive, got {gradient_scale!r}")
 
     start_time = time.perf_counter()
     policy.train()
-    optimizer.zero_grad()
+    if zero_grad_before:
+        optimizer.zero_grad()
     unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
     batch_size, sequence_length = sequence_shape
     # The sampler's origin is episode-local and may be non-zero when a window
@@ -1935,6 +2022,17 @@ def update_policy_tbptt(
         v3_reference_batch[SEQUENCE_SHAPE_KEY] = torch.tensor(
             [batch_size, sequence_length], dtype=torch.int64, device=accelerator.device
         )
+    v3_pair_normalizers = _v3_ddp_pair_normalizers(
+        unwrapped_policy,
+        v3_reference_batch,
+        sequence_shape,
+        accelerator,
+        enabled=bool(
+            str(getattr(policy_config, "hd_attribution_protocol", ""))
+            == _HD_ATTRIBUTION_PROTOCOL_V3
+            and getattr(policy_config, "hd_v3_global_pair_normalization", True)
+        ),
+    )
     # Estimate the robust action-effect floor from the complete physical
     # window, before TBPTT slicing.  Reusing this detached scalar in every
     # segment keeps action-effect normalization invariant to segment length while
@@ -1959,7 +2057,10 @@ def update_policy_tbptt(
     )
 
     def _stream_v3_backward(loss: torch.Tensor, retain_graph: bool) -> None:
-        accelerator.backward(loss, retain_graph=retain_graph)
+        # Streaming replay invokes backward inside the policy.  Apply the same
+        # accumulation scale as the ordinary segment loss so QH2L/CMD retain
+        # their objective ratio when several independent windows are averaged.
+        accelerator.backward(loss * gradient_scale, retain_graph=retain_graph)
 
     local_num_segments = len(segment_loss_weights)
     # Tail-preserving windows intentionally have variable physical lengths.
@@ -2021,6 +2122,8 @@ def update_policy_tbptt(
                     # query replay and its global pair normalizers.
                     segment_kwargs["sequence_offset"] = window_sequence_offset + segment_start
                     segment_kwargs["v3_reference_batch"] = v3_reference_batch
+                    if v3_pair_normalizers is not None:
+                        segment_kwargs["v3_pair_normalizers"] = v3_pair_normalizers
                     if stream_v3_replay:
                         segment_kwargs["v3_streaming_backward"] = _stream_v3_backward
                 segment_loss, segment_output, fast_states = unwrapped_policy.forward_sequence_segment(
@@ -2071,7 +2174,7 @@ def update_policy_tbptt(
                 check_parameters=False,
             )
 
-        accelerator.backward(weighted_segment_loss)
+        accelerator.backward(weighted_segment_loss * gradient_scale)
         total_loss += weighted_segment_loss.detach()
         if has_local_segment:
             segment_loss_per_dim = torch.tensor(
@@ -2146,11 +2249,13 @@ def update_policy_tbptt(
             }
         num_segments += 1
 
-    if accelerator.num_processes > 1:
+    if optimizer_step and accelerator.num_processes > 1:
         # Sequence TTT calls the unwrapped policy, so synchronize all outer
         # gradients explicitly.  The helper preserves conditional unused-
         # parameter handling while flattening dense tensors to avoid one
-        # all-reduce per model parameter.
+        # all-reduce per model parameter.  In accumulation mode this reduction
+        # intentionally happens only on the final window: reducing each partial
+        # sum in place would average already-synchronized gradients repeatedly.
         _ddp_reduce_gradients(policy, accelerator)
 
         total_loss = accelerator.reduce(total_loss, reduction="mean")
@@ -2168,7 +2273,7 @@ def update_policy_tbptt(
                     accelerator.reduce(metric_tensor, reduction="mean").item()
                 )
 
-    if finite_guard_enabled:
+    if optimizer_step and finite_guard_enabled:
         # This is the last point before gradient clipping and the optimizer
         # step.  A bad loss, gradient, recurrent fast state, or parameter is
         # therefore reported without allowing any mutation by the optimizer.
@@ -2204,61 +2309,72 @@ def update_policy_tbptt(
             )
         )
 
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+    if optimizer_step:
+        if grad_clip_norm > 0:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(), float("inf"), error_if_nonfinite=False
+            )
 
-    if finite_guard_enabled:
-        # Clipping can itself produce an infinite norm for otherwise finite
-        # but overflowing gradients.  Check again after clipping and still
-        # abort before entering the lock/optimizer section.
-        _hd_ttt_finite_guard(
-            policy=policy,
-            loss=total_loss,
-            grad_norm=grad_norm,
-            fast_states=fast_states,
-            accelerator=accelerator,
-            stage="after gradient clipping",
-        )
+        if finite_guard_enabled:
+            # Clipping can itself produce an infinite norm for otherwise finite
+            # but overflowing gradients.  Check again after clipping and still
+            # abort before entering the lock/optimizer section.
+            _hd_ttt_finite_guard(
+                policy=policy,
+                loss=total_loss,
+                grad_norm=grad_norm,
+                fast_states=fast_states,
+                accelerator=accelerator,
+                stage="after gradient clipping",
+            )
 
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
 
-    if accelerator.num_processes > 1 and os.environ.get("LEROBOT_VERIFY_DDP_SYNC") == "1":
-        max_parameter_difference = torch.zeros((), device=accelerator.device)
-        for parameter in policy.parameters():
-            if not parameter.requires_grad:
-                continue
-            rank_zero_parameter = parameter.detach().clone()
-            torch.distributed.broadcast(rank_zero_parameter, src=0)
-            max_parameter_difference = torch.maximum(
+        if accelerator.num_processes > 1 and os.environ.get("LEROBOT_VERIFY_DDP_SYNC") == "1":
+            max_parameter_difference = torch.zeros((), device=accelerator.device)
+            for parameter in policy.parameters():
+                if not parameter.requires_grad:
+                    continue
+                rank_zero_parameter = parameter.detach().clone()
+                torch.distributed.broadcast(rank_zero_parameter, src=0)
+                max_parameter_difference = torch.maximum(
+                    max_parameter_difference,
+                    (parameter.detach() - rank_zero_parameter).abs().max(),
+                )
+            torch.distributed.all_reduce(
                 max_parameter_difference,
-                (parameter.detach() - rank_zero_parameter).abs().max(),
+                op=torch.distributed.ReduceOp.MAX,
             )
-        torch.distributed.all_reduce(
-            max_parameter_difference,
-            op=torch.distributed.ReduceOp.MAX,
-        )
-        if max_parameter_difference.item() != 0:
-            raise RuntimeError(
-                "TTT policy data-parallel replicas diverged after optimizer step: "
-                f"max parameter difference={max_parameter_difference.item()}"
-            )
-        if accelerator.is_main_process:
-            logging.info("Verified TTT data-parallel replicas are identical after optimizer step")
+            if max_parameter_difference.item() != 0:
+                raise RuntimeError(
+                    "TTT policy data-parallel replicas diverged after optimizer step: "
+                    f"max parameter difference={max_parameter_difference.item()}"
+                )
+            if accelerator.is_main_process:
+                logging.info("Verified TTT data-parallel replicas are identical after optimizer step")
 
-    optimizer.zero_grad()
+        optimizer.zero_grad()
 
-    if lr_scheduler is not None:
-        lr_scheduler.step()
-    if has_method(unwrapped_policy, "update"):
-        unwrapped_policy.update()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+        if has_method(unwrapped_policy, "update"):
+            unwrapped_policy.update()
+    else:
+        # Gradients are intentionally left in place for the next independent
+        # window.  No clipping/reduction/scheduler step is allowed here: doing
+        # either would change the sum that the final accumulation call sees.
+        grad_norm = torch.zeros((), device=accelerator.device)
 
     train_metrics.loss = total_loss.item()
-    train_metrics.grad_norm = grad_norm.item()
+    # A deferred micro-window has no post-accumulation norm yet.  Recording a
+    # synthetic zero would bias the running diagnostic toward zero whenever
+    # accumulation is enabled, so publish the clipped norm only on the final
+    # optimizer call (the historical path always takes this branch).
+    if optimizer_step:
+        train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     output_dict = {
@@ -2319,6 +2435,24 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     is_pi05_ttt = isinstance(cfg.policy, PI05TTTConfig)
     is_smolvla_ttt = isinstance(cfg.policy, SmolVLATTTConfig)
     is_sequence_ttt = is_pi0_ttt or is_pi05_ttt or is_smolvla_ttt
+    raw_gradient_accumulation_steps = getattr(cfg, "gradient_accumulation_steps", 1)
+    if (
+        type(raw_gradient_accumulation_steps) is not int
+        or raw_gradient_accumulation_steps < 1
+    ):
+        # ``TrainPipelineConfig.validate`` catches malformed CLI values in
+        # normal runs.  Keep this local guard for callers that construct a
+        # config object programmatically and invoke ``train`` directly.
+        raise ValueError(
+            "gradient_accumulation_steps must be a positive integer, got "
+            f"{raw_gradient_accumulation_steps!r}"
+        )
+    gradient_accumulation_steps = raw_gradient_accumulation_steps
+    if gradient_accumulation_steps > 1 and not is_sequence_ttt:
+        raise ValueError(
+            "gradient_accumulation_steps>1 is currently supported only for "
+            "episode-local sequence-TTT policies"
+        )
     if is_sequence_ttt:
         if cfg.sample_weighting is not None:
             raise ValueError("TTT sequence training does not support sample weighting yet")
@@ -2527,8 +2661,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        effective_bs = cfg.batch_size * num_processes * gradient_accumulation_steps
+        logging.info(
+            "Effective optimizer batch size: %s x %s x %s accumulation = %s "
+            "(per-device window x processes x windows/update)",
+            cfg.batch_size,
+            num_processes,
+            gradient_accumulation_steps,
+            effective_bs,
+        )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -2721,65 +2862,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         ):
             train_metrics[metric_name] = AverageMeter(metric_name, ":.5f")
 
-    # Keep global batch size for logging; MetricsTracker handles world size internally.
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
-    train_tracker = MetricsTracker(
-        cfg.batch_size,
-        dataset.num_frames,
-        dataset.num_episodes,
-        train_metrics,
-        initial_step=step,
-        accelerator=accelerator,
-    )
+    def _record_sequence_output(output_dict: dict[str, Any]) -> None:
+        """Add one sequence-window's diagnostics to the running meters.
 
-    if is_main_process:
-        progbar = tqdm(
-            total=cfg.steps - step,
-            desc="Training",
-            unit="step",
-            disable=inside_slurm(),
-            position=0,
-            leave=True,
-        )
-        logging.info(
-            f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
-        )
+        Gradient accumulation executes several *independent* windows before a
+        single optimizer update.  Keeping this bookkeeping in a helper lets
+        each micro-window contribute its diagnostics without moving the
+        optimizer/checkpoint cadence or accidentally sharing its fast state.
+        """
 
-    for _ in range(step, cfg.steps):
-        start_time = time.perf_counter()
-        batch = next(dl_iter)
-        sequence_shape = None
-        if is_sequence_ttt:
-            sequence_shape = tuple(int(value) for value in batch.pop(SEQUENCE_SHAPE_KEY))
-        for cam_key in dataset.meta.camera_keys:
-            if cam_key in batch and batch[cam_key].dtype == torch.uint8:
-                batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
-        batch = preprocessor(batch)
-        train_tracker.dataloading_s = time.perf_counter() - start_time
-
-        if is_sequence_ttt:
-            train_tracker, output_dict = update_policy_tbptt(
-                train_tracker,
-                policy,
-                batch,
-                sequence_shape,
-                active_cfg.tbptt_segment_length,
-                optimizer,
-                cfg.optimizer.grad_clip_norm,
-                accelerator=accelerator,
-                lr_scheduler=lr_scheduler,
-            )
-        else:
-            train_tracker, output_dict = update_policy(
-                train_tracker,
-                policy,
-                batch,
-                optimizer,
-                cfg.optimizer.grad_clip_norm,
-                accelerator=accelerator,
-                lr_scheduler=lr_scheduler,
-                sample_weighter=sample_weighter,
-            )
         if is_smolvla_ttt and cfg.policy.hd_ttt_enabled:
             for metric_name in (
                 "hd_hca",
@@ -2850,12 +2941,92 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if metric_name in output_dict:
                     setattr(train_tracker, metric_name, output_dict[metric_name])
 
+    # Keep global batch size for logging; MetricsTracker handles world size internally.
+    effective_batch_size = (
+        cfg.batch_size * accelerator.num_processes * gradient_accumulation_steps
+    )
+    train_tracker = MetricsTracker(
+        cfg.batch_size,
+        dataset.num_frames,
+        dataset.num_episodes,
+        train_metrics,
+        initial_step=step,
+        accelerator=accelerator,
+    )
+
+    if is_main_process:
+        progbar = tqdm(
+            total=cfg.steps - step,
+            desc="Training",
+            unit="step",
+            disable=inside_slurm(),
+            position=0,
+            leave=True,
+        )
+        logging.info(
+            f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
+        )
+
+    for _ in range(step, cfg.steps):
+        # Each micro-window is an independent trajectory sample.  Only the
+        # persistent outer gradients span accumulation windows; fast states,
+        # grounding branches, and TBPTT graphs are created/reset inside
+        # ``update_policy_tbptt`` for every call.
+        output_dict: dict[str, Any] = {}
+        for accumulation_index in range(gradient_accumulation_steps):
+            start_time = time.perf_counter()
+            batch = next(dl_iter)
+            sequence_shape = None
+            if is_sequence_ttt:
+                sequence_shape = tuple(int(value) for value in batch.pop(SEQUENCE_SHAPE_KEY))
+            for cam_key in dataset.meta.camera_keys:
+                if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                    batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+            batch = preprocessor(batch)
+            train_tracker.dataloading_s = time.perf_counter() - start_time
+
+            if is_sequence_ttt:
+                train_tracker, output_dict = update_policy_tbptt(
+                    train_tracker,
+                    policy,
+                    batch,
+                    sequence_shape,
+                    active_cfg.tbptt_segment_length,
+                    optimizer,
+                    cfg.optimizer.grad_clip_norm,
+                    accelerator=accelerator,
+                    lr_scheduler=lr_scheduler,
+                    # Synchronize/step only once after all independent windows
+                    # have contributed their scaled gradients.
+                    optimizer_step=(accumulation_index == gradient_accumulation_steps - 1),
+                    zero_grad_before=(accumulation_index == 0),
+                    gradient_scale=1.0 / gradient_accumulation_steps,
+                )
+            else:
+                # Non-sequence policies are guarded above to keep the scope of
+                # explicit accumulation unambiguous and preserve their native
+                # update path.
+                train_tracker, output_dict = update_policy(
+                    train_tracker,
+                    policy,
+                    batch,
+                    optimizer,
+                    cfg.optimizer.grad_clip_norm,
+                    accelerator=accelerator,
+                    lr_scheduler=lr_scheduler,
+                    sample_weighter=sample_weighter,
+                )
+            _record_sequence_output(output_dict)
+
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
         step += 1
         if is_main_process:
             progbar.update(1)
-        train_tracker.step()
+        # One logical step may consume several independent sequence windows;
+        # account for all of them in sample/epoch diagnostics while retaining
+        # one scheduler/checkpoint/evaluation step.
+        train_tracker.step(sample_multiplier=gradient_accumulation_steps)
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0

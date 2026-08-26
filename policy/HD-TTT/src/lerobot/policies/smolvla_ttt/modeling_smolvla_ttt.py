@@ -3399,6 +3399,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         effect_normalization_floor: float | Tensor | None = None,
         sequence_offset: int = 0,
         v3_reference_batch: dict[str, Tensor] | None = None,
+        v3_pair_normalizers: Mapping[str, Tensor | float] | None = None,
         previous_action_at_start: Tensor | None = None,
         v3_streaming_backward: Callable[[Tensor, bool], None] | None = None,
     ) -> tuple[Tensor, dict, TTTFastStates]:
@@ -3438,6 +3439,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         callback receives ``(loss, retain_graph)`` and is invoked synchronously;
         the returned loss remains connected only to the non-streamed flow/
         anchor terms, so callers must not backward the streamed terms again.
+        ``v3_pair_normalizers`` optionally supplies detached complete-window
+        denominators.  The sequence trainer uses all-rank denominators divided
+        by world size so the explicit DDP gradient mean produces a global
+        pair-weighted objective; omitting it retains the historical local
+        denominator path.
         """
         batch_size, sequence_length = sequence_shape
         if sequence_offset is None:
@@ -3552,8 +3558,13 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             if credit_v3
             else None
         )
-        v3_pair_normalizers: dict[str, Tensor] | None = None
-        if v3_pair_labels is not None:
+        v3_pair_normalizers_local: dict[str, Tensor] | None = None
+        # The trainer's all-rank override already came from this exact
+        # complete-window label population.  Avoid rebuilding that population
+        # on every TBPTT segment (which is particularly costly for the
+        # cross-segment replay path); direct callers without an override keep
+        # the historical local computation below.
+        if v3_pair_labels is not None and v3_pair_normalizers is None:
             # Compute denominators from the complete episode/window whenever
             # the trainer supplied one.  Segment-local labels are still used
             # for the actual replay, but their numerators now add up to one
@@ -3570,7 +3581,22 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     sequence_offset=reference_offset,
                     allow_cross_segment=True,
                 )
-            v3_pair_normalizers = self._v3_pair_normalizers(normalization_labels)
+            v3_pair_normalizers_local = self._v3_pair_normalizers(normalization_labels)
+        # The trainer can override the local complete-window denominators with
+        # detached all-rank values (divided by world size to compensate for its
+        # explicit gradient mean).  Keep this boundary explicit so direct
+        # single-process callers and old checkpoints retain the historical
+        # fallback without any hidden collective.
+        if v3_pair_normalizers is not None:
+            required_normalizer_names = {"full", "positive", "null"}
+            if not required_normalizer_names.issubset(v3_pair_normalizers):
+                raise ValueError(
+                    "v3_pair_normalizers must contain full/positive/null denominators"
+                )
+            v3_pair_normalizers_local = {
+                name: torch.as_tensor(value, device=actions.device).detach()
+                for name, value in v3_pair_normalizers.items()
+            }
         v3_trace_indices: tuple[int, ...] = ()
         v3_trace_layer_indices: tuple[int, ...] | None = None
         v3_trace_collector: dict[int, TTTBoundedTrace] = {}
@@ -3965,7 +3991,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 stream_v3 = bool(
                     v3_streaming_backward is not None
                     and v3_reference_batch is not None
-                    and v3_pair_normalizers is not None
+                    and v3_pair_normalizers_local is not None
                 )
 
                 def _stream_qh2l(loss: Tensor, retain_graph: bool) -> None:
@@ -3984,7 +4010,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                             final_hidden_collector=v3_final_hidden_collector,
                             trace_indices=v3_trace_indices,
                             reference_batch=v3_reference_batch,
-                            normalizers=v3_pair_normalizers,
+                            normalizers=v3_pair_normalizers_local,
                             normalization_floor=effect_normalization_floor,
                             stream_backward=_stream_qh2l if stream_v3 else None,
                             stream_weight=1.0,
@@ -4006,7 +4032,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                             v3_pair_labels,
                             trace_collector=v3_trace_collector,
                             reference_batch=v3_reference_batch,
-                            normalizers=v3_pair_normalizers,
+                            normalizers=v3_pair_normalizers_local,
                             normalization_floor=effect_normalization_floor,
                             stream_backward=_stream_cmd if stream_v3 else None,
                             stream_weight=1.0,

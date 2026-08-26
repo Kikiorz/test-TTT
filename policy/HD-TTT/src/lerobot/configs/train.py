@@ -97,6 +97,12 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # Number of independent sequence windows whose outer gradients are
+    # averaged before one optimizer update.  The default (1) is the historical
+    # one-window/one-step behavior.  Sequence-TTT training may opt in to a
+    # larger value when memory prevents increasing the per-device trajectory
+    # batch; fast states are still reset at every window boundary.
+    gradient_accumulation_steps: int = 1
     prefetch_factor: int = 4
     persistent_workers: bool = True
     steps: int = 100_000
@@ -133,6 +139,11 @@ class TrainPipelineConfig(HubMixin):
         return self.policy  # type: ignore[return-value]
 
     def validate(self) -> None:
+        if type(self.gradient_accumulation_steps) is not int or self.gradient_accumulation_steps < 1:
+            raise ValueError(
+                "gradient_accumulation_steps must be a positive integer, got "
+                f"{self.gradient_accumulation_steps!r}"
+            )
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         reward_model_path = parser.get_path_arg("reward_model")

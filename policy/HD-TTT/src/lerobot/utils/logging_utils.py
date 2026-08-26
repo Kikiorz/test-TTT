@@ -128,13 +128,23 @@ class MetricsTracker:
         else:
             raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
-    def step(self) -> None:
+    def step(self, *, sample_multiplier: int = 1) -> None:
         """
-        Updates metrics that depend on 'step' for one step.
+        Updates metrics that depend on 'step' for one optimizer update.
+
+        ``sample_multiplier`` records additional independent data windows
+        consumed by that update (for example explicit gradient accumulation),
+        while leaving the logical optimizer ``steps`` counter unchanged.  The
+        default preserves the historical behavior for ordinary trainers.
         """
+        if type(sample_multiplier) is not int or sample_multiplier < 1:
+            raise ValueError(
+                "sample_multiplier must be a positive integer, got "
+                f"{sample_multiplier!r}"
+            )
         self.steps += 1
         world_size = self.accelerator.num_processes if self.accelerator else 1
-        self.samples += self._batch_size * world_size
+        self.samples += self._batch_size * world_size * sample_multiplier
         self.episodes = self.samples / self._avg_samples_per_ep
         self.epochs = self.samples / self._num_frames
 

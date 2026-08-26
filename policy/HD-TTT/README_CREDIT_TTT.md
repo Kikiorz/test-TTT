@@ -360,11 +360,30 @@ otherwise duplicate many more demonstrations).  For `BATCH_SIZE>1` with the
 default `tbptt_loss_weighting=valid_actions`, the trainer therefore multiplies
 each rank's flow mean by `world_size * n_rank / n_global`, where `n_rank` is
 its valid action-slot count.  The explicit gradient mean then equals the
-global frame/slot-weighted flow objective.  V3 QH2L/CMD terms retain their
-complete-window, per-trajectory normalization and are not rescaled by this
-factor.  Historical `BATCH_SIZE=1`, non-equal-length, and legacy HD paths are
-unchanged.  This rank-weighting rule and the per-rank counts are part of the
-training provenance sidecar.
+global frame/slot-weighted flow objective.  Canonical V3 QH2L/CMD terms use a
+separate all-rank pair denominator (described below), so they are not rescaled
+by this flow factor.  Historical `BATCH_SIZE=1`, non-equal-length, and legacy
+HD paths are unchanged.  This rank-weighting rule and the per-rank counts are
+part of the training provenance sidecar.
+
+For canonical V3 batches, the three QH2L/CMD stratum denominators are
+all-reduced across DDP ranks before replay.  Each rank receives the global
+denominator divided by the world size; this exactly cancels the trainer's
+explicit gradient mean, yielding a global pair-weighted numerator/denominator
+for every stratum instead of an average of rank-local ratios.  The switch is
+`hd_v3_global_pair_normalization` (default `true`); single-process and B=1
+paths do not issue these collectives and retain their historical values.  A
+`false` value is only a named compatibility/ablation setting.
+
+When memory limits the per-device trajectory batch, the top-level
+`gradient_accumulation_steps` option (default `1`) averages gradients from that
+many independent windows before one optimizer/scheduler update.  Fast-weight
+and grounding states are reset at each window, while all TBPTT segments within
+one window retain their existing recurrent carry.  V3 replay callbacks receive
+the same `1/N` scale as the ordinary flow loss, so QH2L/CMD ratios and the
+writer/reader gradient split are unchanged.  DDP reduction, clipping,
+checkpoint, and evaluation cadence occur only on the final micro-window; the
+sidecar records the resulting effective batch.
 
 The four-card launcher can run two independent tasks on two cards each, or one
 task on all four cards.  Native (non-TTT) SmolVLA has no recurrent-state
