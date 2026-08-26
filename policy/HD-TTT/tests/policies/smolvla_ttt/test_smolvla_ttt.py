@@ -1648,6 +1648,35 @@ def test_trainer_v3_effect_floor_accepts_flattened_pair_labels() -> None:
     torch.testing.assert_close(floor, torch.tensor(2.0))
 
 
+def test_trainer_v3_effect_floor_prefers_pair_field_when_legacy_is_also_present() -> None:
+    """The declared V3 protocol wins over a migration-era legacy column."""
+
+    # The legacy slot-0 field would produce a floor of one; the V3 pair field
+    # has a deliberately different population and must produce two.
+    legacy = torch.ones(1, 4, 1, 2)
+    pair = torch.zeros(1, 4, 2, 2)
+    pair[:, :, 0, :] = 2.0
+    pair[:, :, 1, :] = 100.0
+    valid = torch.ones(1, 4, 2, dtype=torch.bool)
+    for protocol in ("credit_ttt_v3_query_effect", "credit_ttt_v3", "v3"):
+        config = SimpleNamespace(
+            action_feature=SimpleNamespace(shape=(2,)),
+            hd_attribution_protocol=protocol,
+        )
+
+        floor = _compute_hd_effect_normalization_floor(
+            {
+                "hd_teacher_effect": legacy,
+                "hd_v3_pair_effect": pair,
+                "hd_v3_pair_valid": valid,
+            },
+            sequence_shape=(1, 4),
+            policy_config=config,
+        )
+        assert floor is not None
+        torch.testing.assert_close(floor, torch.tensor(2.0))
+
+
 def test_action_effect_backpropagates_through_differentiable_ttt_writer() -> None:
     """The v2 meta-gradient keeps the raw value target in the inner update."""
 

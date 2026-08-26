@@ -1352,9 +1352,28 @@ def _compute_hd_effect_normalization_floor(
     """
 
     teacher_effect = batch.get("hd_teacher_effect")
-    pair_effect = teacher_effect is None and batch.get("hd_v3_pair_effect") is not None
+    pair_effect_field = batch.get("hd_v3_pair_effect")
+    # A correctly generated V3 artifact only needs the pair field, but a
+    # migration/merge step may temporarily carry both legacy and V3 columns.
+    # Let the declared protocol select the canonical population in that case:
+    # V3 must never silently fall back to the legacy slot-0 statistic, while
+    # callers without an explicit V3 protocol retain the historical field
+    # precedence and direct-helper behavior.
+    declared_protocol = str(getattr(policy_config, "hd_attribution_protocol", ""))
+    # ``SmolVLATTTConfig`` canonicalizes these aliases at construction time;
+    # accepting them here as well keeps the standalone trainer helper
+    # deterministic for lightweight callers/tests that use a namespace.
+    declared_v3 = declared_protocol in {
+        _HD_ATTRIBUTION_PROTOCOL_V3,
+        "credit_ttt_v3",
+        "v3",
+    }
+    pair_effect = bool(
+        pair_effect_field is not None
+        and (teacher_effect is None or declared_v3)
+    )
     if pair_effect:
-        teacher_effect = batch.get("hd_v3_pair_effect")
+        teacher_effect = pair_effect_field
     if teacher_effect is None:
         return None
     if not isinstance(teacher_effect, torch.Tensor) or teacher_effect.ndim == 0:
