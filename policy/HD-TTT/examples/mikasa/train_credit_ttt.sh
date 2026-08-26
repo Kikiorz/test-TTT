@@ -70,6 +70,9 @@ Useful overrides:
   NUM_PROCESSES=4 (use all four GPUs on the reference server),
   TEACHER_EPISODE_BATCH_SIZE=1 (legacy default; set >1 to right-pad cached
   feature episodes with a valid_mask for higher teacher-fit throughput),
+  CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE=4 (execution-only replay chunk; hardware
+  bound, every pair is still evaluated),
+  CREDIT_TTT_REPLAY_SAVE_ON_CPU=0 (execution-only host-offload switch),
   EQUAL_LENGTH_BATCHING=0 (opt-in; never pads time or mixes offset domains),
   TRAINING_METADATA_PATH=... (default: <student_output>/training_metadata.json),
   NATIVE_CHECKPOINT=..., CLEAN_CHECKPOINT=...
@@ -566,6 +569,7 @@ write_training_metadata() {
     "${TTT_HIDDEN_DIM}" \
     "${REGISTER_TOKENS}" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -629,6 +633,18 @@ payload = {
     "ttt_layer_indices": ttt_layers,
     "ttt_hidden_dim": int(ttt_hidden_dim),
     "register_tokens": int(register_tokens),
+    # Execution-only replay bounds are deliberately recorded separately from
+    # the scientific V3 hyperparameters.  The model reads these environment
+    # variables at replay time; preserving the raw values here makes a
+    # hardware-profiled run reproducible without implying a changed target.
+    "execution_bounds": {
+        "credit_ttt_replay_pair_chunk_size": os.environ.get(
+            "CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE", "default:4"
+        ),
+        "credit_ttt_replay_save_on_cpu": os.environ.get(
+            "CREDIT_TTT_REPLAY_SAVE_ON_CPU", "default:0"
+        ),
+    },
     "batching": batching,
 }
 output = Path(output_raw)
@@ -850,6 +866,7 @@ print_protocol() {
   echo "full-history window: sequence_length=${SEQUENCE_LENGTH} sequence_stride=${SEQUENCE_STRIDE} max_windows_per_episode=${MAX_WINDOWS_PER_EPISODE} history_warmup_length=${HISTORY_WARMUP_LENGTH}"
   echo "trajectory batch: per_device=${BATCH_SIZE} equal_length=${EQUAL_LENGTH_BATCHING} processes=${NUM_PROCESSES} accumulation=${GRADIENT_ACCUMULATION_STEPS} (no temporal padding; fast state resets per window)"
   echo "V3 DDP pair normalization: global_pair_weighted=${HD_V3_GLOBAL_PAIR_NORMALIZATION} (denominator all-reduced; B1/single-process unchanged)"
+  echo "execution-only replay bounds: pair_chunk=${CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE:-default:4} save_on_cpu=${CREDIT_TTT_REPLAY_SAVE_ON_CPU:-default:0}"
   echo "teacher fit: episode_batch_size=${TEACHER_EPISODE_BATCH_SIZE} (right-padded valid_mask; checkpoint execution provenance records this value)"
   echo "offset contract: episode-local origin; full window offset=0; TBPTT segment offset=window_offset+segment_start; reset at episode boundary"
   echo "stages: full-history teacher -> pair labels -> QH2L student; baseline commands are evaluation-only"
