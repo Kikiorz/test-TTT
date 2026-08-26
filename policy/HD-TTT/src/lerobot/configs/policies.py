@@ -220,18 +220,40 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        # HACK: Parse the original config to get the config subclass, so that we can
-        # apply cli overrides.
-        # This is very ugly, ideally we'd like to be able to do that natively with draccus
-        # something like --policy.path (in addition to --policy.type)
-        with draccus.config_type("json"):
-            orig_config = draccus.parse(cls, config_file, args=[])
-
         if config_file is None:
             raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
         with open(config_file) as f:
             config = json.load(f)
+
+        # HACK: Parse the original config to get the config subclass, so that
+        # we can apply cli overrides.  Older SmolVLA-TTT checkpoints may carry
+        # JSON null for fields that are non-nullable in the older draccus
+        # runtime (notably the two HD booleans).  Sanitize a private temporary
+        # copy before this *first* parse; normalizing only after parsing is too
+        # late on the benchmark's Python 3.11 environment, where draccus
+        # rejects ``null`` immediately.
+        # This is very ugly, ideally we'd like to be able to do that natively
+        # with draccus, something like --policy.path (in addition to
+        # --policy.type)
+        config_type = config.get("type")
+        orig_config_file = config_file
+        if config_type == "smolvla_ttt":
+            config_for_probe = dict(config)
+            for flag_name in ("hd_ttt_enabled", "hd_learned_write_gate"):
+                if config_for_probe.get(flag_name) is None:
+                    config_for_probe[flag_name] = False
+            if config_for_probe.get("hd_effect_weight") is None:
+                config_for_probe["hd_effect_weight"] = 0.0
+            if config_for_probe.get("hd_attribution_protocol") is None:
+                config_for_probe["hd_attribution_protocol"] = "legacy_raw_hinge_max"
+            if config_for_probe != config:
+                config = config_for_probe
+                with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as probe:
+                    json.dump(config_for_probe, probe)
+                    orig_config_file = probe.name
+        with draccus.config_type("json"):
+            orig_config = draccus.parse(cls, orig_config_file, args=[])
 
         config.pop("type")
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
