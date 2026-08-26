@@ -1606,6 +1606,170 @@ def _ddp_frame_weighted_flow_scale(
     return rank_scale, local_count, global_count
 
 
+def _ddp_reduce_gradients(
+    policy: torch.nn.Module,
+    accelerator: "Accelerator",
+) -> None:
+    """Synchronize sequence-policy gradients with a small number of collectives.
+
+    Sequence TTT deliberately calls the *unwrapped* policy so its recurrent
+    fast state can be carried across TBPTT segments.  Consequently Accelerate
+    cannot install DDP gradient hooks and the trainer has to reduce gradients
+    explicitly.  Reducing one tensor per parameter is prohibitively expensive
+    for SmolVLA (and becomes especially visible on four PCIe-connected GPUs),
+    so dense gradients are flattened per ``(device, dtype)`` group, reduced
+    once, and copied back to their individual ``.grad`` buffers.
+
+    The first collective preserves the conditional-branch contract used by the
+    old implementation: a parameter that is unused on one rank receives an
+    explicit zero there whenever another rank used it.  A second, tiny
+    presence vector identifies unusual sparse/layout-mismatched gradients; the
+    corresponding parameters take the compatibility per-parameter path on all
+    ranks, preventing collective-order divergence.  Ordinary dense models use
+    one all-reduce per dtype/device group instead of one per parameter.  The
+    function is only called for multi-process sequence training; the B=1 /
+    single-process path is therefore untouched.
+    """
+
+    if accelerator.num_processes <= 1:
+        return
+
+    trainable_parameters = [
+        parameter for parameter in policy.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        return
+
+    # Determine which parameters are used anywhere in the data-parallel
+    # group before constructing the flattened buffers.  ``accelerator.reduce``
+    # clones its input, so this remains a tiny O(number-of-parameters) tensor.
+    local_presence = torch.tensor(
+        [parameter.grad is not None for parameter in trainable_parameters],
+        dtype=torch.int32,
+        device=accelerator.device,
+    )
+    global_presence = accelerator.reduce(local_presence, reduction="sum")
+    if not isinstance(global_presence, torch.Tensor):
+        raise RuntimeError("Accelerator.reduce must return a tensor for gradient presence")
+    global_presence = global_presence.reshape(-1)
+    if global_presence.numel() != len(trainable_parameters):
+        raise RuntimeError(
+            "Gradient-presence reduction returned an unexpected shape: "
+            f"got {tuple(global_presence.shape)}, expected ({len(trainable_parameters)},)"
+        )
+    # Materialize the tiny control vectors once. Calling ``.item()`` inside
+    # the parameter loop would re-synchronize the CUDA stream for every
+    # parameter and erase the benefit of flattened gradient reduction.
+    global_presence_values = global_presence.detach().cpu().tolist()
+
+    # Dense flattening requires the same layout/device/dtype on every rank.
+    # Usually this is guaranteed by a deterministic model and autocast, but
+    # discover anomalous local gradients collectively so a sparse or cast
+    # branch cannot make ranks enter different numbers of all-reduces.
+    local_unsupported = torch.tensor(
+        [
+            int(
+                int(global_presence_values[index]) > 0
+                and (
+                    parameter.layout != torch.strided
+                    or (
+                        parameter.grad is not None
+                        and (
+                            parameter.grad.layout != torch.strided
+                            or parameter.grad.device != parameter.device
+                            or parameter.grad.dtype != parameter.dtype
+                        )
+                    )
+                )
+            )
+            for index, parameter in enumerate(trainable_parameters)
+        ],
+        dtype=torch.int32,
+        device=accelerator.device,
+    )
+    global_unsupported = accelerator.reduce(local_unsupported, reduction="sum")
+    if not isinstance(global_unsupported, torch.Tensor):
+        raise RuntimeError("Accelerator.reduce must return a tensor for gradient layouts")
+    global_unsupported = global_unsupported.reshape(-1)
+    if global_unsupported.numel() != len(trainable_parameters):
+        raise RuntimeError(
+            "Gradient-layout reduction returned an unexpected shape: "
+            f"got {tuple(global_unsupported.shape)}, expected ({len(trainable_parameters)},)"
+        )
+    global_unsupported_values = global_unsupported.detach().cpu().tolist()
+
+    dense_groups: dict[tuple[torch.device, torch.dtype], list[tuple[torch.nn.Parameter, torch.Tensor]]] = {}
+    fallback_parameters: list[torch.nn.Parameter] = []
+
+    for index, parameter in enumerate(trainable_parameters):
+        if int(global_presence_values[index]) <= 0:
+            # No rank produced a gradient, matching the historical behavior
+            # of leaving ``parameter.grad`` as ``None``.
+            continue
+        if int(global_unsupported_values[index]) > 0:
+            fallback_parameters.append(parameter)
+            continue
+        gradient = parameter.grad
+        if gradient is None:
+            gradient = torch.zeros_like(parameter)
+        # The collective layout check above should make this branch true on
+        # every rank. Keep a defensive fallback for unusual custom modules or
+        # test doubles that mutate a gradient between the two collectives.
+        if (
+            gradient.layout != torch.strided
+            or gradient.device != parameter.device
+            or gradient.dtype != parameter.dtype
+            or parameter.layout != torch.strided
+            or parameter.numel() == 0
+        ):
+            fallback_parameters.append(parameter)
+            continue
+        key = (parameter.device, parameter.dtype)
+        dense_groups.setdefault(key, []).append((parameter, gradient))
+
+    for entries in dense_groups.values():
+        parameters, gradients = zip(*entries, strict=True)
+        flat = torch._utils._flatten_dense_tensors(list(gradients))
+        reduced_flat = accelerator.reduce(flat, reduction="mean")
+        if not isinstance(reduced_flat, torch.Tensor) or reduced_flat.shape != flat.shape:
+            raise RuntimeError("Accelerator.reduce returned an invalid flattened gradient")
+        reduced_gradients = torch._utils._unflatten_dense_tensors(
+            reduced_flat, list(gradients)
+        )
+        for parameter, reduced_gradient in zip(parameters, reduced_gradients, strict=True):
+            if parameter.grad is None:
+                parameter.grad = torch.zeros_like(parameter)
+            parameter.grad.copy_(reduced_gradient)
+        # ``reduced_gradients`` are views into ``reduced_flat``; deleting both
+        # here avoids retaining a model-sized flat buffer until the optimizer
+        # step while leaving each parameter's own gradient in place.
+        del reduced_gradients, reduced_flat, flat
+
+    for parameter in fallback_parameters:
+        gradient = parameter.grad
+        if gradient is None:
+            gradient = torch.zeros_like(parameter)
+        if gradient.layout != torch.strided:
+            # Sparse gradients are uncommon for this policy, but densifying
+            # them keeps all ranks on the same dense collective contract when
+            # only one rank took a sparse branch.
+            gradient = gradient.to_dense()
+        if gradient.device != parameter.device or gradient.dtype != parameter.dtype:
+            gradient = gradient.to(device=parameter.device, dtype=parameter.dtype)
+        reduced_gradient = accelerator.reduce(gradient, reduction="mean")
+        if not isinstance(reduced_gradient, torch.Tensor):
+            raise RuntimeError("Accelerator.reduce returned an invalid fallback gradient")
+        if parameter.layout == torch.strided:
+            if parameter.grad is None or parameter.grad.layout != torch.strided:
+                parameter.grad = torch.zeros_like(parameter)
+            parameter.grad.copy_(reduced_gradient)
+        else:
+            # Preserve the only non-dense parameter layout supported by this
+            # compatibility branch; optimizer implementations that support it
+            # can consume the reduced sparse tensor directly.
+            parameter.grad = reduced_gradient
+
+
 def update_policy_tbptt(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -1964,30 +2128,11 @@ def update_policy_tbptt(
         num_segments += 1
 
     if accelerator.num_processes > 1:
-        trainable_parameters = [parameter for parameter in policy.parameters() if parameter.requires_grad]
-        gradient_presence = torch.tensor(
-            [parameter.grad is not None for parameter in trainable_parameters],
-            dtype=torch.int32,
-            device=accelerator.device,
-        )
-        gradient_presence = accelerator.reduce(gradient_presence, reduction="sum")
-        # HD replay and optional ablations contain genuinely conditional
-        # branches (for example an all-zero effect-valid window).  A parameter
-        # can therefore be unused on one rank while receiving a gradient on
-        # another rank.  Treat that as a sparse data-parallel gradient and
-        # contribute an explicit zero on the rank where autograd produced
-        # ``None``.  Raising here made an otherwise valid episode composition
-        # fail nondeterministically and, more importantly, turned a data-mask
-        # detail into a hidden hyperparameter constraint.
-        for parameter, presence_count in zip(trainable_parameters, gradient_presence.tolist(), strict=True):
-            if presence_count == 0:
-                continue
-            local_gradient = parameter.grad
-            if local_gradient is None:
-                local_gradient = torch.zeros_like(parameter)
-                parameter.grad = local_gradient
-            reduced_gradient = accelerator.reduce(local_gradient, reduction="mean")
-            parameter.grad.copy_(reduced_gradient)
+        # Sequence TTT calls the unwrapped policy, so synchronize all outer
+        # gradients explicitly.  The helper preserves conditional unused-
+        # parameter handling while flattening dense tensors to avoid one
+        # all-reduce per model parameter.
+        _ddp_reduce_gradients(policy, accelerator)
 
         total_loss = accelerator.reduce(total_loss, reduction="mean")
         loss_per_dim = accelerator.reduce(loss_per_dim, reduction="mean")
