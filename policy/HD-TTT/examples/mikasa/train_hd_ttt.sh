@@ -28,6 +28,11 @@ PRETRAINED_PATH="${PRETRAINED_PATH:-lerobot/smolvla_base}"
 LABEL_PATH="${LABEL_PATH:-}"
 EPOCHS="${EPOCHS:-150}"
 NUM_PROCESSES="${NUM_PROCESSES:-4}"
+# Keep the benchmark recipe on bf16 by default, but allow a reproducible
+# fp32/no-autocast diagnostic (and an explicit mixed-precision ablation)
+# without copying or hand-editing this launcher.  This is an execution
+# setting, not an HD-TTT algorithm parameter.
+MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-64}"
 SEQUENCE_STRIDE="${SEQUENCE_STRIDE:-64}"
 MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-4}"
@@ -231,6 +236,7 @@ STEPS_PER_EPOCH=$(( (WINDOWS + NUM_PROCESSES - 1) / NUM_PROCESSES ))
 STEPS=$(( STEPS_PER_EPOCH * EPOCHS ))
 
 echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, writer=${TTT_WRITER_MODE}, stable_inner_update=${TTT_STABLE_INNER_UPDATE}, attribution=${HD_ATTRIBUTION_PROTOCOL}, second_order=${TTT_SECOND_ORDER}, grounding_min_future=${HD_GROUNDING_MIN_FUTURE_FRAMES}, margin=${HD_COUNTERFACTUAL_MARGIN}, effect_weight=${HD_EFFECT_WEIGHT}, grounding_weight=${HD_GROUNDING_WEIGHT}"
+echo "mixed_precision=${MIXED_PRECISION}"
 
 COMMON_ARGS=(
   --dataset.repo_id="${DATASET_REPO_ID}"
@@ -298,7 +304,7 @@ LAUNCH=(
   "${ACCELERATE_BIN}" launch
   --num_machines=1
   --num_processes="${NUM_PROCESSES}"
-  --mixed_precision=bf16
+  --mixed_precision="${MIXED_PRECISION}"
   --dynamo_backend=no
 )
 if (( NUM_PROCESSES > 1 )); then
