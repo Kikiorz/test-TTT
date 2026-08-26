@@ -40,6 +40,7 @@ class _SelectedEpisodeDataset(_EpisodeDataset):
         super().__init__([3, 4, 2])
         self.episodes = [1, 2]
         self._length = 6
+        self.repo_id = "synthetic"
 
 
 def test_columnar_labels_attach_and_preserve_dataset_metadata(tmp_path) -> None:
@@ -113,6 +114,24 @@ def test_full_source_labels_are_reindexed_for_selected_episodes(tmp_path) -> Non
     dataset = _SelectedEpisodeDataset()
     path = tmp_path / "labels.pt"
     torch.save({"hd_rho": torch.arange(9, dtype=torch.float32)}, path)
+
+    labeled = HindsightLabelDataset(dataset, path)
+    assert [labeled[i]["hd_rho"].item() for i in range(6)] == [3, 4, 5, 6, 7, 8]
+
+
+def test_provenance_rich_superset_labels_are_reindexed_for_selected_episodes(tmp_path) -> None:
+    """V3 train views may reuse one artifact containing held-out episodes."""
+
+    dataset = _SelectedEpisodeDataset()
+    path = tmp_path / "labels_with_metadata.pt"
+    torch.save(
+        {
+            "hd_rho": torch.arange(9, dtype=torch.float32),
+            "global_index": torch.arange(9, dtype=torch.int64),
+            "metadata": {"dataset_repo_id": "synthetic"},
+        },
+        path,
+    )
 
     labeled = HindsightLabelDataset(dataset, path)
     assert [labeled[i]["hd_rho"].item() for i in range(6)] == [3, 4, 5, 6, 7, 8]

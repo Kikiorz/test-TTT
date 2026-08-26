@@ -223,6 +223,21 @@ class HindsightLabelDataset(Dataset):
             self.hd_teacher_writer_mode = str(
                 self.label_metadata.get("teacher_ttt_writer_mode") or "suffix"
             )
+        # A provenance-rich artifact is often generated once for all
+        # episodes and then consumed by a training view containing only the
+        # train split.  Such a view has a source-index map, while the label
+        # file legitimately contains additional validation rows.  Permit
+        # those extra rows to be skipped only when the artifact and dataset
+        # explicitly identify the same repository; anonymous/minimal test or
+        # malformed artifacts retain the old fail-closed behavior.
+        dataset_repo_id = getattr(dataset, "repo_id", None)
+        artifact_repo_id = self.label_metadata.get("dataset_repo_id")
+        self._allow_subset_extras = bool(
+            self._source_to_local
+            and artifact_repo_id is not None
+            and dataset_repo_id is not None
+            and str(artifact_repo_id) == str(dataset_repo_id)
+        )
         if isinstance(payload, Mapping) and "windows" in payload:
             # A structural window list is unambiguous evidence of the
             # window-local protocol.  Infer the flag for early artifacts that
@@ -545,11 +560,15 @@ class HindsightLabelDataset(Dataset):
             for offset in range(length)
         ]
 
-    def _resolve_index(self, mapping: Mapping[str, Any], fallback: int | None = None) -> int:
+    def _resolve_index(
+        self, mapping: Mapping[str, Any], fallback: int | None = None
+    ) -> int | None:
         raw_global_index = mapping.get("global_index")
         if raw_global_index is not None:
             source_index = _scalar_int(raw_global_index, name="global_index")
             if self._source_to_local and source_index not in self._source_to_local:
+                if self._allow_subset_extras:
+                    return None
                 raise ValueError(f"HD label global index {source_index} is not in the selected dataset episodes")
             index = self._source_to_local.get(source_index, source_index)
         else:
@@ -560,6 +579,8 @@ class HindsightLabelDataset(Dataset):
                 # still be a valid absolute source index from the artifact.
                 if not 0 <= index < len(self.dataset) and index in self._source_to_local:
                     index = self._source_to_local[index]
+                elif not 0 <= index < len(self.dataset) and self._allow_subset_extras:
+                    return None
             else:
                 raw_episode = _mapping_value(mapping, _EPISODE_KEYS)
                 raw_frame = _mapping_value(mapping, _FRAME_KEYS)
@@ -571,12 +592,16 @@ class HindsightLabelDataset(Dataset):
                     episode = _scalar_int(raw_episode, name="episode_index")
                     frame = _scalar_int(raw_frame, name="frame_index")
                     if episode not in self._episode_locations:
+                        if self._allow_subset_extras:
+                            return None
                         raise ValueError(f"HD label references unknown episode {episode}")
                     start, length = self._episode_locations[episode]
                     if frame < 0 or frame >= length:
                         raise ValueError(f"HD label frame {frame} is outside episode {episode} length {length}")
                     index = start + frame
         if index < 0 or index >= len(self.dataset):
+            if self._allow_subset_extras:
+                return None
             raise ValueError(f"HD label dataset index {index} is outside [0, {len(self.dataset)})")
         return index
 
@@ -799,6 +824,8 @@ class HindsightLabelDataset(Dataset):
             if not labels:
                 continue
             index = self._resolve_index(raw_record, fallback=position)
+            if index is None:
+                continue
             self._register(index, labels)
 
     def _ingest_episode_mapping(self, mapping: Mapping[Any, Any]) -> None:
@@ -868,7 +895,10 @@ class HindsightLabelDataset(Dataset):
                 labels = {
                     key: self._row_value(value, row, row_count) for key, value in columns.items()
                 }
-                self._register(self._resolve_index(row_metadata, fallback=row), labels)
+                index = self._resolve_index(row_metadata, fallback=row)
+                if index is None:
+                    continue
+                self._register(index, labels)
             return
 
         if row_count == len(self.dataset):
