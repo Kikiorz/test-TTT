@@ -141,7 +141,7 @@ x_{k+1} = x_k + dt * v_k
 
 每个物理 observation 的 callback 只在第一个 denoising step 传 `update=True`；后续 9 步读取同一个已更新的 fast state。下一个物理 observation 到来时才进行下一次写入。episode 结束时调用 `policy.reset()`，不得跨 episode 复用 state。
 
-训练的普通 `hd_phase_mode="random"` 使用随机 flow interpolation；正式 HD recipe 使用 `hd_phase_mode="deployment"`，让写入 interaction 与部署一致：$t=1$、输入是纯高斯 action noise，而不是 teacher-forced future action chunk。外层 flow loss 仍然用专家 action 作为 target，但 gate context 和 writer 的输入路径不读取它。
+训练的普通 `hd_phase_mode="random"` 使用随机 flow interpolation；正式 HD recipe 使用 `hd_phase_mode="deployment"`，让写入 interaction 与部署一致：$t=1$、输入是纯高斯 action noise，而不是 teacher-forced future action chunk。外层 flow loss 仍然用专家 action 作为 target；writer 仍读取当前 noisy-action tokens，但不会看到未来/专家 action，gate context 则完全不读取 action。
 
 ## 5. 三个 HD-TTT 组件
 
@@ -469,7 +469,7 @@ Shuffle-Long 必须使用自己的 dataset root 和 task id，不能与 Color �
 | Clean SmolVLA-TTT | `HD_ENABLED=false` | 测试 fast weights/register 本身 |
 | No-register | `REGISTER_TOKENS=0` | 测试显式 register 的贡献 |
 | HD-TTT | `HD_ENABLED=true`, `HD_LEARNED_GATE=true` | 完整方法 |
-| Fixed-label gate | `HD_LEARNED_GATE=false` | 测试直接 label gate 的旧/对照路径，不是部署方案 |
+| Direct label-gated training | `HD_LEARNED_GATE=false` | 训练期直接用 label gate 的旧/对照路径，不是部署方案 |
 | Reset memory | `--reset-memory-every-step` | 验证长程 memory 是否被真正使用 |
 | Exhaustive attribution | `HD_MAX_EVENTS=0` | 去除事件采样 compute budget |
 | No grounding | `HD_GROUNDING_WEIGHT=0` | 测试 reader grounding 的作用 |
