@@ -347,6 +347,18 @@ steps-per-sequence-epoch from this exact bucket arithmetic.  This mode is a
 method-neutral batching optimization, but the batch setting and any repeated
 sample count must still be recorded in the training manifest.
 
+The sampler's global stream may assign different length buckets to different
+ranks at one step (padding every bucket to a multiple of `world_size` would
+otherwise duplicate many more demonstrations).  For `BATCH_SIZE>1` with the
+default `tbptt_loss_weighting=valid_actions`, the trainer therefore multiplies
+each rank's flow mean by `world_size * n_rank / n_global`, where `n_rank` is
+its valid action-slot count.  The explicit gradient mean then equals the
+global frame/slot-weighted flow objective.  V3 QH2L/CMD terms retain their
+complete-window, per-trajectory normalization and are not rescaled by this
+factor.  Historical `BATCH_SIZE=1`, non-equal-length, and legacy HD paths are
+unchanged.  This rank-weighting rule and the per-rank counts are part of the
+training provenance sidecar.
+
 The four-card launcher can run two independent tasks on two cards each, or one
 task on all four cards.  Native (non-TTT) SmolVLA has no recurrent-state
 restriction and may use an ordinary batch of 4--8 per card.
@@ -360,12 +372,22 @@ benchmark envelope with
 `benchmark_credit_ttt_v3.py manifest --training-metadata-json <path>`; the
 metadata is hash-protected provenance and is never read by the optimizer.
 
-The V3 full-flow reference replay uses activation offloading to host RAM by
-default so the second-order graph fits on 32-GB cards.  On a separately
-profiled job with sufficient device headroom, setting
-`CREDIT_TTT_REPLAY_SAVE_ON_CPU=0` removes that transfer overhead.  It leaves
-the denoising steps, paired noise, gradients, and loss exactly unchanged; the
-trade-off is higher peak GPU memory.  Unknown values retain the safe default.
+The V3 full-flow reference replay is evaluated in a fixed, execution-only
+pair micro-batch (`CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE`, default `4`).  Every
+sampled event--future pair is still evaluated, and the differentiable before/
+after outputs are concatenated before the same complete-window loss is
+reduced; changing this bound therefore cannot change the method or its
+normalizers (apart from ordinary floating-point summation order).  Chunking
+prevents the checkpoint graph from scaling with `T*K` and is what makes the
+larger trajectory batch practical on 32-GB cards.  A value of `0` is reserved
+for an explicitly named unchunked diagnostic.
+
+`CREDIT_TTT_REPLAY_SAVE_ON_CPU=1` is an optional host-offload escape hatch for
+an independently profiled machine.  It is **off by default**: retaining the
+saved activations of every pair on the host can exceed a container's RAM cap
+even when the GPU has room.  With the canonical chunked path, leaving this
+variable unset (or setting it to `0`) keeps each replay checkpoint on the GPU;
+the denoising steps, paired noise, gradients, and loss remain unchanged.
 
 For the published four-task benchmark, each task is a separate training run
 with its own native initialization, normalization statistics, teacher, labels,

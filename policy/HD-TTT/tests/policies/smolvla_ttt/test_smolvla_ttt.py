@@ -28,7 +28,9 @@ from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import (
     SmolVLATTTFlowMatching,
     SmolVLATTTPolicy,
     _CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV,
+    _CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_ENV,
     _credit_ttt_replay_save_on_cpu_enabled,
+    _credit_ttt_replay_pair_chunk_size,
     _hd_loss_balance_metrics,
     _hd_ttt_parameter_range_metrics,
     _restore_checkpoint_model_fields,
@@ -108,10 +110,10 @@ def test_stable_inner_update_flag_is_serialized_and_defaults_off(tmp_path: Path)
 def test_v3_replay_save_on_cpu_toggle_defaults_safe_and_parses_explicit_opt_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The replay memory guard stays on unless a launcher opts out explicitly."""
+    """Chunked replay keeps host offload opt-in and parses explicit values."""
 
     monkeypatch.delenv(_CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV, raising=False)
-    assert _credit_ttt_replay_save_on_cpu_enabled() is True
+    assert _credit_ttt_replay_save_on_cpu_enabled() is False
 
     for value in ("0", "false", "OFF", "no"):
         monkeypatch.setenv(_CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV, value)
@@ -120,6 +122,16 @@ def test_v3_replay_save_on_cpu_toggle_defaults_safe_and_parses_explicit_opt_out(
     for value in ("1", "true", "on", "unexpected"):
         monkeypatch.setenv(_CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV, value)
         assert _credit_ttt_replay_save_on_cpu_enabled() is True
+
+    monkeypatch.delenv(_CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_ENV, raising=False)
+    assert _credit_ttt_replay_pair_chunk_size(65) == 4
+    assert _credit_ttt_replay_pair_chunk_size(2) == 2
+    monkeypatch.setenv(_CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_ENV, "1")
+    assert _credit_ttt_replay_pair_chunk_size(65) == 1
+    monkeypatch.setenv(_CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_ENV, "0")
+    assert _credit_ttt_replay_pair_chunk_size(65) == 0
+    monkeypatch.setenv(_CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_ENV, "not-an-int")
+    assert _credit_ttt_replay_pair_chunk_size(65) == 4
 
 
 def test_hd_loss_balance_diagnostics_are_scale_explicit_and_zero_safe() -> None:

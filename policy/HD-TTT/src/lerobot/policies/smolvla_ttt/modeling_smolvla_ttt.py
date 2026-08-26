@@ -69,31 +69,64 @@ from .ttt import TTTBoundedTrace, TTTFastState, TTTMLPLayer, TTTStateTransition
 
 TTTFastStates = dict[int, TTTFastState]
 
-# The paired CreditTTT V3 replay is checkpointed with ``save_on_cpu`` by
-# default.  This keeps peak device memory bounded when a 10-step replay runs
-# alongside the second-order training graph, at the cost of moving saved
-# activations over the device/host boundary.  On a machine with enough device
-# headroom those transfers can dominate replay wall time, so allow an explicit
-# opt-out without changing the scientific default.  The value is intentionally
-# parsed at call time (rather than import time) so launchers/tests can set it
-# after importing this module.
+# The paired CreditTTT V3 replay is pair-chunked by default (see the helper
+# below), so checkpoint tensors stay bounded on the device.  Host offload is
+# retained as an explicit opt-in only: keeping one saved graph per pair on CPU
+# can exceed a container RAM cap.  The value is intentionally parsed at call
+# time (rather than import time) so launchers/tests can set it after importing
+# this module.
 _CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV = "CREDIT_TTT_REPLAY_SAVE_ON_CPU"
+# Full-flow CMD/QH2L replay is an auxiliary training computation.  Keep its
+# pair dimension small enough that checkpointed transformer activations never
+# scale with the number of sampled event--future pairs.  This is an execution
+# bound, not a loss/hyper-parameter: every pair is still evaluated and the
+# outputs are concatenated before the objective is reduced.  The value can be
+# overridden for a hardware profile, while the reproducible default is four
+# pairs per before/after replay.
+_CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_ENV = "CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE"
+_CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_DEFAULT = 4
 
 
 def _credit_ttt_replay_save_on_cpu_enabled() -> bool:
     """Return whether V3 replay checkpoint tensors should be moved to CPU.
 
-    ``CREDIT_TTT_REPLAY_SAVE_ON_CPU`` defaults to enabled.  Set it to one of
-    ``0``, ``false``, ``off``, or ``no`` only when the training job has enough
-    GPU memory for the replay graph; disabling the offload is an exact
-    recomputation optimization, but increases peak device memory.  Unknown
-    values intentionally retain the safe/default behavior.
+    ``CREDIT_TTT_REPLAY_SAVE_ON_CPU`` is an explicit escape hatch.  The
+    pair-chunked replay path keeps only a small, bounded checkpoint on the
+    device, so the default is now *off*: moving every chunk's saved tensors to
+    host RAM would retain one graph per pair and can hit a container RAM cap.
+    Set the variable to ``1`` (or another truthy value) only for a separately
+    profiled host-memory-rich run.  Unknown values intentionally retain the
+    default-off behavior.
     """
 
     value = os.environ.get(_CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV)
     if value is None:
-        return True
+        return False
     return value.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _credit_ttt_replay_pair_chunk_size(pair_count: int) -> int:
+    """Return the execution-only pair chunk bound for a replay call.
+
+    A non-positive explicit value disables chunking for diagnostic comparisons.
+    Invalid values fall back to the canonical bound instead of changing the
+    scientific objective or failing a long-running job because of a launcher
+    typo.
+    """
+
+    count = int(pair_count)
+    if count <= 0:
+        return 0
+    raw = os.environ.get(_CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_ENV)
+    if raw is None:
+        return min(count, _CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_DEFAULT)
+    try:
+        requested = int(raw.strip())
+    except (TypeError, ValueError):
+        return min(count, _CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_DEFAULT)
+    if requested <= 0:
+        return 0
+    return min(count, requested)
 
 
 def _coerce_sequence_offset(value: object | None) -> int:
@@ -1428,6 +1461,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         batch_indices: Tensor,
         detach_states: bool = False,
         return_actions: bool = False,
+        _pair_chunk_size: int | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Replay final slot-0 actions for arbitrary event/future pairs.
 
@@ -1466,6 +1500,46 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             == pair_count
         ):
             raise ValueError("CreditTTT cross-segment pair fields are misaligned")
+
+        # Keep the exact full-flow objective while bounding the largest
+        # checkpointed replay graph.  The old implementation assembled all
+        # before/after branches in one call; with K=5 this can mean O(T*K)
+        # transformer rows and either a host-RAM or device-memory spike.  Each
+        # recursive call below evaluates an identical deterministic replay for
+        # a disjoint pair slice.  We concatenate the differentiable outputs,
+        # so the caller still applies one loss/reduction over the complete
+        # sampled population and all gradients are preserved.  ``0`` is an
+        # explicit diagnostic escape hatch and disables this execution-only
+        # partitioning.
+        if _pair_chunk_size is None:
+            pair_chunk_size = _credit_ttt_replay_pair_chunk_size(pair_count)
+        else:
+            pair_chunk_size = int(_pair_chunk_size)
+        if pair_chunk_size < 0:
+            raise ValueError("_pair_chunk_size must be non-negative")
+        if pair_chunk_size > 0 and pair_count > pair_chunk_size:
+            before_parts: list[Tensor] = []
+            after_parts: list[Tensor] = []
+            for start in range(0, pair_count, pair_chunk_size):
+                stop = min(start + pair_chunk_size, pair_count)
+                chunk_result = self._v3_reference_student_effects(
+                    reference_batch=reference_batch,
+                    trace_collector=trace_collector,
+                    event_indices=event_indices[start:stop],
+                    event_indices_global=event_indices_global[start:stop],
+                    future_indices_global=future_indices_global[start:stop],
+                    batch_indices=batch_indices[start:stop],
+                    detach_states=detach_states,
+                    return_actions=True,
+                    _pair_chunk_size=0,
+                )
+                if not isinstance(chunk_result, tuple) or len(chunk_result) != 2:
+                    raise RuntimeError("CreditTTT replay chunk did not return paired actions")
+                before_parts.append(chunk_result[0])
+                after_parts.append(chunk_result[1])
+            before = torch.cat(before_parts, dim=0)
+            after = torch.cat(after_parts, dim=0)
+            return (before, after) if return_actions else after - before
 
         reference_shape = self._v3_reference_sequence_shape(reference_batch)
         reference_offset = _coerce_sequence_offset(reference_batch.get(SEQUENCE_OFFSET_KEY))
