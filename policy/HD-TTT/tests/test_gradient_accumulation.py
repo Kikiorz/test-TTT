@@ -333,3 +333,23 @@ def test_metrics_tracker_sample_multiplier_preserves_optimizer_step_count() -> N
     assert tracker.steps == 1
     assert tracker.samples == 4
     assert tracker.epochs == pytest.approx(0.5)
+
+
+def test_metrics_tracker_initial_samples_include_accumulation_on_resume() -> None:
+    accelerator = _CPUAccelerator()
+    tracker = MetricsTracker(
+        batch_size=2,
+        num_frames=16,
+        num_episodes=4,
+        metrics={"loss": AverageMeter("loss")},
+        initial_step=3,
+        accelerator=accelerator,
+        sample_multiplier=4,
+    )
+    # Three logical updates had consumed 3*2*4 independent windows before the
+    # checkpoint; the next update adds another four windows without changing
+    # the logical step counter semantics.
+    assert tracker.samples == 24
+    tracker.step(sample_multiplier=4)
+    assert tracker.steps == 4
+    assert tracker.samples == 32

@@ -96,7 +96,13 @@ class MetricsTracker:
         metrics: dict[str, AverageMeter],
         initial_step: int = 0,
         accelerator: Callable | None = None,
+        sample_multiplier: int = 1,
     ):
+        if type(sample_multiplier) is not int or sample_multiplier < 1:
+            raise ValueError(
+                "sample_multiplier must be a positive integer, got "
+                f"{sample_multiplier!r}"
+            )
         self.__dict__.update(dict.fromkeys(self.__keys__))
         self._batch_size = batch_size
         self._num_frames = num_frames
@@ -107,7 +113,10 @@ class MetricsTracker:
         world_size = accelerator.num_processes if accelerator else 1
         # A sample is an (observation,action) pair, where observation and action
         # can be on multiple timestamps. In a batch, we have `batch_size` number of samples.
-        self.samples = self.steps * self._batch_size * world_size
+        # ``sample_multiplier`` keeps resumed runs' epoch/sample counters
+        # consistent with fresh runs that use explicit sequence-window
+        # accumulation.  The default is one, preserving the historical API.
+        self.samples = self.steps * self._batch_size * world_size * sample_multiplier
         self.episodes = self.samples / self._avg_samples_per_ep
         self.epochs = self.samples / self._num_frames
         self.accelerator = accelerator

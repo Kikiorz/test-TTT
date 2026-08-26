@@ -2952,6 +2952,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         train_metrics,
         initial_step=step,
         accelerator=accelerator,
+        sample_multiplier=gradient_accumulation_steps,
     )
 
     if is_main_process:
