@@ -1963,7 +1963,13 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # below. Clear once before all of them so the finite marker covers the
         # complete outer update, while the trainer can fail before backward or
         # optimizer.step if any branch encountered a malformed value.
-        self.model.clear_ttt_diagnostics()
+        # Keep the policy API compatible with lightweight/legacy model
+        # adapters that predate the optional finite-diagnostic hook.  The
+        # production SmolVLA-TTT flow model implements this method; a missing
+        # hook simply means there is no marker to clear for that adapter.
+        clear_ttt_diagnostics = getattr(self.model, "clear_ttt_diagnostics", None)
+        if clear_ttt_diagnostics is not None:
+            clear_ttt_diagnostics()
 
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
