@@ -23,11 +23,19 @@ from .hd_ttt import (
 )
 from .modeling_smolvla_ttt import SmolVLATTTPolicy
 from .processor_smolvla_ttt import make_smolvla_ttt_pre_post_processors
-from .sequence import SEQUENCE_SHAPE_KEY, TailPreservingSequenceDataset, sequence_collate_fn
+from .sequence import (
+    HD_ACTION_SLOT_VALID_KEY,
+    HD_WRITER_VALID_KEY,
+    SEQUENCE_SHAPE_KEY,
+    TailPreservingSequenceDataset,
+    sequence_collate_fn,
+)
 from .ttt import TTTFastState, TTTMLPLayer
 
 __all__ = [
     "SEQUENCE_SHAPE_KEY",
+    "HD_ACTION_SLOT_VALID_KEY",
+    "HD_WRITER_VALID_KEY",
     "SmolVLATTTConfig",
     "SmolVLATTTPolicy",
     "HindsightAttribution",

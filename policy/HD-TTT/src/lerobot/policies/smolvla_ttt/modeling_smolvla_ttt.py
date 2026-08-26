@@ -47,7 +47,7 @@ from ..utils import (
 )
 from .configuration_smolvla_ttt import SmolVLATTTConfig
 from .hd_ttt import counterfactual_grounding_loss, local_kvb_loss
-from .sequence import HD_WRITER_VALID_KEY, SEQUENCE_SHAPE_KEY
+from .sequence import HD_ACTION_SLOT_VALID_KEY, HD_WRITER_VALID_KEY, SEQUENCE_SHAPE_KEY
 from .smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
 from .ttt import TTTFastState, TTTMLPLayer
 
@@ -795,6 +795,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         *,
         device: torch.device,
         dtype: torch.dtype,
+        field_name: str = "action_is_pad",
     ) -> Tensor | None:
         """Return ``[B,T,S]`` validity for action-chunk slots.
 
@@ -806,14 +807,28 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         physical frame.
         """
 
-        action_is_pad = batch.get("action_is_pad")
-        if action_is_pad is None:
+        action_mask = batch.get(field_name)
+        if action_mask is None:
             return None
-        pad = SmolVLATTTPolicy._reshape_hd_field(
-            action_is_pad,
+        mask = SmolVLATTTPolicy._reshape_hd_field(
+            action_mask,
             sequence_shape,
-            name="action_is_pad",
+            name=field_name,
         ).to(device=device)
+        if field_name == HD_ACTION_SLOT_VALID_KEY:
+            # The sequence dataset stores validity (not padding) under this
+            # key.  Reduce any retained action-feature axes conservatively so
+            # a slot is valid only when all feature flags are valid.
+            valid = mask.bool()
+            while valid.ndim > 3:
+                if valid.shape[-1] == 1:
+                    valid = valid.squeeze(-1)
+                else:
+                    valid = valid.all(dim=-1)
+            if valid.ndim == 2:
+                valid = valid.unsqueeze(-1)
+            return valid.to(dtype=dtype)
+        pad = mask
         while pad.ndim > 3:
             if pad.shape[-1] == 1:
                 pad = pad.squeeze(-1)
@@ -913,6 +928,33 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         return SmolVLATTTPolicy._hd_weighted_mean(per_step, step_weights)
 
     @staticmethod
+    def _hd_grounding_rho_weight(
+        rho: Tensor | None,
+        sequence_shape: tuple[int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Return episode-normalized grounding weights without segment renormalization.
+
+        ``hd_rho`` is normalized once by the offline episode label builder.
+        TBPTT segments must preserve those absolute values; normalizing by a
+        segment-local maximum would make the same interaction receive a
+        different grounding target solely because its segment was truncated.
+        """
+
+        weight = SmolVLATTTPolicy._hd_step_weight(
+            rho,
+            sequence_shape,
+            device=device,
+            dtype=dtype,
+            name="hd_rho",
+        )
+        if weight is None:
+            return torch.ones(sequence_shape, device=device, dtype=dtype)
+        return weight.clamp(0, 1)
+
+    @staticmethod
     def _clone_fast_states(
         fast_states: TTTFastStates | None,
         *,
@@ -979,6 +1021,22 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             dtype=student_velocity.dtype,
             fallback=valid_steps,
         )
+        # ``TailPreservingSequenceDataset`` preserves the pre-warm-up action
+        # slot mask under this auxiliary key.  Use its fractional validity for
+        # the local writer objective so terminal rows with repeated/padded
+        # future actions do not dominate H2L, while history warm-up rows stay
+        # trainable through ``writer_valid_steps``.
+        writer_slot_valid_steps: Tensor | None = None
+        if HD_ACTION_SLOT_VALID_KEY in batch:
+            preserved_slots = self._hd_action_slot_valid_weight(
+                batch,
+                sequence_shape,
+                device=student_velocity.device,
+                dtype=student_velocity.dtype,
+                field_name=HD_ACTION_SLOT_VALID_KEY,
+            )
+            if preserved_slots is not None:
+                writer_slot_valid_steps = preserved_slots.mean(dim=-1)
 
         teacher_velocity = self._reshape_hd_field(
             batch.get("hd_teacher_velocity"), sequence_shape, name="hd_teacher_velocity"
@@ -1073,9 +1131,19 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     if local_gate is None
                     else local_gate * writer_valid_steps
                 )
+            if writer_slot_valid_steps is not None:
+                local_gate = (
+                    writer_slot_valid_steps
+                    if local_gate is None
+                    else local_gate * writer_slot_valid_steps
+                )
             kvb = self._hd_weighted_mean(local_loss, local_gate)
             total = total + h2l_weight * kvb
             metrics["hd_h2l"] = float(kvb.detach().item())
+            if writer_slot_valid_steps is not None:
+                metrics["hd_h2l_slot_valid_fraction"] = float(
+                    writer_slot_valid_steps.detach().mean().item()
+                )
         else:
             # Backward-compatible fallback for old checkpoints/collectors that
             # explicitly stored projected local K/V tensors.  New HD training
@@ -1114,9 +1182,19 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                         if local_gate is None
                         else local_gate * writer_valid_steps
                     )
+                if writer_slot_valid_steps is not None:
+                    local_gate = (
+                        writer_slot_valid_steps
+                        if local_gate is None
+                        else local_gate * writer_slot_valid_steps
+                    )
                 kvb = local_kvb_loss(local_query, local_key, local_value, local_prediction, local_gate)
                 total = total + h2l_weight * kvb
                 metrics["hd_h2l"] = float(kvb.detach().item())
+                if writer_slot_valid_steps is not None:
+                    metrics["hd_h2l_slot_valid_fraction"] = float(
+                        writer_slot_valid_steps.detach().mean().item()
+                    )
 
         # Hindsight ``u_i`` is available only offline.  Distill it into the
         # causal gate predicted from the current interaction so deployment
@@ -1278,22 +1356,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 student_wrong_active = wrong_student_velocity[..., :active_dim]
                 teacher_true_active = teacher_true[..., :active_dim]
                 teacher_wrong_active = teacher_wrong[..., :active_dim]
-                rho_weight = self._hd_step_weight(
+                rho_weight = self._hd_grounding_rho_weight(
                     rho,
                     (B, T),
                     device=student_velocity.device,
                     dtype=student_velocity.dtype,
-                    name="hd_rho",
                 )
-                if rho_weight is None:
-                    rho_weight = student_velocity.new_ones((B, T))
-                else:
-                    # ``rho`` may be a raw column sum of C rather than a
-                    # pre-normalized dependency label.  Grounding interprets
-                    # it as a mixture coefficient in [0,1], so normalize per
-                    # sequence before the tensor utility clamps/broadcasts it.
-                    rho_max = rho_weight.amax(dim=-1, keepdim=True)
-                    rho_weight = rho_weight / rho_max.clamp_min(1e-8)
                 grounding_parts = counterfactual_grounding_loss(
                     student_true_active,
                     student_wrong_active,

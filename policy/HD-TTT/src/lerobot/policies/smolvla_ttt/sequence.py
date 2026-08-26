@@ -29,6 +29,10 @@ SEQUENCE_SHAPE_KEY = "_lerobot_sequence_shape"
 # still must train the local K/V objective.  Window-local counterfactual gate
 # supervision is masked separately through ``hd_write_gate_observed``.
 HD_WRITER_VALID_KEY = "hd_writer_valid"
+# Preserve action-chunk validity before warm-up rows are masked with
+# ``action_is_pad=True``.  The HD local writer objective still trains on
+# history interactions, but should not learn from repeated terminal slots.
+HD_ACTION_SLOT_VALID_KEY = "hd_action_slot_valid"
 
 
 def _selected_episode_lengths(dataset: Dataset) -> list[int]:
@@ -194,6 +198,18 @@ class TailPreservingSequenceDataset(Dataset):
         samples: list[dict[str, Any]] = []
         for absolute_index in range(history_start, start_index + window_length):
             sample = dict(self.dataset[absolute_index])
+            # Save the physical action-slot mask before the warm-up convention
+            # below replaces ``action_is_pad`` with all-true values.  This
+            # auxiliary mask is consumed only by the HD local writer loss;
+            # ordinary imitation losses continue to use ``action_is_pad``.
+            original_action_slot_valid = None
+            original_action_is_pad = sample.get("action_is_pad")
+            if isinstance(original_action_is_pad, torch.Tensor):
+                original_action_slot_valid = (~original_action_is_pad.bool()).clone()
+            elif ACTION in sample and isinstance(sample[ACTION], torch.Tensor):
+                original_action_slot_valid = torch.ones(
+                    sample[ACTION].shape[:-1], dtype=torch.bool
+                )
             # Hindsight labels are complementary data and are present only in
             # an HD run.  Mark every physical frame carrying them as a valid
             # writer interaction, including the history prefix below.  The
@@ -242,6 +258,18 @@ class TailPreservingSequenceDataset(Dataset):
                 overlay = window_labels.get(absolute_index)
                 if overlay is not None:
                     sample.update(overlay)
+            # Apply the preserved mask after window overlays so frame-level and
+            # window-keyed artifacts share the same writer contract.  Do not
+            # add it to ordinary datasets: the model uses the presence of
+            # ``hd_*`` fields to detect an offline label replay.
+            has_hd_labels = any(
+                isinstance(key, str)
+                and key.startswith("hd_")
+                and key not in {HD_WRITER_VALID_KEY, HD_ACTION_SLOT_VALID_KEY}
+                for key in sample
+            )
+            if has_hd_labels and original_action_slot_valid is not None:
+                sample[HD_ACTION_SLOT_VALID_KEY] = original_action_slot_valid
             samples.append(sample)
         return samples
 

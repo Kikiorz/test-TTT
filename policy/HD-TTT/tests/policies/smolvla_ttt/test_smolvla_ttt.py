@@ -20,7 +20,11 @@ from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import (
     _restore_checkpoint_model_fields,
     _validate_checkpoint_keys,
 )
-from lerobot.policies.smolvla_ttt.sequence import HD_WRITER_VALID_KEY, TailPreservingSequenceDataset
+from lerobot.policies.smolvla_ttt.sequence import (
+    HD_ACTION_SLOT_VALID_KEY,
+    HD_WRITER_VALID_KEY,
+    TailPreservingSequenceDataset,
+)
 from lerobot.policies.smolvla_ttt.smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
 from lerobot.policies.smolvla_ttt.ttt import TTTMLPLayer
 from lerobot.scripts.lerobot_train import _tbptt_segment_loss_weights
@@ -171,6 +175,36 @@ def test_history_warmup_masks_prefix_but_keeps_it_in_the_recurrent_window() -> N
     assert all(bool(samples[index]["action_is_pad"].all()) for index in range(3))
     assert all(not bool(samples[index]["action_is_pad"].any()) for index in range(3, 7))
     assert all(bool(sample[HD_WRITER_VALID_KEY]) for sample in samples)
+    # The original action validity survives the warm-up masking and is used
+    # only for the local HD writer objective.
+    assert all(bool(sample[HD_ACTION_SLOT_VALID_KEY].all()) for sample in samples)
+
+
+def test_history_warmup_preserves_terminal_action_slot_padding_for_h2l() -> None:
+    class _TerminalActionDataset(_EpisodeDataset):
+        def __getitem__(self, index: int) -> dict[str, torch.Tensor | int]:
+            return {
+                "frame_index": index,
+                "action": torch.zeros(3, 2),
+                "action_is_pad": torch.tensor(
+                    [False, False, False] if index < 7 else [True, True, True]
+                ),
+                "hd_write_gate": torch.tensor(1.0),
+            }
+
+    sequences = TailPreservingSequenceDataset(
+        _TerminalActionDataset([8]),
+        sequence_length=4,
+        sequence_stride=4,
+        history_warmup_length=2,
+    )
+    samples = sequences[1]
+    # The first two rows are warm-up rows and therefore expose an all-padded
+    # imitation target, but the preserved field still records their physical
+    # action validity.  The terminal row remains invalid for the H2L writer.
+    assert all(bool(sample[HD_ACTION_SLOT_VALID_KEY].all()) for sample in samples[:-1])
+    assert not bool(samples[-1][HD_ACTION_SLOT_VALID_KEY].any())
+    assert all(bool(samples[index]["action_is_pad"].all()) for index in range(2))
 
 
 def test_none_history_warmup_replays_from_episode_start() -> None:
@@ -1010,6 +1044,29 @@ def test_grounding_slot_reduction_does_not_square_terminal_padding_weight() -> N
     )
 
     torch.testing.assert_close(reduced, torch.tensor(1.5))
+
+
+def test_grounding_rho_preserves_episode_scale_across_tbptt_segments() -> None:
+    # ``hd_rho`` is normalized once over the complete episode.  Splitting it
+    # for TBPTT must not renormalize each segment independently: the first
+    # segment's maximum remains .4 instead of being promoted to 1.0.
+    rho = torch.tensor([[0.2, 0.4, 0.8, 1.2]], dtype=torch.float32)
+    first = SmolVLATTTPolicy._hd_grounding_rho_weight(
+        rho[:, :2],
+        (1, 2),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    second = SmolVLATTTPolicy._hd_grounding_rho_weight(
+        rho[:, 2:],
+        (1, 2),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(first, torch.tensor([[0.2, 0.4]]))
+    torch.testing.assert_close(second, torch.tensor([[0.8, 1.0]]))
+    assert first[0, 0].item() / first[0, 1].item() == pytest.approx(0.5)
 
 
 def test_tbptt_writer_mask_keeps_history_only_segment_trainable() -> None:
