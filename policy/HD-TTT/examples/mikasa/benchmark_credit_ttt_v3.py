@@ -872,6 +872,7 @@ def _require_published_four_per_task_checkpoints(
     methods: Sequence[Mapping[str, Any]],
     checkpoint_scope: Mapping[str, Any],
     *,
+    checkpoint_maps: Mapping[str, Any] | None = None,
     path: str = "manifest",
 ) -> None:
     """Enforce the one-model/one-task contract of the canonical profile.
@@ -904,6 +905,34 @@ def _require_published_four_per_task_checkpoints(
             "Supply the corresponding --*-checkpoints-json maps. "
             "Singular --*-checkpoint flags remain a shared-checkpoint fallback "
             "for legacy_two only."
+        )
+    if checkpoint_maps is None:
+        return
+
+    # ``scope=per_task`` is an explicit provenance declaration, but by itself
+    # it would still allow the same path to be listed four times.  At manifest
+    # freeze time we cannot inspect checkpoint contents, so require distinct
+    # normalized paths as a conservative one-model/one-task proxy.  The two
+    # native cadence entries may (and normally do) share the *corresponding*
+    # task path; this check is applied independently to each method.
+    duplicate_path_methods: list[str] = []
+    for method_id in method_ids:
+        mapping = checkpoint_maps.get(method_id)
+        if not isinstance(mapping, Mapping):
+            continue  # the scope/map shape validator reports the precise error
+        normalized_paths = {
+            os.path.normcase(os.path.normpath(os.path.expanduser(str(value).strip())))
+            for value in mapping.values()
+        }
+        if len(normalized_paths) != len(mapping):
+            duplicate_path_methods.append(method_id)
+    if duplicate_path_methods:
+        raise ValueError(
+            f"{path}: published_four per-task checkpoint maps must use distinct "
+            "checkpoint paths across task IDs (one model/checkpoint per task); "
+            f"duplicate paths found for: {sorted(duplicate_path_methods)}. "
+            "Native K=50 and K=1 may share each task's native path, but not a "
+            "single path across different tasks."
         )
 
 
@@ -1026,6 +1055,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         task_set,
         methods,
         checkpoint_scope,
+        checkpoint_maps=task_checkpoint_maps,
         path="manifest",
     )
     checkpoint_map = {
@@ -2311,6 +2341,7 @@ def _validate_checkpoint_manifest(manifest: Mapping[str, Any], *, path: Path | s
             task_set,
             methods,
             {},
+            checkpoint_maps={},
             path=path,
         )
         return
@@ -2352,6 +2383,7 @@ def _validate_checkpoint_manifest(manifest: Mapping[str, Any], *, path: Path | s
         task_set,
         methods,
         raw_scope,
+        checkpoint_maps=raw_maps,
         path=path,
     )
 

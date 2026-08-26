@@ -475,8 +475,11 @@ Use `--native-checkpoints-json`, `--clean-checkpoints-json`, and
 `--utility-checkpoints-json` when `--include-optional` is enabled).  The frozen
 manifest records `checkpoint_scope` and `checkpoints_by_task`; an incomplete
 or shared map is rejected instead of silently falling back to a different
-task's checkpoint.  To replay the historical shared-checkpoint envelope, pass
-`--task-set legacy_two`.
+task's checkpoint.  The canonical guard also rejects a map that repeats one
+path for multiple task IDs; the two native cadence entries may share each
+task's native path, but paths must differ across tasks.  (Checkpoint hashes
+remain the final provenance check once artifacts exist.)  To replay the
+historical shared-checkpoint envelope, pass `--task-set legacy_two`.
 
 All paths below are placeholders; replace them with real checkpoint and dataset
 paths.  The launcher never fabricates an evaluation JSON.

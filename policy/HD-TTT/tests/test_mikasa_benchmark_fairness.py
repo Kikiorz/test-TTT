@@ -129,6 +129,41 @@ def test_published_four_requires_per_task_checkpoint_maps(tmp_path: Path) -> Non
         benchmark.build_manifest(args)
 
 
+def test_published_four_rejects_reused_task_checkpoint_path(tmp_path: Path) -> None:
+    parser = benchmark._build_parser()
+    map_args = _published_checkpoint_map_args(tmp_path)
+    # Replace the clean map with one path repeated for every task.  An explicit
+    # map must not be enough to disguise a shared model as one-model/task.
+    clean_map = {
+        task["id"]: "/ckpt/clean/shared"
+        for task in benchmark.PUBLISHED_COMPARABLE_TASKS
+    }
+    clean_path = tmp_path / "clean_published.json"
+    clean_path.write_text(json.dumps(clean_map), encoding="utf-8")
+    clean_flag = map_args.index("--clean-checkpoints-json")
+    map_args[clean_flag + 1] = str(clean_path)
+    args = parser.parse_args(
+        [
+            "manifest",
+            "--output",
+            str(tmp_path / "published_manifest.json"),
+            "--repo-root",
+            str(tmp_path),
+            "--python-bin",
+            "python",
+            "--n-episodes",
+            "1",
+            "--train-seeds",
+            "1000",
+            "--task-set",
+            "published_four",
+            *map_args,
+        ]
+    )
+    with pytest.raises(ValueError, match="distinct checkpoint paths"):
+        benchmark.build_manifest(args)
+
+
 def test_published_profile_uses_all_official_demos(tmp_path: Path) -> None:
     """The canonical four-task recipe must not reserve an implicit 20% split."""
     for task in benchmark.PUBLISHED_COMPARABLE_TASKS:
