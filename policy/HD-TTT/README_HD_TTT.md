@@ -2,6 +2,15 @@
 
 本文档描述 `policy/HD-TTT` 中当前可运行的算法实现、训练协议和 MIKASA-Robo-VLA 实验方法。它是本项目的算法说明，不是对上游 LeRobot 或任何论文实现的逐字复现。
 
+> **当前实验状态（2026-08-26）**：V2 的 clean-prefix、V2 label、writer-connected
+> action-effect/second-order smoke 已经跑通；此前 4 卡报错已定位为 variable-length
+> TBPTT 在 DDP 中的 collective 顺序问题，并在 `58db6d4` 修复。正式的 Color/Shuffle
+> V2 长训练和官方 SR 仍在进行，本文档不会把旧版 v1 分数当作 V2 结果。
+
+如果只想快速了解 V2 的执行顺序和当前风险，可先看本文档末尾的
+[“V2 当前问题与验证状态”](#v2-当前问题与验证状态)；下面的定义和公式仍是完整的
+实现参考。
+
 ## 先看结论
 
 HD-TTT 在 SmolVLA 的 action expert 中加入可跨物理时刻保存的 TTT fast weights，并用成功示范的完整历史离线计算“某段过去是否影响未来控制”的信用，再把这个信用蒸馏为部署时可计算的局部写入/读取目标。论文主路径（v2）用与动作效果对齐的 true/wrong writer replay 训练 fast-weight 的写入内容；learned write gate 只保留为 legacy/no-effect 消融，不是 v2 的必要模块。这不是把未来信息带到部署端。
@@ -470,12 +479,13 @@ HD-v2 阶段在 clean prefix-writer checkpoint 上开启
 任务共享的预注册 protocol；做 ablation 时必须把改动写入 checkpoint config 和
 label metadata，不能只在命令行临时覆盖而不留 provenance。
 
-### 7.4 参数鲁棒性 protocol（论文报告要求）
+### 7.4 参数使用与跨任务复现（辅助审计，不是算法贡献）
 
 HD-TTT 并不是“去掉参数”的方法。`η`、residual gate、各辅助项的
-`λ`、事件块长度和 replay budget 都保留为可解释的底层参数；算法层面的贡献
-是因果事件删除、无量纲稳健信用和 writer/reader effect 对齐，而不是某个精确
-小数值。为避免把论文结果变成逐任务调参，采用下面的预注册规则：
+`λ`、事件块长度和 replay budget 都是可解释的底层参数，当然可以影响 SR；算法层面的
+贡献是因果事件删除、无量纲稳健信用和 writer/reader effect 对齐，而不是某个精确
+小数值。下面的规则只是帮助复现和排除逐任务过拟合，不把“参数不敏感”本身宣称为
+新的算法目标：
 
 1. Color 与 Shuffle-Long 共享同一份 v2 config；不按 task 选择不同的
    `λ`、gate 初始化或事件阈值。只允许 `sequence_length` 服从 episode 长度
@@ -491,7 +501,7 @@ HD-TTT 并不是“去掉参数”的方法。`η`、residual gate、各辅助�
    `(max-min)/|baseline|`。同时报告 `max-events=8` 相对 exhaustive 的事件
    召回率；这能区分 compute budget 变化与模型超参数敏感性。
 4. `prefix_only`↔`suffix`、v2↔legacy、effect weight=0、register=0 是
-   **结构性消融**，不应混在连续参数敏感性表里。所有结果使用同一个 checkpoint
+   **结构性消融**，不应混在连续参数审计表里。所有结果使用同一个 checkpoint
    provenance/label protocol，并给出失败或不稳定的设置，而不是只展示成功项。
 
 训练日志还记录 `hd_aux_to_flow_ratio` 与 `hd_aux_fraction`，以及选中 TTT 层的
@@ -710,6 +720,59 @@ rate。
 - reset-memory SR/return；
 - clean TTT、no-register、native SmolVLA 对照；
 - label selection mode、event budget、teacher SHA 和完整训练配置。
+
+## V2 当前问题与验证状态
+
+这一节专门区分“算法尚未证明的边界”和“已经修复的工程问题”，避免把一次运行
+失败误判成 V2 数学本身失效。
+
+### 已实现的 V2 闭环
+
+```text
+clean prefix-only teacher
+  → full/bounded causal replay
+  → robust z/-z event attribution (HCA)
+  → credit-weighted local K/V objective (H2L)
+  → writer-connected true/wrong slot-0 effect loss
+  → deployment-time causal fast-weight memory
+```
+
+单个物理时刻的实际顺序是：当前 observation prefix 写入一次 fast state；第一个
+denoising step 先 update 再 apply；后九个 denoising step 只读取同一个 state；执行
+slot 0 后进入下一物理时刻。部署侧没有 teacher、未来帧或专家动作。V2 主路径使用
+`prefix_only` writer、16 个 register、最后四个 action-expert 层和 `effect_branches=1`。
+
+### 当前已知问题
+
+| 状态 | 问题 | 解释和处理 |
+| --- | --- | --- |
+| 已修复（`58db6d4`） | DDP 各 rank 的 episode 长度不同，TBPTT segment 数不同 | 原先 rank 在不同 collective 位置调用 reduce，主进程会误报 “another distributed rank”。现在先同步最大 segment 数，短 rank 用 differentiable zero loss 参与 collective，且不推进 fast state。 |
+| 已验证 | clean prefix one-step、V2 label smoke、writer-connected effect/second-order one-step | 这些只证明张量/梯度路径 finite，不代表 benchmark success rate。 |
+| 已验证 | 修复后的 3-GPU fp32 variable-length DDP 1-step | 不同 Color episode 长度可安全混合；4-GPU bf16 仍需复验。 |
+| 待验证 | 4-GPU bf16 长训练的数值和吞吐 | `MIXED_PRECISION=bf16` 是默认；如失败先保留 rank/local-batch 日志，再与 `MIXED_PRECISION=no` 对照，不能静默吞掉 finite marker。 |
+| 协议边界 | Shuffle-Long 的 label teacher | Color teacher 不能用于 Shuffle 的科学标签；必须先在 Shuffle 自己的数据上训练 clean prefix teacher。现有单 episode Shuffle smoke 仅用于格式/计时检查。 |
+| 计算边界 | Shuffle episode 长度 145–513，full replay 很慢 | 采用预注册的 bounded `L=64, stride=64, context=128, K=4`，并明确 `history_mode=bounded_window_replay`，不能冒充 full-history。 |
+| 研究边界 | HCA 的监督对象 | 它是“删除 learned fast-weight event 后未来动作预测的退化”，不是任意历史 oracle 的真实 action value；论文应写成 control attribution under the clean teacher。 |
+| 研究边界 | effect 的覆盖范围 | 当前只消费 selected event 的 slot 0 / branch 0；全 50-slot 或多事件 effect 尚未实现，不能在论文中暗示已覆盖。 |
+| 需监控 | 长 episode 的 state drift | stable update 约束每一步而非整个 episode；记录 `ttt_state_rms_ratio_*`。如果 Shuffle 越界，应先报告并做独立机制实验，不在主结果中临时加入 decay。 |
+| 尚无结论 | 正式 Color/Shuffle V2 150-epoch 和官方 SR | 旧 v1 的 `.08/.12` 只属于旧协议，不能作为 V2 提升或失败的证据。 |
+
+### 为什么 DDP 报错不是 V2 NaN
+
+Color 的一个 DDP batch 可能同时包含 29-frame 和 15-frame window。旧 trainer 让前者
+执行 4 个 TBPTT segment，而后者只执行 2 个；短 rank 随后进入参数梯度 reduce，长 rank
+仍在执行 segment finite-guard reduce，collective 顺序因此错位。单卡各 episode 都是
+finite，且修复后 3 卡 fp32 日志中所有 rank 的 segment guard 均为 `local_bad=False`。
+这说明故障来自分布式控制流，而不是 HCA/H2L/effect 的损失公式。
+
+### 参数如何使用而不变成逐任务调参
+
+`inner_lr`、residual gate、各 loss weight、event block 和 replay budget 都是可解释
+的底层旋钮；它们可以影响 SR，但不是论文贡献。主实验对 Color 与 Shuffle 使用同一
+份 V2 配置和相同 update budget，只允许序列长度服从数据的容量约束。参数邻域实验
+只作为审计（例如独立 ±20% 扰动），不能从邻域结果挑一个最优值再回填主结果。真正
+需要单独成表的是结构性消融：no-register、suffix writer、no-effect、legacy HCA、
+reset-memory 和 exhaustive attribution。
 
 ## 11. 文件地图
 
