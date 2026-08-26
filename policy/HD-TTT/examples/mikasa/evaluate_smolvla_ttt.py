@@ -397,6 +397,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "action_chunk_size": policy.chunk_size,
             "model_action_horizon": int(policy.policy.config.chunk_size),
             "execution_action_steps": int(policy.policy.config.n_action_steps),
+            # TTT deliberately re-queries the policy after every physical
+            # action so its recurrent state advances once per observation.
+            # Keep this cadence explicit alongside the native evaluator's
+            # native_chunk/receding_horizon marker; the benchmark uses it to
+            # reject accidental K=50/K=1 comparisons.
+            "execution_cadence": "receding_horizon",
             "model": {
                 "checkpoint": str(args.checkpoint),
                 # Keep legacy/clean labels stable, but give the final method
@@ -422,6 +428,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "ttt_writer_mode": getattr(policy.policy.config, "ttt_writer_mode", None),
                 "ttt_second_order": bool(getattr(policy.policy.config, "ttt_second_order", False)),
+                "model_action_horizon": int(policy.policy.config.chunk_size),
+                "execution_action_steps": int(policy.policy.config.n_action_steps),
+                "execution_cadence": "receding_horizon",
                 "protocol_version": (
                     "creditttt_qh2l_v3"
                     if bool(getattr(policy.policy.config, "credit_ttt_enabled", False))

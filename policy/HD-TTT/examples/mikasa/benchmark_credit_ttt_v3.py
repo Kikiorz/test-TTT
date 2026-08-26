@@ -21,11 +21,13 @@ No subcommand launches a job unless ``run --execute`` is explicitly supplied.
 The default command is therefore safe to use while planning an experiment.
 
 The protocol intentionally uses functional method names rather than version
-labels.  ``CreditTTT`` is the proposed method; ``Native-SmolVLA`` and
-``Clean-TTT`` are the primary baselines.  A legacy result whose metadata says
-``HD-TTT`` (or an old v1/v2 protocol) is rejected when it is supplied as a
-CreditTTT result.  This prevents an old checkpoint from silently becoming a
-reported V3 result.
+labels.  ``CreditTTT`` is the proposed method; ``Clean-TTT`` and a native
+SmolVLA **K=1 receding-horizon control** are the cadence-matched baselines.
+The original Native-SmolVLA K=50 behavior is retained as a descriptive
+reference, but is never placed in the primary memory comparison.  A legacy
+result whose metadata says ``HD-TTT`` (or an old v1/v2 protocol) is rejected
+when it is supplied as a CreditTTT result.  This prevents both an old
+checkpoint and a cadence confound from silently becoming a reported V3 gain.
 
 The official MIKASA metric and seed convention are documented at
 https://mikasarobo.github.io/evaluation_protocol.html.  The script keeps the
@@ -84,6 +86,16 @@ CANONICAL_V3_PROTOCOL_IDENTITY: dict[str, Any] = {
 }
 CANONICAL_V3_PROTOCOL_FIELDS = tuple(CANONICAL_V3_PROTOCOL_IDENTITY)
 OFFICIAL_PROTOCOL = "MIKASA-Robo-VLA official runner"
+# The native SmolVLA model always predicts a 50-slot flow chunk.  The runner
+# may consume all 50 slots (the canonical native contract) or only slot 0 and
+# re-query at the next physical step (the cadence-matched control).  Keeping
+# these values explicit prevents a result's runner chunk from being confused
+# with the model's action horizon.
+NATIVE_MODEL_ACTION_HORIZON = 50
+NATIVE_CADENCE_CHUNK = "native_chunk"
+NATIVE_CADENCE_RECEDING = "receding_horizon"
+NATIVE_VARIANT_CHUNK = "native_smolvla"
+NATIVE_VARIANT_K1 = "native_smolvla_k1"
 DEFAULT_START_SEED = 4_242_424_242
 DEFAULT_EPISODES = 50
 DEFAULT_TORCH_SEED = 7_000
@@ -126,9 +138,30 @@ METHODS: tuple[dict[str, Any], ...] = (
     {
         "id": "native_smolvla",
         "label": "Native-SmolVLA",
-        "role": "primary_baseline",
+        "role": "cadence_reference_baseline",
         "evaluator": "examples/mikasa/evaluate_smolvla_baseline.py",
-        "expected_action_chunk_size": 50,
+        "expected_action_chunk_size": NATIVE_MODEL_ACTION_HORIZON,
+        "expected_model_action_horizon": NATIVE_MODEL_ACTION_HORIZON,
+        "expected_execution_action_steps": NATIVE_MODEL_ACTION_HORIZON,
+        "expected_execution_cadence": NATIVE_CADENCE_CHUNK,
+        "benchmark_variant": NATIVE_VARIANT_CHUNK,
+        "comparison_scope": "cadence_mismatched_reference",
+        "deployable": True,
+        "requires_v3_metadata": False,
+        "optional": False,
+        "replicate_policy": "fixed_checkpoint",
+    },
+    {
+        "id": "native_smolvla_k1",
+        "label": "Native-SmolVLA-K1",
+        "role": "matched_cadence_baseline",
+        "evaluator": "examples/mikasa/evaluate_smolvla_baseline.py",
+        "expected_action_chunk_size": 1,
+        "expected_model_action_horizon": NATIVE_MODEL_ACTION_HORIZON,
+        "expected_execution_action_steps": 1,
+        "expected_execution_cadence": NATIVE_CADENCE_RECEDING,
+        "benchmark_variant": NATIVE_VARIANT_K1,
+        "comparison_scope": "matched_cadence",
         "deployable": True,
         "requires_v3_metadata": False,
         "optional": False,
@@ -140,6 +173,10 @@ METHODS: tuple[dict[str, Any], ...] = (
         "role": "primary_baseline",
         "evaluator": "examples/mikasa/evaluate_smolvla_ttt.py",
         "expected_action_chunk_size": 1,
+        "expected_model_action_horizon": NATIVE_MODEL_ACTION_HORIZON,
+        "expected_execution_action_steps": 1,
+        "expected_execution_cadence": NATIVE_CADENCE_RECEDING,
+        "comparison_scope": "matched_cadence",
         "deployable": True,
         "requires_v3_metadata": False,
         "optional": False,
@@ -151,6 +188,10 @@ METHODS: tuple[dict[str, Any], ...] = (
         "role": "ours",
         "evaluator": "examples/mikasa/evaluate_smolvla_ttt.py",
         "expected_action_chunk_size": 1,
+        "expected_model_action_horizon": NATIVE_MODEL_ACTION_HORIZON,
+        "expected_execution_action_steps": 1,
+        "expected_execution_cadence": NATIVE_CADENCE_RECEDING,
+        "comparison_scope": "matched_cadence",
         "deployable": True,
         "requires_v3_metadata": True,
         "optional": False,
@@ -162,6 +203,10 @@ METHODS: tuple[dict[str, Any], ...] = (
         "role": "mechanism_baseline",
         "evaluator": "examples/mikasa/evaluate_smolvla_ttt.py",
         "expected_action_chunk_size": 1,
+        "expected_model_action_horizon": NATIVE_MODEL_ACTION_HORIZON,
+        "expected_execution_action_steps": 1,
+        "expected_execution_cadence": NATIVE_CADENCE_RECEDING,
+        "comparison_scope": "matched_cadence",
         "deployable": True,
         "requires_v3_metadata": False,
         "optional": True,
@@ -672,6 +717,13 @@ def _eval_command(
                 "--hd-v3-include-previous-action",
             ]
         )
+    elif method["id"] == NATIVE_VARIANT_K1:
+        # The native checkpoint still predicts its complete 50-slot chunk;
+        # only the runner consumption horizon changes.  This is the explicit
+        # cadence-matched control for Clean/Credit K=1 and must not be
+        # approximated by evaluating the canonical K=50 result and relabeling
+        # its metadata.
+        command.extend(["--execution-action-steps", "1"])
     return command
 
 
@@ -685,6 +737,9 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     methods = _method_specs(args.include_optional)
     checkpoint_map = {
         "native_smolvla": str(args.native_checkpoint),
+        # Same frozen native checkpoint as K=50; this map entry changes only
+        # runner cadence, not model weights or architecture.
+        NATIVE_VARIANT_K1: str(args.native_checkpoint),
         "clean_ttt": str(args.clean_checkpoint),
         "credit_ttt": str(args.credit_checkpoint),
     }
@@ -742,11 +797,34 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "that projection is reported only as an explicitly named ablation."
             ),
             "match_action_tail_unfreezing": True,
+            # K=1 is the only native comparison with the same observation /
+            # action cadence as Clean-TTT and CreditTTT.  K=50 remains useful
+            # as the original-policy reference, but it is not a fair primary
+            # memory comparison and is excluded from the primary pairwise
+            # confidence gates below.
+            "native_k1_control_required": True,
+            "native_k1_control": NATIVE_VARIANT_K1,
+            "native_k1_control_note": (
+                "Native-SmolVLA-K1 uses the identical frozen native checkpoint and "
+                "50-slot model horizon while the runner consumes one slot and "
+                "re-queries every physical step."
+            ),
+            # Backward-compatible spelling retained for consumers of earlier
+            # manifests.  Its value now means that the explicit K=1 control
+            # is required; the K=50 reference itself is not a matched control.
             "native_chunk_control_required": True,
             "native_chunk_control_note": (
-                "Native K=50 is the canonical baseline. Add a K=1 receding-horizon "
-                "native control before attributing gains to memory rather than observation cadence."
+                "Deprecated alias: satisfy this requirement with the native_k1_control; "
+                "Native K=50 is cadence-mismatched and exploratory only."
             ),
+            "native_k50_reference": NATIVE_VARIANT_CHUNK,
+            "native_k50_reference_note": (
+                "Native-SmolVLA K=50 is a cadence-mismatched behavioral reference; "
+                "never present CreditTTT-vs-K50 as the primary memory claim."
+            ),
+            "primary_comparison_scope": "matched_cadence_only",
+            "primary_baselines": ["clean_ttt", NATIVE_VARIANT_K1],
+            "exploratory_cadence_mismatched_baselines": [NATIVE_VARIANT_CHUNK],
             "persistent_reset_pair": True,
             "fixed_episode_seeds_across_methods": True,
         },
@@ -915,8 +993,22 @@ def _method_from_metadata(result: Mapping[str, Any], path: Path) -> tuple[str, s
         return "credit_ttt", protocol_text
     if normalized in {"hd-ttt", "hindsight-distilled-ttt", "v2", "v1"}:
         return "legacy_rejected", protocol_text
+    if normalized in {
+        "smolvla-k1",
+        "native-smolvla-k1",
+        "native-smolvla-receding",
+    }:
+        return NATIVE_VARIANT_K1, protocol_text
     if normalized in {"smolvla", "native-smolvla"}:
-        return "native_smolvla", protocol_text
+        # The baseline evaluator emits an explicit variant/cadence marker for
+        # both native modes.  Do not infer K=1 merely from a directory name or
+        # a truncated success vector: that would allow a K=50 result to be
+        # relabeled as the matched-cadence control.
+        variant = model.get("benchmark_variant") or result.get("benchmark_variant")
+        cadence = model.get("execution_cadence") or result.get("execution_cadence")
+        if variant == NATIVE_VARIANT_K1 or cadence == NATIVE_CADENCE_RECEDING:
+            return NATIVE_VARIANT_K1, protocol_text
+        return NATIVE_VARIANT_CHUNK, protocol_text
     if normalized in {"clean-ttt", "clean-ttt-kvb", "cleanttt"}:
         return "clean_ttt", protocol_text
     if normalized in {"utility-kvb", "utility-kvb-baseline"}:
@@ -949,6 +1041,10 @@ def _iter_result_records(payload: Any, path: Path) -> Iterable[dict[str, Any]]:
                 "protocol_id",
                 "protocol_version",
                 "credit_ttt_protocol",
+                "benchmark_variant",
+                "execution_cadence",
+                "execution_action_steps",
+                "model_action_horizon",
             )
             if key in payload
         }
@@ -967,6 +1063,30 @@ def _iter_result_records(payload: Any, path: Path) -> Iterable[dict[str, Any]]:
         return
     # A summary file has no per-episode vector and must never be aggregated.
     raise ValueError(f"{path}: expected an eval JSON with results[] or env_id+successes")
+
+
+def _coherent_result_field(
+    result: Mapping[str, Any],
+    model: Mapping[str, Any],
+    key: str,
+    *,
+    path: Path,
+) -> Any:
+    """Read a provenance field while rejecting contradictory envelope copies."""
+
+    values = [
+        container[key]
+        for container in (result, model)
+        if key in container and container[key] is not None
+    ]
+    if not values:
+        return None
+    first = values[0]
+    if any(value != first for value in values[1:]):
+        raise ValueError(
+            f"{path}: contradictory {key!r} values on result/model envelopes: {values!r}"
+        )
+    return first
 
 
 def _validate_eval_record(
@@ -1070,10 +1190,84 @@ def _validate_eval_record(
             f"{path}: missing action_chunk_size; cadence must be explicit for the "
             "Native-SmolVLA versus TTT comparison"
         )
-    if expected_method == "native_smolvla" and int(chunk) != 50:
-        raise ValueError(f"{path}: Native-SmolVLA must report canonical action_chunk_size=50, got {chunk}")
-    if expected_method in {"clean_ttt", "credit_ttt", "utility_kvb"} and int(chunk) != 1:
-        raise ValueError(f"{path}: TTT methods must report action_chunk_size=1, got {chunk}")
+    try:
+        chunk_int = int(chunk)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path}: action_chunk_size must be an integer, got {chunk!r}") from exc
+    if expected_method in {NATIVE_VARIANT_CHUNK, NATIVE_VARIANT_K1}:
+        # Native controls share the same 50-slot model prediction.  The
+        # result's action_chunk_size is the runner cadence and is therefore
+        # checked independently from model_action_horizon.
+        expected_spec = next(
+            (item for item in METHODS if item["id"] == expected_method),
+            {},
+        )
+        expected_chunk = int(expected_spec.get("expected_action_chunk_size", -1))
+        if chunk_int != expected_chunk:
+            raise ValueError(
+                f"{path}: {expected_method} must report action_chunk_size={expected_chunk}, "
+                f"got {chunk}"
+            )
+        if bool(model.get("ttt_enabled", False)) or str(model.get("policy_type", "")) != "smolvla":
+            raise ValueError(
+                f"{path}: {expected_method} must be an original SmolVLA model without TTT"
+            )
+        variant = _coherent_result_field(result, model, "benchmark_variant", path=path)
+        cadence = _coherent_result_field(result, model, "execution_cadence", path=path)
+        model_horizon = _coherent_result_field(
+            result, model, "model_action_horizon", path=path
+        )
+        execution_steps = _coherent_result_field(
+            result, model, "execution_action_steps", path=path
+        )
+        if variant != expected_spec.get("benchmark_variant"):
+            raise ValueError(
+                f"{path}: {expected_method} requires benchmark_variant="
+                f"{expected_spec.get('benchmark_variant')!r}, got {variant!r}"
+            )
+        if cadence != expected_spec.get("expected_execution_cadence"):
+            raise ValueError(
+                f"{path}: {expected_method} requires execution_cadence="
+                f"{expected_spec.get('expected_execution_cadence')!r}, got {cadence!r}"
+            )
+        if model_horizon is None or int(model_horizon) != NATIVE_MODEL_ACTION_HORIZON:
+            raise ValueError(
+                f"{path}: {expected_method} must report model_action_horizon="
+                f"{NATIVE_MODEL_ACTION_HORIZON}, got {model_horizon!r}"
+            )
+        if execution_steps is None or int(execution_steps) != int(
+            expected_spec.get("expected_execution_action_steps", expected_chunk)
+        ):
+            raise ValueError(
+                f"{path}: {expected_method} must report execution_action_steps="
+                f"{expected_spec.get('expected_execution_action_steps')!r}, got {execution_steps!r}"
+            )
+    if expected_method in {"clean_ttt", "credit_ttt", "utility_kvb"}:
+        if chunk_int != 1:
+            raise ValueError(f"{path}: TTT methods must report action_chunk_size=1, got {chunk}")
+        expected_ttt_horizon = NATIVE_MODEL_ACTION_HORIZON
+        model_horizon = _coherent_result_field(
+            result, model, "model_action_horizon", path=path
+        )
+        execution_steps = _coherent_result_field(
+            result, model, "execution_action_steps", path=path
+        )
+        cadence = _coherent_result_field(result, model, "execution_cadence", path=path)
+        if model_horizon is None or int(model_horizon) != expected_ttt_horizon:
+            raise ValueError(
+                f"{path}: {expected_method} must report model_action_horizon="
+                f"{expected_ttt_horizon}, got {model_horizon!r}"
+            )
+        if execution_steps is None or int(execution_steps) != 1:
+            raise ValueError(
+                f"{path}: {expected_method} must report execution_action_steps=1, "
+                f"got {execution_steps!r}"
+            )
+        if cadence != NATIVE_CADENCE_RECEDING:
+            raise ValueError(
+                f"{path}: {expected_method} must report execution_cadence="
+                f"{NATIVE_CADENCE_RECEDING!r}, got {cadence!r}"
+            )
     order = np.argsort(np.asarray(seeds_int, dtype=np.int64))
     return {
         "method_id": expected_method,
@@ -1377,12 +1571,20 @@ def aggregate_results(
                 "train_seeds": sorted(clusters),
             }
 
-    primary_baselines = ["native_smolvla", "clean_ttt", "utility_kvb"]
+    # Only cadence-matched baselines are eligible for the primary method
+    # claim.  Native K=50 is retained as a useful behavioral reference but is
+    # intentionally routed to a separate exploratory namespace so its action
+    # persistence/observation-frequency advantage cannot be mistaken for a
+    # memory gain.
+    primary_baselines = ["clean_ttt", NATIVE_VARIANT_K1, "utility_kvb"]
+    exploratory_baselines = [NATIVE_VARIANT_CHUNK]
     pairwise: dict[str, Any] = {}
+    pairwise_exploratory: dict[str, Any] = {}
     ours_runs = _clusters_for_method_task  # keep the local name readable below
-    for baseline in primary_baselines:
+
+    def _make_pairwise_entry(baseline: str, *, primary: bool) -> dict[str, Any] | None:
         if "credit_ttt" not in method_task or baseline not in method_task:
-            continue
+            return None
         per_task: dict[str, Any] = {}
         paired_by_task: dict[str, Mapping[str, tuple[np.ndarray, np.ndarray]]] = {}
         for task_id in tasks:
@@ -1404,18 +1606,62 @@ def aggregate_results(
                 "paired_train_seed_clusters": sorted(paired),
             }
             paired_by_task[task_id] = paired
-        if per_task:
-            macro, low, high, count = _macro_paired_ci(
-                paired_by_task,
-                n_bootstrap=n_bootstrap,
-                seed=seed + _stable_seed("credit_ttt", baseline, "macro"),
+        if not per_task:
+            return None
+        macro, low, high, count = _macro_paired_ci(
+            paired_by_task,
+            n_bootstrap=n_bootstrap,
+            seed=seed + _stable_seed("credit_ttt", baseline, "macro"),
+        )
+        baseline_spec = methods.get(baseline, {})
+        scope = "matched_cadence" if primary else "cadence_mismatched_reference"
+        entry: dict[str, Any] = {
+            "per_task": per_task,
+            "macro_delta_sr": macro,
+            "macro_ci95": [low, high],
+            "macro_n_paired_episodes": count,
+            "primary": bool(primary),
+            "comparison_scope": scope,
+            "credit_ttt_action_chunk_size": 1,
+            "baseline_action_chunk_size": baseline_spec.get("expected_action_chunk_size"),
+        }
+        if not primary:
+            entry["warning"] = (
+                "Native K=50 consumes a different number of actions per query; "
+                "this comparison is descriptive only and cannot support a causal "
+                "memory-improvement claim."
             )
-            pairwise[f"CreditTTT_vs_{baseline}"] = {
-                "per_task": per_task,
-                "macro_delta_sr": macro,
-                "macro_ci95": [low, high],
-                "macro_n_paired_episodes": count,
+        return entry
+
+    for baseline in primary_baselines:
+        entry = _make_pairwise_entry(baseline, primary=True)
+        if entry is not None:
+            pairwise[f"CreditTTT_vs_{baseline}"] = entry
+    for baseline in exploratory_baselines:
+        entry = _make_pairwise_entry(baseline, primary=False)
+        if entry is not None:
+            pairwise_exploratory[f"CreditTTT_vs_{baseline}"] = entry
+
+    required_tasks = set(tasks)
+    native_k1_tasks = set(method_task.get(NATIVE_VARIANT_K1, {}))
+    missing_native_k1_tasks = sorted(required_tasks - native_k1_tasks)
+    fairness = {
+        "primary_scope": "matched_cadence_only",
+        "required_native_k1_control": True,
+        "native_k1_control_id": NATIVE_VARIANT_K1,
+        "native_k1_complete": not missing_native_k1_tasks,
+        "native_k1_missing_tasks": missing_native_k1_tasks,
+        "native_k50_reference_id": NATIVE_VARIANT_CHUNK,
+        "native_k50_is_primary": False,
+        "method_cadence": {
+            method_id: {
+                "runner_action_chunk_size": method.get("expected_action_chunk_size"),
+                "model_action_horizon": method.get("expected_model_action_horizon"),
+                "comparison_scope": method.get("comparison_scope"),
             }
+            for method_id, method in methods.items()
+        },
+    }
 
     payload: dict[str, Any] = {
         "protocol_id": manifest["protocol_id"],
@@ -1427,6 +1673,8 @@ def aggregate_results(
         "runs_discovered": len(runs),
         "per_method_task": method_task,
         "pairwise": pairwise,
+        "pairwise_exploratory": pairwise_exploratory,
+        "fairness": fairness,
         "primary_metric": "success_once",
         "debug_metric": "mean_return",
         "legacy_v1_v2_included": False,
@@ -1544,8 +1792,49 @@ def run_go_no_go_checks(
 
     # Benchmark evidence is deliberately a separate family from mechanism
     # checks.  A positive SR difference is necessary for the paper claim but
-    # cannot substitute for proving the causal mechanism.
+    # cannot substitute for proving the causal mechanism.  The aggregate
+    # writer places only cadence-matched comparisons in ``pairwise``; native
+    # K=50 comparisons live in ``pairwise_exploratory`` and are never turned
+    # into a primary gate here.
     if aggregate_payload is not None:
+        fairness = aggregate_payload.get("fairness")
+        if isinstance(fairness, Mapping):
+            native_k1_complete = fairness.get("native_k1_complete")
+            missing_tasks = fairness.get("native_k1_missing_tasks", [])
+            if native_k1_complete is True:
+                fairness_status = "PASS"
+            elif strict:
+                fairness_status = "FAIL"
+            else:
+                fairness_status = "INCONCLUSIVE"
+            checks.append(
+                {
+                    "id": "benchmark_native_k1_cadence_control",
+                    "status": fairness_status,
+                    "value": native_k1_complete,
+                    "missing_tasks": list(missing_tasks)
+                    if isinstance(missing_tasks, Sequence)
+                    and not isinstance(missing_tasks, (str, bytes))
+                    else missing_tasks,
+                    "reason": (
+                        "A K=1 native receding-horizon control is required before "
+                        "credit gains can be attributed to memory rather than action cadence."
+                    ),
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "id": "benchmark_native_k1_cadence_control",
+                    "status": "FAIL" if strict else "INCONCLUSIVE",
+                    "value": None,
+                    "missing_tasks": None,
+                    "reason": (
+                        "Aggregate artifact has no fairness contract; regenerate it with "
+                        "the V3 coordinator so Native K=50 cannot be confused with K=1."
+                    ),
+                }
+            )
         for pair_name, pair in aggregate_payload.get("pairwise", {}).items():
             low_high = pair.get("macro_ci95")
             if not isinstance(low_high, list) or len(low_high) != 2:
@@ -1594,7 +1883,58 @@ def _load_manifest(path: Path) -> dict[str, Any]:
         manifest.get("credit_ttt_protocol"),
         path=f"{path}:credit_ttt_protocol",
     )
+    _validate_cadence_manifest(manifest, path=path)
     return dict(manifest)
+
+
+def _validate_cadence_manifest(manifest: Mapping[str, Any], *, path: Path | str) -> None:
+    """Fail closed on manifests that can mix native K=50 and TTT K=1.
+
+    A pre-fairness manifest can still have a valid SHA256 and V3 model
+    identity, yet its aggregate would report the cadence-mismatched native
+    result as a primary baseline.  Requiring the explicit K=1 control and
+    comparison scopes here prevents that old envelope from being reused by
+    simply editing a results directory.
+    """
+
+    raw_methods = manifest.get("methods")
+    if not isinstance(raw_methods, Sequence) or isinstance(raw_methods, (str, bytes)):
+        raise ValueError(f"{path}: manifest methods must be a sequence")
+    methods = {
+        str(item.get("id")): item
+        for item in raw_methods
+        if isinstance(item, Mapping) and item.get("id") is not None
+    }
+    for method_id in (NATIVE_VARIANT_CHUNK, NATIVE_VARIANT_K1, "clean_ttt", "credit_ttt"):
+        if method_id not in methods:
+            raise ValueError(
+                f"{path}: fairness manifest is missing required method {method_id!r}; "
+                "regenerate it with the current coordinator"
+            )
+    native_k50 = methods[NATIVE_VARIANT_CHUNK]
+    native_k1 = methods[NATIVE_VARIANT_K1]
+    if native_k50.get("comparison_scope") != "cadence_mismatched_reference":
+        raise ValueError(f"{path}: Native-SmolVLA K=50 must be exploratory-only")
+    if native_k1.get("comparison_scope") != "matched_cadence":
+        raise ValueError(f"{path}: Native-SmolVLA-K1 must be a matched-cadence control")
+    if int(native_k50.get("expected_action_chunk_size", -1)) != NATIVE_MODEL_ACTION_HORIZON:
+        raise ValueError(f"{path}: Native-SmolVLA K=50 cadence metadata is malformed")
+    if int(native_k1.get("expected_action_chunk_size", -1)) != 1:
+        raise ValueError(f"{path}: Native-SmolVLA-K1 cadence metadata is malformed")
+    controls = manifest.get("fairness_controls")
+    if not isinstance(controls, Mapping):
+        raise ValueError(f"{path}: manifest is missing fairness_controls")
+    if controls.get("primary_comparison_scope") != "matched_cadence_only":
+        raise ValueError(f"{path}: primary comparisons must be matched-cadence-only")
+    if controls.get("native_k1_control") != NATIVE_VARIANT_K1:
+        raise ValueError(f"{path}: fairness manifest must name Native-SmolVLA-K1 control")
+    primary = controls.get("primary_baselines")
+    if not isinstance(primary, Sequence) or isinstance(primary, (str, bytes)):
+        raise ValueError(f"{path}: fairness primary_baselines must be a sequence")
+    if NATIVE_VARIANT_CHUNK in primary or NATIVE_VARIANT_K1 not in primary:
+        raise ValueError(
+            f"{path}: primary_baselines must include K=1 and exclude native K=50"
+        )
 
 
 def _cmd_manifest(args: argparse.Namespace) -> int:
@@ -1706,11 +2046,49 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
     assert _validate_canonical_v3_identity(
         manifest["credit_ttt_protocol"], path="self-check manifest"
     ) == CANONICAL_V3_PROTOCOL_IDENTITY
-    assert sum(command["method_id"] == "native_smolvla" for command in manifest["commands"]) == 2
+    assert sum(command["method_id"] == NATIVE_VARIANT_CHUNK for command in manifest["commands"]) == 2
+    assert sum(command["method_id"] == NATIVE_VARIANT_K1 for command in manifest["commands"]) == 2
     assert all(
         command["train_seed"] == "fixed"
         for command in manifest["commands"]
-        if command["method_id"] == "native_smolvla"
+        if command["method_id"] in {NATIVE_VARIANT_CHUNK, NATIVE_VARIANT_K1}
+    )
+    native_k1_commands = [
+        command
+        for command in manifest["commands"]
+        if command["method_id"] == NATIVE_VARIANT_K1
+    ]
+    assert all("--execution-action-steps" in command["argv"] for command in native_k1_commands)
+    assert all(
+        "--execution-action-steps" not in command["argv"]
+        for command in manifest["commands"]
+        if command["method_id"] == NATIVE_VARIANT_CHUNK
+    )
+    assert manifest["fairness_controls"]["primary_comparison_scope"] == "matched_cadence_only"
+    assert manifest["fairness_controls"]["native_k1_control"] == NATIVE_VARIANT_K1
+    cadence_audit = run_go_no_go_checks(
+        {},
+        aggregate_payload={
+            "fairness": {"native_k1_complete": True, "native_k1_missing_tasks": []},
+            "pairwise": {},
+            "pairwise_exploratory": {
+                "CreditTTT_vs_native_smolvla": {
+                    "macro_delta_sr": 1.0,
+                    "macro_ci95": [1.0, 1.0],
+                    "primary": False,
+                }
+            },
+        },
+        strict=False,
+    )
+    assert not any(
+        item["id"] == "benchmark_CreditTTT_vs_native_smolvla"
+        for item in cadence_audit["checks"]
+    )
+    assert any(
+        item["id"] == "benchmark_native_k1_cadence_control"
+        and item["status"] == "PASS"
+        for item in cadence_audit["checks"]
     )
     bins = manifest["mechanism_audits"]["delay_bins_by_task"]
     assert bins["color"] == ["1-16"]
@@ -1718,6 +2096,55 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
     seeds = np.arange(4, dtype=np.float64)
     paired = _paired_episode_vectors({"1000": seeds}, {"fixed": seeds[::-1]})
     assert len(paired) == 1 and next(iter(paired.values()))[0].shape == (4,)
+    # A native K=1 control must be identified by explicit cadence provenance;
+    # a K=50 result in a directory named ``native_smolvla_k1`` is not enough.
+    native_common = {
+        "benchmark_protocol": OFFICIAL_PROTOCOL,
+        "env_id": DEFAULT_TASKS[0]["env_id"],
+        "successes": [True],
+        "episode_seeds": [DEFAULT_START_SEED],
+        "action_chunk_size": 1,
+        "model_action_horizon": NATIVE_MODEL_ACTION_HORIZON,
+        "execution_action_steps": 1,
+        "execution_cadence": NATIVE_CADENCE_RECEDING,
+        "model": {
+            "method": "SmolVLA",
+            "policy_type": "smolvla",
+            "ttt_enabled": False,
+            "benchmark_variant": NATIVE_VARIANT_K1,
+            "model_action_horizon": NATIVE_MODEL_ACTION_HORIZON,
+            "execution_action_steps": 1,
+            "execution_cadence": NATIVE_CADENCE_RECEDING,
+        },
+    }
+    assert _method_from_metadata(native_common, Path("native_smolvla_k1/eval.json"))[0] == NATIVE_VARIANT_K1
+    _validate_eval_record(
+        native_common,
+        path=Path("native_smolvla_k1/eval.json"),
+        expected_method=NATIVE_VARIANT_K1,
+        expected_task=DEFAULT_TASKS[0],
+        expected_episode_seeds=[DEFAULT_START_SEED],
+    )
+    malformed_native_k1 = dict(native_common)
+    malformed_native_k1["action_chunk_size"] = 50
+    malformed_native_k1["model"] = dict(native_common["model"])
+    malformed_native_k1["model"]["benchmark_variant"] = NATIVE_VARIANT_CHUNK
+    malformed_native_k1["model"]["execution_cadence"] = NATIVE_CADENCE_CHUNK
+    malformed_native_k1["execution_cadence"] = NATIVE_CADENCE_CHUNK
+    malformed_native_k1["execution_action_steps"] = 50
+    malformed_native_k1["model"]["execution_action_steps"] = 50
+    try:
+        _validate_eval_record(
+            malformed_native_k1,
+            path=Path("native_smolvla_k1/relabeled_k50.json"),
+            expected_method=NATIVE_VARIANT_K1,
+            expected_task=DEFAULT_TASKS[0],
+            expected_episode_seeds=[DEFAULT_START_SEED],
+        )
+    except ValueError:
+        pass
+    else:  # pragma: no cover - defensive assertion for the self-check itself
+        raise AssertionError("K=50 native result was accepted as the K=1 control")
     legacy_method, _ = _method_from_metadata(
         {"model": {"method": "HD-TTT", "hd_attribution_protocol": "v2_relative_antithetic_robust"}},
         Path("legacy.json"),
@@ -1762,6 +2189,9 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
         "successes": [True],
         "episode_seeds": [DEFAULT_START_SEED],
         "action_chunk_size": 1,
+        "model_action_horizon": NATIVE_MODEL_ACTION_HORIZON,
+        "execution_action_steps": 1,
+        "execution_cadence": NATIVE_CADENCE_RECEDING,
     }
     validated = _validate_eval_record(
         canonical_record,

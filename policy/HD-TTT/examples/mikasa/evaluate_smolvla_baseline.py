@@ -1,13 +1,17 @@
 #!/usr/bin/env python
-"""Evaluate the original LeRobot SmolVLA with native 50-step chunking.
+"""Evaluate the original LeRobot SmolVLA with native or receding chunking.
 
 This adapter uses the official MIKASA-Robo-VLA environment and episode runner,
 but deliberately loads :class:`lerobot.policies.smolvla.SmolVLAPolicy` rather
 than the independent ``smolvla_ttt`` implementation.  The policy is asked for
-one complete flow-matching action chunk (``predict_action_chunk``), and the
-official runner executes that chunk for up to 50 simulator steps before asking
-for the next observation.  Consequently ``action_chunk_size`` in the result
-is 50, matching the original SmolVLA inference contract.
+one complete flow-matching action chunk (``predict_action_chunk``).  By
+default the official runner executes that chunk for up to 50 simulator steps
+before asking for the next observation, matching the original SmolVLA
+inference contract.  ``--execution-action-steps 1`` is an explicit,
+backward-compatible receding-horizon control: the same native checkpoint is
+queried at every simulator step and only slot 0 is returned.  The latter is
+provided to separate action-cadence effects from the TTT memory comparison;
+the default remains 50 and is unchanged.
 
 Run this file inside the MIKASA Python environment, for example::
 
@@ -66,11 +70,27 @@ class SmolVLABaselineMikasaPolicy(SmolVLAMikasaPolicy):
     ``SmolVLAMikasaPolicy`` intentionally exposes ``select_action`` and a
     one-step chunk for TTT, because its recurrent state must advance at every
     environment decision.  The original SmolVLA baseline has no such state:
-    this subclass calls ``predict_action_chunk`` directly and exposes the
-    native 50 actions to ``benchmarking.run_episode``.
+    this subclass calls ``predict_action_chunk`` directly.  Its native model
+    still predicts 50 actions, while ``execution_action_steps`` controls how
+    many of those actions the official runner receives before the next query.
     """
 
     chunk_size = 50
+
+    def __init__(self, *args, execution_action_steps: int = 50, **kwargs):
+        super().__init__(*args, **kwargs)
+        execution_action_steps = int(execution_action_steps)
+        if not 1 <= execution_action_steps <= 50:
+            raise ValueError(
+                "execution_action_steps must be an integer in [1, 50], "
+                f"got {execution_action_steps}"
+            )
+        # ``chunk_size`` is the length consumed by the official runner.  Keep
+        # the source model's 50-slot horizon separate so a K=1 control does
+        # not accidentally reconstruct a different policy architecture.
+        self.chunk_size = execution_action_steps
+        self.execution_action_steps = execution_action_steps
+        self.model_action_horizon = 50
 
     @torch.inference_mode()
     def forward(self, obs: Mapping[str, Any]) -> torch.Tensor:
@@ -99,10 +119,10 @@ class SmolVLABaselineMikasaPolicy(SmolVLAMikasaPolicy):
                 "MIKASA's canonical action space has 7 dimensions, "
                 f"but SmolVLA returned D={action_chunk.shape[1]}"
             )
-        if action_chunk.shape[0] != self.chunk_size:
+        if action_chunk.shape[0] != self.model_action_horizon:
             raise ValueError(
                 "The original SmolVLA baseline must expose its complete "
-                f"50-step chunk, got K={action_chunk.shape[0]}"
+                f"50-step model chunk, got K={action_chunk.shape[0]}"
             )
         if not torch.isfinite(action_chunk).all():
             raise ValueError("SmolVLA produced a NaN/Inf action chunk")
@@ -110,6 +130,10 @@ class SmolVLABaselineMikasaPolicy(SmolVLAMikasaPolicy):
         # MIKASA's action space is [-1, 1].  Keep the environment contract at
         # the adapter boundary after unnormalization, just as the TTT adapter
         # does, while retaining all 50 actions in the returned queue.
+        # Receding-horizon control deliberately returns only the first action;
+        # native mode returns the complete model chunk.  No model weights or
+        # normalization path differ between the two modes.
+        action_chunk = action_chunk[: self.execution_action_steps]
         return action_chunk.detach().to(device="cpu", dtype=torch.float32).clamp(-1.0, 1.0)
 
 
@@ -226,6 +250,7 @@ def _load_policy(args: argparse.Namespace) -> SmolVLABaselineMikasaPolicy:
         preprocessor,
         postprocessor,
         device=torch.device(args.device),
+        execution_action_steps=args.execution_action_steps,
     )
 
 
@@ -307,11 +332,17 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 "requested_tasks": [task.env_id for task in tasks],
                 "benchmark_commit": benchmark_revision,
                 "wrapper_chain": "apply_mikasa_vla_wrappers(include_overlays=False)",
-                # Unlike TTT, the original policy's native action horizon is
-                # also the runner execution chunk.
+                # ``action_chunk_size`` is the actual runner cadence.  The
+                # model horizon remains 50 in both native and K=1 control
+                # modes and is reported separately below.
                 "action_chunk_size": policy.chunk_size,
                 "model_action_horizon": int(policy.policy.config.chunk_size),
-                "execution_action_steps": int(policy.policy.config.n_action_steps),
+                "execution_action_steps": int(policy.execution_action_steps),
+                "execution_cadence": (
+                    "native_chunk"
+                    if policy.execution_action_steps == 50
+                    else "receding_horizon"
+                ),
                 "model": {
                     "checkpoint": str(args.checkpoint),
                     "method": "SmolVLA",
@@ -319,6 +350,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     "policy_api": "predict_action_chunk",
                     "ttt_enabled": False,
                     "action_chunk_size": policy.chunk_size,
+                    "model_action_horizon": int(policy.model_action_horizon),
+                    "execution_action_steps": int(policy.execution_action_steps),
+                    "execution_cadence": (
+                        "native_chunk"
+                        if policy.execution_action_steps == 50
+                        else "receding_horizon"
+                    ),
+                    "benchmark_variant": (
+                        "native_smolvla"
+                        if policy.execution_action_steps == 50
+                        else "native_smolvla_k1"
+                    ),
                 },
                 "episode_lengths": [int(ep.n_steps) for ep in episodes],
                 "episode_seeds": [int(ep.seed) for ep in episodes],
@@ -380,6 +423,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sim-backend", choices=("cpu", "gpu"), default="gpu")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--execution-action-steps",
+        type=int,
+        choices=range(1, 51),
+        default=50,
+        help=(
+            "Number of actions from each native 50-slot prediction passed to "
+            "the runner before re-querying. 50 is the canonical native mode; "
+            "1 is the matched-cadence receding-horizon control."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
         "--official-output-dir",

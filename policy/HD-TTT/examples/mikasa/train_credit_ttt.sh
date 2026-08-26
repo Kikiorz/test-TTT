@@ -414,6 +414,7 @@ baseline_commands() {
   # Match benchmark_credit_ttt_v3.py's frozen result layout so aggregation
   # can recover training replicates from the path without guessing.
   local native_output="${RESULTS_ROOT}/native_smolvla/train_seed_fixed/${TASK_ID}/eval.json"
+  local native_k1_output="${RESULTS_ROOT}/native_smolvla_k1/train_seed_fixed/${TASK_ID}/eval.json"
   local clean_output="${RESULTS_ROOT}/clean_ttt/train_seed_${SEED}/${TASK_ID}/eval.json"
   local credit_output="${RESULTS_ROOT}/credit_ttt/train_seed_${SEED}/${TASK_ID}/eval.json"
   local native_cmd=(
@@ -423,6 +424,14 @@ baseline_commands() {
     --num-episodes "${EVAL_EPISODES}" --start-seed "${EVAL_START_SEED}"
     --torch-seed "${EVAL_TORCH_SEED}" --sim-backend "${SIM_BACKEND}"
     --device cuda --output "${native_output}"
+  )
+  local native_k1_cmd=(
+    "${PYTHON_BIN}" "${REPO_ROOT}/examples/mikasa/evaluate_smolvla_baseline.py"
+    --checkpoint "${NATIVE_CHECKPOINT}" --dataset-repo-id "${DATASET_REPO_ID}"
+    --dataset-root "${DATASET_ROOT}" --task "${ENV_ID}"
+    --num-episodes "${EVAL_EPISODES}" --start-seed "${EVAL_START_SEED}"
+    --torch-seed "${EVAL_TORCH_SEED}" --sim-backend "${SIM_BACKEND}"
+    --device cuda --execution-action-steps 1 --output "${native_k1_output}"
   )
   local clean_cmd=(
     "${PYTHON_BIN}" "${REPO_ROOT}/examples/mikasa/evaluate_smolvla_ttt.py"
@@ -454,6 +463,8 @@ baseline_commands() {
   print_cmd "${manifest_cmd[@]}"
   echo "# Native-SmolVLA (canonical native action chunk K=50):"
   print_cmd "${native_cmd[@]}"
+  echo "# Native-SmolVLA-K1 (same native checkpoint/model horizon, matched receding cadence):"
+  print_cmd "${native_k1_cmd[@]}"
   echo "# Clean-TTT (K=1, HD explicitly disabled, previous-action schema matched):"
   print_cmd "${clean_cmd[@]}"
   echo "# CreditTTT (K=1, canonical V3 identity emitted by evaluator):"
