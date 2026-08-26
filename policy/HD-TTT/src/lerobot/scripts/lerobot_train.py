@@ -1705,6 +1705,22 @@ def update_policy_tbptt(
         else None
     )
 
+    # Canonical CreditTTT V3 replay can be substantially larger than the
+    # action-flow batch (one event may supervise several future queries).  The
+    # SmolVLA policy accepts this callback to backward each CMD/QH2L pair
+    # chunk synchronously and release its checkpoint graph before constructing
+    # the next one.  ``accelerator.backward`` is intentionally kept here,
+    # outside the model, so the policy remains framework-agnostic and the
+    # historical non-V3/B=1 call path is unchanged.
+    stream_v3_replay = bool(
+        str(getattr(policy_config, "hd_attribution_protocol", ""))
+        == _HD_ATTRIBUTION_PROTOCOL_V3
+        and use_global_hd_normalization
+    )
+
+    def _stream_v3_backward(loss: torch.Tensor, retain_graph: bool) -> None:
+        accelerator.backward(loss, retain_graph=retain_graph)
+
     local_num_segments = len(segment_loss_weights)
     # Tail-preserving windows intentionally have variable physical lengths.
     # In DDP, ranks can therefore reach the end of their local sequence at
@@ -1761,10 +1777,12 @@ def update_policy_tbptt(
                 ):
                     # Pair indices are episode-local.  The model uses this
                     # offset to map them into the current TBPTT segment; the
-                    # complete batch remains available for a future
-                    # cross-segment query replay implementation.
+                    # complete batch remains available for cross-segment
+                    # query replay and its global pair normalizers.
                     segment_kwargs["sequence_offset"] = window_sequence_offset + segment_start
                     segment_kwargs["v3_reference_batch"] = v3_reference_batch
+                    if stream_v3_replay:
+                        segment_kwargs["v3_streaming_backward"] = _stream_v3_backward
                 segment_loss, segment_output, fast_states = unwrapped_policy.forward_sequence_segment(
                     segment_batch,
                     **segment_kwargs,
@@ -1846,11 +1864,14 @@ def update_policy_tbptt(
                         "hd_v3_qh2l",
                         "hd_v3_qh2l_positive",
                         "hd_v3_qh2l_null",
+                        "hd_v3_qh2l_streamed_loss",
                         "hd_v3_cmd",
                         "hd_v3_cmd_full",
                         "hd_v3_cmd_effect",
                         "hd_v3_cmd_rank",
                         "hd_v3_cmd_null",
+                        "hd_v3_cmd_streamed_loss",
+                        "hd_v3_streamed_loss",
                         "hd_v3_pairs",
                         "hd_v3_positive_pairs",
                         "hd_v3_null_pairs",

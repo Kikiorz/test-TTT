@@ -1170,6 +1170,7 @@ def causal_memory_deployment_loss(
     full_denominator: Tensor | float | None = None,
     positive_denominator: Tensor | float | None = None,
     null_denominator: Tensor | float | None = None,
+    normalization_floor: Tensor | float | None = None,
     huber_delta: float = 1.0,
     reduction: Literal["mean", "sum"] = "mean",
     return_components: bool = False,
@@ -1199,7 +1200,10 @@ def causal_memory_deployment_loss(
     No term introduces a global memory-off scalar.  Empty strata return a
     graph-connected zero, which is important for delay-stratified minibatches.
     Optional complete-window denominators make the sum of per-segment CMD
-    losses invariant to the TBPTT partition.
+    losses invariant to the TBPTT partition.  ``normalization_floor`` can
+    additionally pin the robust effect scale computed over that complete
+    population; streaming callers use it so chunk-local medians cannot alter
+    the objective.
     """
 
     if not isinstance(correct_action, Tensor) or not isinstance(wrong_action, Tensor):
@@ -1274,7 +1278,7 @@ def causal_memory_deployment_loss(
         else correct_action.sum(dim=-1) * 0.0
     )
     effect = correct_action - wrong_action
-    effect_scale = _robust_effect_scale(target_effect, eps=eps, floor=None)
+    effect_scale = _robust_effect_scale(target_effect, eps=eps, floor=normalization_floor)
     effect_error = _huber_per_pair((effect - target_effect) / effect_scale, delta=huber_delta)
     null_error = _huber_per_pair(effect / effect_scale, delta=huber_delta)
 

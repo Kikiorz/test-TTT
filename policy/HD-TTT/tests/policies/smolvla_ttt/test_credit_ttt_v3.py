@@ -9,12 +9,14 @@ from lerobot.policies.smolvla_ttt.credit_ttt_v3 import (
     CreditTTTProtocol,
     CREDIT_TTT_V3_PAIR_SCHEMA,
     DEFAULT_CREDIT_TTT_PROTOCOL,
+    causal_memory_deployment_loss,
     functional_local_ttt_update,
     local_update_read_before_after,
     query_conditioned_local_effect_loss,
     sample_delay_balanced_pairs,
     symmetric_relative_utility,
 )
+from lerobot.policies.smolvla_ttt.hd_ttt import compute_action_effect_normalization_floor
 from lerobot.policies.smolvla_ttt.ttt import TTTBoundedTrace, TTTMLPLayer
 
 
@@ -118,7 +120,6 @@ def test_qh2l_effect_loss_has_positive_and_null_branches() -> None:
     breakdown.total.backward()
     assert after.grad is not None
     assert teacher.grad is None
-
     perturbed = query_conditioned_local_effect_loss(
         before.detach(),
         (after.detach() + 0.5),
@@ -127,6 +128,126 @@ def test_qh2l_effect_loss_has_positive_and_null_branches() -> None:
         null_mask=torch.tensor([False, True]),
     )
     assert perturbed.item() > breakdown.total.detach().item()
+
+
+def test_qh2l_streaming_chunks_match_concat_loss_and_gradients() -> None:
+    """Global denominators/floor make pair-chunk backward mathematically exact."""
+
+    torch.manual_seed(17)
+    pair_count, action_dim = 7, 5
+    before = torch.randn(pair_count, action_dim, requires_grad=True)
+    after = torch.randn(pair_count, action_dim, requires_grad=True)
+    teacher = torch.randn(pair_count, action_dim)
+    utility = torch.tensor([1.0, 0.6, 0.0, -0.4, 0.8, 0.0, 0.2])
+    positive = utility > 0
+    null = ~positive
+    positive_denominator = utility.clamp_min(0).clamp_max(1)[positive].sum()
+    null_denominator = null.to(dtype=torch.float32).sum()
+
+    concat = query_conditioned_local_effect_loss(
+        before,
+        after,
+        teacher,
+        utility=utility,
+        positive_mask=positive,
+        null_mask=null,
+        positive_denominator=positive_denominator,
+        null_denominator=null_denominator,
+        null_loss_weight=0.25,
+        return_components=True,
+    )
+    concat_grads = torch.autograd.grad(concat.total, (before, after))
+
+    before_chunk = before.detach().clone().requires_grad_()
+    after_chunk = after.detach().clone().requires_grad_()
+    floor = compute_action_effect_normalization_floor(teacher)
+    streamed_terms = []
+    for indices in (slice(0, 2), slice(2, 5), slice(5, None)):
+        chunk = query_conditioned_local_effect_loss(
+            before_chunk[indices],
+            after_chunk[indices],
+            teacher[indices],
+            utility=utility[indices],
+            positive_mask=positive[indices],
+            null_mask=null[indices],
+            positive_denominator=positive_denominator,
+            null_denominator=null_denominator,
+            null_loss_weight=0.25,
+            normalization_floor=floor,
+        )
+        streamed_terms.append(chunk)
+    streamed = torch.stack(streamed_terms).sum()
+    streamed_grads = torch.autograd.grad(streamed, (before_chunk, after_chunk))
+
+    torch.testing.assert_close(streamed, concat.total, rtol=2e-5, atol=2e-6)
+    for streamed_grad, concat_grad in zip(streamed_grads, concat_grads, strict=True):
+        torch.testing.assert_close(streamed_grad, concat_grad, rtol=2e-5, atol=2e-6)
+
+
+def test_cmd_streaming_chunks_match_concat_loss_and_gradients() -> None:
+    """CMD's full/effect/rank/null terms are additive with a global floor."""
+
+    torch.manual_seed(23)
+    pair_count, action_dim = 8, 4
+    correct = torch.randn(pair_count, action_dim, requires_grad=True)
+    wrong = torch.randn(pair_count, action_dim, requires_grad=True)
+    teacher_full = torch.randn(pair_count, action_dim)
+    teacher_wrong = torch.randn(pair_count, action_dim)
+    teacher_effect = teacher_full - teacher_wrong
+    expert = torch.randn(pair_count, action_dim)
+    utility = torch.tensor([1.0, 0.2, 0.0, -0.2, 0.8, 0.0, 0.4, -0.1])
+    positive = utility > 0
+    null = ~positive
+    positive_denominator = utility.clamp_min(0).clamp_max(1)[positive].sum()
+    null_denominator = null.to(dtype=torch.float32).sum()
+    full_denominator = torch.tensor(float(pair_count))
+
+    concat = causal_memory_deployment_loss(
+        correct,
+        wrong,
+        teacher_full_action=teacher_full,
+        teacher_wrong_action=teacher_wrong,
+        teacher_effect=teacher_effect,
+        expert_action=expert,
+        utility=utility,
+        positive_mask=positive,
+        null_mask=null,
+        full_denominator=full_denominator,
+        positive_denominator=positive_denominator,
+        null_denominator=null_denominator,
+        null_weight=0.25,
+        return_components=True,
+    )
+    concat_grads = torch.autograd.grad(concat.total, (correct, wrong))
+
+    correct_chunk = correct.detach().clone().requires_grad_()
+    wrong_chunk = wrong.detach().clone().requires_grad_()
+    floor = compute_action_effect_normalization_floor(teacher_effect)
+    streamed_terms = []
+    for indices in (slice(0, 3), slice(3, 6), slice(6, None)):
+        chunk = causal_memory_deployment_loss(
+            correct_chunk[indices],
+            wrong_chunk[indices],
+            teacher_full_action=teacher_full[indices],
+            teacher_wrong_action=teacher_wrong[indices],
+            teacher_effect=teacher_effect[indices],
+            expert_action=expert[indices],
+            utility=utility[indices],
+            positive_mask=positive[indices],
+            null_mask=null[indices],
+            full_denominator=full_denominator,
+            positive_denominator=positive_denominator,
+            null_denominator=null_denominator,
+            null_weight=0.25,
+            normalization_floor=floor,
+        )
+        streamed_terms.append(chunk)
+    streamed = torch.stack(streamed_terms).sum()
+    streamed_grads = torch.autograd.grad(streamed, (correct_chunk, wrong_chunk))
+
+    torch.testing.assert_close(streamed, concat.total, rtol=2e-5, atol=2e-6)
+    for streamed_grad, concat_grad in zip(streamed_grads, concat_grads, strict=True):
+        torch.testing.assert_close(streamed_grad, concat_grad, rtol=2e-5, atol=2e-6)
 
 
 def test_qh2l_empty_batch_is_finite_and_connected() -> None:

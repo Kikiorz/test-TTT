@@ -27,7 +27,7 @@ import logging
 import math
 import os
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
 from pathlib import Path
 from typing import TypedDict, Unpack
@@ -52,6 +52,7 @@ from .configuration_smolvla_ttt import SmolVLATTTConfig
 from .hd_ttt import (
     action_effect_distillation_loss,
     counterfactual_grounding_loss,
+    compute_action_effect_normalization_floor,
     local_kvb_loss,
 )
 from .credit_ttt_v3 import (
@@ -79,10 +80,11 @@ _CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV = "CREDIT_TTT_REPLAY_SAVE_ON_CPU"
 # Full-flow CMD/QH2L replay is an auxiliary training computation.  Keep its
 # pair dimension small enough that checkpointed transformer activations never
 # scale with the number of sampled event--future pairs.  This is an execution
-# bound, not a loss/hyper-parameter: every pair is still evaluated and the
-# outputs are concatenated before the objective is reduced.  The value can be
-# overridden for a hardware profile, while the reproducible default is four
-# pairs per before/after replay.
+# bound, not a loss/hyper-parameter: every pair is still evaluated.  Historical
+# direct callers concatenate the chunk outputs; the sequence trainer's
+# streaming callback reduces/backpropagates each chunk immediately.  The value
+# can be overridden for a hardware profile, while the reproducible default is
+# four pairs per before/after replay.
 _CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_ENV = "CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE"
 _CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_DEFAULT = 4
 
@@ -1506,11 +1508,10 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # before/after branches in one call; with K=5 this can mean O(T*K)
         # transformer rows and either a host-RAM or device-memory spike.  Each
         # recursive call below evaluates an identical deterministic replay for
-        # a disjoint pair slice.  We concatenate the differentiable outputs,
-        # so the caller still applies one loss/reduction over the complete
-        # sampled population and all gradients are preserved.  ``0`` is an
-        # explicit diagnostic escape hatch and disables this execution-only
-        # partitioning.
+        # a disjoint pair slice.  Direct callers receive concatenated outputs;
+        # the sequence trainer may request a callback and consume those slices
+        # one at a time.  ``0`` is an explicit diagnostic escape hatch and
+        # disables this execution-only partitioning.
         if _pair_chunk_size is None:
             pair_chunk_size = _credit_ttt_replay_pair_chunk_size(pair_count)
         else:
@@ -1729,6 +1730,8 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         trace_indices: Sequence[int],
         reference_batch: Mapping[str, object] | None = None,
         normalizers: Mapping[str, Tensor | float] | None = None,
+        stream_backward: Callable[[Tensor, bool], None] | None = None,
+        stream_weight: float = 1.0,
     ) -> tuple[Tensor, dict[str, float]]:
         """Compute the CreditTTT query-conditioned local effect objective.
 
@@ -1780,33 +1783,165 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             }
         selected_event = pair_labels["event_index"].index_select(0, indices)
         selected_batch = pair_labels["batch_index"].index_select(0, indices)
+        teacher_effect = pair_labels["teacher_effect"].index_select(0, indices)
+        utility = pair_labels["utility"].index_select(0, indices)
+        positive = pair_labels["positive"].index_select(0, indices)
+        null = pair_labels["null"].index_select(0, indices)
+        # ``indices`` already filters to rows that participate in one of the
+        # two supervised strata.  Keep the corresponding mask explicitly for
+        # diagnostics below; relying on an implicit/outer ``active`` variable
+        # would raise a NameError exactly when the first valid V3 pair is
+        # encountered (the empty-pair path never reaches that metric block).
+        active = positive | null
+
+        # A complete reference window is the canonical V3 path even when the
+        # future query happens to lie in the current TBPTT segment.  The
+        # teacher target is an integrated final slot-0 action, whereas
+        # ``v3_local_effects_from_trace`` is only a single-phase velocity
+        # readout.  Routing same-segment rows through that helper would
+        # silently mix units/denoising phases and invalidate QH2L.
         if reference_batch is not None:
-            # A complete reference window is the canonical V3 path even when
-            # the future query happens to lie in the current TBPTT segment.
-            # The teacher target is an integrated final slot-0 action, whereas
-            # ``v3_local_effects_from_trace`` is only a single-phase velocity
-            # readout.  Routing same-segment rows through that helper would
-            # silently mix units/denoising phases and invalidate QH2L.  The
-            # replay helper performs exact pair chunking internally, so this
-            # all-pair call remains bounded without changing the objective.
             if "event_index_global" not in pair_labels or "future_index_global" not in pair_labels:
                 raise ValueError(
                     "Canonical CreditTTT replay requires global event/future indices; "
                     "regenerate labels with the V3 pair schema"
                 )
-            student_effect = self._v3_reference_student_effects(
-                reference_batch=reference_batch,
-                trace_collector=trace_collector,
-                event_indices=selected_event,
-                event_indices_global=pair_labels["event_index_global"].index_select(0, indices),
-                future_indices_global=pair_labels["future_index_global"].index_select(0, indices),
-                batch_indices=selected_batch,
-            )
+            selected_event_global = pair_labels["event_index_global"].index_select(0, indices)
+            selected_future_global = pair_labels["future_index_global"].index_select(0, indices)
             replay_cross_count = int(
                 pair_labels.get("cross_segment", torch.zeros_like(valid))
                 .index_select(0, indices)
                 .sum()
                 .item()
+            )
+
+            # When the trainer supplies a callback and complete-window
+            # denominators, process one replay chunk at a time and immediately
+            # backpropagate it.  The denominators make the primitive additive;
+            # the fixed robust floor below also makes its per-row scale equal
+            # to the one obtained by the historical concatenated call.
+            streaming = (
+                stream_backward is not None
+                and normalizers is not None
+                and torch.is_grad_enabled()
+            )
+            if streaming:
+                stream_scale = float(stream_weight)
+                if not math.isfinite(stream_scale) or stream_scale < 0:
+                    raise ValueError("stream_weight must be a finite non-negative scalar")
+                pair_count = int(indices.numel())
+                chunk_size = _credit_ttt_replay_pair_chunk_size(pair_count)
+                if chunk_size <= 0:
+                    chunk_size = pair_count
+                # ``_hd_active_action_dim`` is determined by the configured
+                # task action space and the detached label width.  Replay
+                # outputs use the same max-action projection, so this is the
+                # exact feature prefix used by the non-streaming path.
+                configured_feature = getattr(self.config, "action_feature", None)
+                configured_shape = getattr(configured_feature, "shape", None)
+                configured_dim = (
+                    int(configured_shape[0])
+                    if configured_shape and configured_shape[0] is not None
+                    else int(self.config.max_action_dim)
+                )
+                active_dim = min(int(teacher_effect.shape[-1]), configured_dim)
+                if active_dim <= 0:
+                    raise ValueError("CreditTTT QH2L requires a positive action dimension")
+                normalization_floor = compute_action_effect_normalization_floor(
+                    teacher_effect[..., :active_dim]
+                )
+                total_value = 0.0
+                positive_value = 0.0
+                null_value = 0.0
+                student_square_sum = 0.0
+                teacher_square_sum = 0.0
+                feature_count = 0
+                delay_sum = float(
+                    pair_labels["delay"].index_select(0, indices).float().sum().item()
+                )
+                for start in range(0, pair_count, chunk_size):
+                    stop = min(start + chunk_size, pair_count)
+                    chunk_indices = indices[start:stop]
+                    chunk_student = self._v3_reference_student_effects(
+                        reference_batch=reference_batch,
+                        trace_collector=trace_collector,
+                        event_indices=pair_labels["event_index"].index_select(0, chunk_indices),
+                        event_indices_global=pair_labels["event_index_global"].index_select(0, chunk_indices),
+                        future_indices_global=pair_labels["future_index_global"].index_select(0, chunk_indices),
+                        batch_indices=pair_labels["batch_index"].index_select(0, chunk_indices),
+                        _pair_chunk_size=0,
+                    )
+                    chunk_teacher = pair_labels["teacher_effect"].index_select(0, chunk_indices)
+                    chunk_utility = pair_labels["utility"].index_select(0, chunk_indices)
+                    chunk_positive = pair_labels["positive"].index_select(0, chunk_indices)
+                    chunk_null = pair_labels["null"].index_select(0, chunk_indices)
+                    chunk_student = chunk_student[..., :active_dim]
+                    chunk_teacher = chunk_teacher[..., :active_dim]
+                    # The loss primitive broadcasts singleton label axes to
+                    # the replay output before computing its RMS.  Mirror
+                    # that broadcast for diagnostics so streamed metrics are
+                    # identical even for legacy [pair,1,dim] labels.
+                    if (
+                        chunk_teacher.ndim == chunk_student.ndim - 1
+                        and chunk_teacher.shape[-1] == chunk_student.shape[-1]
+                    ):
+                        chunk_teacher = chunk_teacher.unsqueeze(-2)
+                    chunk_teacher = torch.broadcast_to(chunk_teacher, chunk_student.shape)
+                    chunk_breakdown = query_conditioned_local_effect_loss(
+                        torch.zeros_like(chunk_student),
+                        chunk_student,
+                        chunk_teacher,
+                        utility=chunk_utility,
+                        positive_mask=chunk_positive,
+                        null_mask=chunk_null,
+                        valid_mask=torch.ones_like(chunk_positive),
+                        null_weight=1.0,
+                        positive_denominator=normalizers.get("positive"),
+                        null_denominator=normalizers.get("null"),
+                        null_loss_weight=float(getattr(self.config, "hd_v3_null_weight", 0.25)),
+                        normalization_floor=normalization_floor,
+                        relative=True,
+                        return_components=True,
+                    )
+                    stream_backward(chunk_breakdown.total * stream_scale, True)
+                    total_value += float(chunk_breakdown.total.detach().item())
+                    positive_value += float(chunk_breakdown.positive.detach().item())
+                    null_value += float(chunk_breakdown.null.detach().item())
+                    student_square_sum += float(chunk_student.detach().square().sum().item())
+                    teacher_square_sum += float(chunk_teacher.detach().square().sum().item())
+                    feature_count += int(chunk_student.numel())
+                    # Explicitly drop replay outputs before constructing the
+                    # next checkpoint graph.  No differentiable tensor is
+                    # retained in the metric accumulator.
+                    del chunk_breakdown, chunk_student, chunk_teacher
+                zero = self.model.action_out_proj.weight.sum() * 0.0
+                metrics = {
+                    "hd_v3_qh2l": total_value,
+                    "hd_v3_qh2l_positive": positive_value,
+                    "hd_v3_qh2l_null": null_value,
+                    "hd_v3_qh2l_streamed_loss": total_value * stream_scale,
+                    "hd_v3_pairs": float(pair_count),
+                    "hd_v3_positive_pairs": float(positive.sum().item()),
+                    "hd_v3_null_pairs": float(null.sum().item()),
+                    "hd_v3_pairs_skipped": float(skipped),
+                    "hd_v3_cross_segment_pairs": float(replay_cross_count),
+                    "hd_v3_delay_mean": delay_sum / max(pair_count, 1),
+                    "hd_v3_teacher_effect_rms": math.sqrt(
+                        teacher_square_sum / max(feature_count, 1)
+                    ),
+                    "hd_v3_student_effect_rms": math.sqrt(
+                        student_square_sum / max(feature_count, 1)
+                    ),
+                }
+                return zero, metrics
+
+            student_effect = self._v3_reference_student_effects(
+                reference_batch=reference_batch,
+                trace_collector=trace_collector,
+                event_indices=selected_event,
+                event_indices_global=selected_event_global,
+                future_indices_global=selected_future_global,
+                batch_indices=selected_batch,
             )
         else:
             student_effect = self.model.v3_local_effects_from_trace(
@@ -1818,16 +1953,6 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 selected_batch,
             )
             replay_cross_count = 0
-        teacher_effect = pair_labels["teacher_effect"].index_select(0, indices)
-        utility = pair_labels["utility"].index_select(0, indices)
-        positive = pair_labels["positive"].index_select(0, indices)
-        null = pair_labels["null"].index_select(0, indices)
-        # ``indices`` already filters to rows that participate in one of the
-        # two supervised strata.  Keep the corresponding mask explicitly for
-        # diagnostics below; relying on an implicit/outer ``active`` variable
-        # would raise a NameError exactly when the first valid V3 pair is
-        # encountered (the empty-pair path never reaches that metric block).
-        active = positive | null
         active_dim = self._hd_active_action_dim(student_effect, teacher_effect)
         student_effect = student_effect[..., :active_dim]
         teacher_effect = teacher_effect[..., :active_dim]
@@ -1873,6 +1998,8 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         trace_collector: dict[int, TTTBoundedTrace],
         reference_batch: Mapping[str, object] | None = None,
         normalizers: Mapping[str, Tensor | float] | None = None,
+        stream_backward: Callable[[Tensor, bool], None] | None = None,
+        stream_weight: float = 1.0,
     ) -> tuple[Tensor, dict[str, float]]:
         """Apply the reader-side Causal Memory Deployment (CMD) objective.
 
@@ -1941,6 +2068,143 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # ``detach_states=True`` is the key CMD contract.  The replay remains
         # differentiable with respect to model parameters used after the
         # memory read, but no gradient can travel through event i's writer.
+        # As with QH2L, a callback enables exact chunk streaming when complete
+        # normalizers are available.  CMD's robust effect scale is fixed from
+        # the complete selected population before the first chunk, otherwise a
+        # chunk-local median would silently define a different objective.
+        streaming = (
+            stream_backward is not None
+            and normalizers is not None
+            and torch.is_grad_enabled()
+        )
+        if streaming:
+            stream_scale = float(stream_weight)
+            if not math.isfinite(stream_scale) or stream_scale < 0:
+                raise ValueError("stream_weight must be a finite non-negative scalar")
+            pair_count = int(indices.numel())
+            chunk_size = _credit_ttt_replay_pair_chunk_size(pair_count)
+            if chunk_size <= 0:
+                chunk_size = pair_count
+            configured_feature = getattr(self.config, "action_feature", None)
+            configured_shape = getattr(configured_feature, "shape", None)
+            configured_dim = (
+                int(configured_shape[0])
+                if configured_shape and configured_shape[0] is not None
+                else int(self.config.max_action_dim)
+            )
+            active_dim = min(int(target_full.shape[-1]), configured_dim)
+            if active_dim <= 0:
+                raise ValueError("CreditTTT CMD requires a positive action dimension")
+            teacher_effect_all = pair_labels["teacher_effect"].index_select(0, indices)
+            normalization_floor = compute_action_effect_normalization_floor(
+                teacher_effect_all[..., :active_dim]
+            )
+            total_value = 0.0
+            full_value = 0.0
+            effect_value = 0.0
+            rank_value = 0.0
+            null_value = 0.0
+            for start in range(0, pair_count, chunk_size):
+                stop = min(start + chunk_size, pair_count)
+                chunk_indices = indices[start:stop]
+                before_action, after_action = self._v3_reference_student_effects(
+                    reference_batch=reference_batch,
+                    trace_collector=trace_collector,
+                    event_indices=pair_labels["event_index"].index_select(0, chunk_indices),
+                    event_indices_global=pair_labels["event_index_global"].index_select(0, chunk_indices),
+                    future_indices_global=pair_labels["future_index_global"].index_select(0, chunk_indices),
+                    batch_indices=pair_labels["batch_index"].index_select(0, chunk_indices),
+                    detach_states=True,
+                    return_actions=True,
+                    _pair_chunk_size=0,
+                )
+                if not isinstance(before_action, Tensor) or not isinstance(after_action, Tensor):
+                    raise RuntimeError("CreditTTT CMD replay did not return paired action tensors")
+                chunk_teacher_full = target_full.index_select(0, chunk_indices).to(
+                    device=after_action.device, dtype=after_action.dtype
+                )
+                chunk_teacher_wrong = target_wrong.index_select(0, chunk_indices).to(
+                    device=after_action.device, dtype=after_action.dtype
+                )
+                chunk_expert = target_expert.index_select(0, chunk_indices).to(
+                    device=after_action.device, dtype=after_action.dtype
+                )
+                chunk_teacher_effect = pair_labels["teacher_effect"].index_select(
+                    0, chunk_indices
+                ).to(device=after_action.device, dtype=after_action.dtype)
+                chunk_utility = pair_labels["utility"].index_select(0, chunk_indices).to(
+                    device=after_action.device, dtype=after_action.dtype
+                )
+                chunk_positive = pair_labels["positive"].index_select(0, chunk_indices).to(
+                    device=after_action.device
+                )
+                chunk_null = pair_labels["null"].index_select(0, chunk_indices).to(
+                    device=after_action.device
+                )
+                before_action = before_action[..., :active_dim]
+                after_action = after_action[..., :active_dim]
+                chunk_teacher_full = chunk_teacher_full[..., :active_dim]
+                chunk_teacher_wrong = chunk_teacher_wrong[..., :active_dim]
+                chunk_expert = chunk_expert[..., :active_dim]
+                chunk_teacher_effect = chunk_teacher_effect[..., :active_dim]
+                chunk_breakdown = causal_memory_deployment_loss(
+                    after_action,
+                    before_action,
+                    teacher_full_action=chunk_teacher_full,
+                    teacher_wrong_action=chunk_teacher_wrong,
+                    teacher_effect=chunk_teacher_effect,
+                    expert_action=chunk_expert,
+                    utility=chunk_utility,
+                    positive_mask=chunk_positive,
+                    null_mask=chunk_null,
+                    valid_mask=torch.ones_like(chunk_positive, dtype=torch.bool),
+                    margin=float(getattr(self.config, "hd_v3_cmd_margin", 0.05)),
+                    null_weight=float(getattr(self.config, "hd_v3_null_weight", 0.25)),
+                    full_denominator=normalizers.get("full"),
+                    positive_denominator=normalizers.get("positive"),
+                    null_denominator=normalizers.get("null"),
+                    normalization_floor=normalization_floor,
+                    return_components=True,
+                )
+                # CMD is intentionally detached from the event writer, so its
+                # replay graph can be released immediately after this
+                # backward.  QH2L uses retain_graph=True below because its
+                # writer-connected state is also needed by the main flow.
+                stream_backward(chunk_breakdown.total * stream_scale, False)
+                total_value += float(chunk_breakdown.total.detach().item())
+                full_value += float(chunk_breakdown.full.detach().item())
+                effect_value += float(chunk_breakdown.effect.detach().item())
+                rank_value += float(chunk_breakdown.rank.detach().item())
+                null_value += float(chunk_breakdown.null.detach().item())
+                del (
+                    chunk_breakdown,
+                    before_action,
+                    after_action,
+                    chunk_teacher_full,
+                    chunk_teacher_wrong,
+                    chunk_expert,
+                    chunk_teacher_effect,
+                )
+            zero = self.model.action_out_proj.weight.sum() * 0.0
+            metrics.update(
+                {
+                    "hd_v3_cmd": total_value,
+                    "hd_v3_cmd_full": full_value,
+                    "hd_v3_cmd_effect": effect_value,
+                    "hd_v3_cmd_rank": rank_value,
+                    "hd_v3_cmd_null": null_value,
+                    "hd_v3_cmd_streamed_loss": total_value * stream_scale,
+                    "hd_v3_cmd_pairs": float(pair_count),
+                    "hd_v3_cmd_cross_segment_pairs": float(
+                        pair_labels.get("cross_segment", torch.zeros_like(valid))
+                        .index_select(0, indices)
+                        .sum()
+                        .item()
+                    ),
+                }
+            )
+            return zero, metrics
+
         before_action, after_action = self._v3_reference_student_effects(
             reference_batch=reference_batch,
             trace_collector=trace_collector,
@@ -3039,6 +3303,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         sequence_offset: int = 0,
         v3_reference_batch: dict[str, Tensor] | None = None,
         previous_action_at_start: Tensor | None = None,
+        v3_streaming_backward: Callable[[Tensor, bool], None] | None = None,
     ) -> tuple[Tensor, dict, TTTFastStates]:
         """Train one contiguous TBPTT segment and return its numerical fast state.
 
@@ -3070,6 +3335,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         mapping is the explicit new-sequence marker and resets it to zero.
         The carry is detached, so it does not extend the TBPTT graph or the
         serialized fast-weight state.
+        ``v3_streaming_backward`` is an internal sequence-trainer callback.
+        When supplied together with a complete V3 reference window, QH2L and
+        CMD replay pairs are reduced and backwarded one chunk at a time.  The
+        callback receives ``(loss, retain_graph)`` and is invoked synchronously;
+        the returned loss remains connected only to the non-streamed flow/
+        anchor terms, so callers must not backward the streamed terms again.
         """
         batch_size, sequence_length = sequence_shape
         if sequence_offset is None:
@@ -3589,48 +3860,81 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 v3_local_weight = float(getattr(self.config, "hd_v3_local_weight", 1.0))
                 v3_cmd_weight = float(getattr(self.config, "hd_v3_cmd_weight", 1.0))
                 zero_v3 = self.model.action_out_proj.weight.sum() * 0.0
-                if v3_local_weight > 0.0:
-                    qh2l_loss, v3_metrics = self._v3_qh2l_loss(
-                        v3_pair_labels,
-                        trace_collector=v3_trace_collector,
-                        final_hidden_collector=v3_final_hidden_collector,
-                        trace_indices=v3_trace_indices,
-                        reference_batch=v3_reference_batch,
-                        normalizers=v3_pair_normalizers,
-                    )
-                else:
+                # The sequence trainer can request exact streaming replay.
+                # It is enabled only for the canonical complete-window path;
+                # without global denominators the primitive's local robust
+                # statistics would make chunkwise reduction a different
+                # objective, so the historical concatenated path is retained.
+                stream_v3 = bool(
+                    v3_streaming_backward is not None
+                    and v3_reference_batch is not None
+                    and v3_pair_normalizers is not None
+                )
+
+                def _stream_qh2l(loss: Tensor, retain_graph: bool) -> None:
+                    assert v3_streaming_backward is not None
+                    v3_streaming_backward(loss * v3_local_weight, retain_graph)
+
+                def _stream_cmd(loss: Tensor, retain_graph: bool) -> None:
+                    assert v3_streaming_backward is not None
+                    v3_streaming_backward(loss * v3_cmd_weight, retain_graph)
+
+                def _qh2l_call() -> tuple[Tensor, dict[str, float]]:
+                    if v3_local_weight > 0.0:
+                        return self._v3_qh2l_loss(
+                            v3_pair_labels,
+                            trace_collector=v3_trace_collector,
+                            final_hidden_collector=v3_final_hidden_collector,
+                            trace_indices=v3_trace_indices,
+                            reference_batch=v3_reference_batch,
+                            normalizers=v3_pair_normalizers,
+                            stream_backward=_stream_qh2l if stream_v3 else None,
+                            stream_weight=1.0,
+                        )
                     # CMD-only is an explicit reader ablation.  Do not spend
                     # the expensive writer-connected replay or expose a
                     # misleading nonzero QH2L diagnostic when its objective
                     # family is disabled.
-                    qh2l_loss = zero_v3
-                    v3_metrics = {
+                    return zero_v3, {
                         "hd_v3_qh2l": 0.0,
                         "hd_v3_pairs": 0.0,
                         "hd_v3_pairs_skipped": 0.0,
                         "hd_v3_qh2l_disabled": 1.0,
                     }
-                # CMD is a reader/action objective over the same event/future
-                # pairs.  Its replay detaches the event snapshots internally,
-                # so adding it here cannot steal the writer meta-gradient that
-                # QH2L receives above.
-                if v3_cmd_weight > 0.0:
-                    cmd_loss, cmd_metrics = self._v3_cmd_loss(
-                        v3_pair_labels,
-                        trace_collector=v3_trace_collector,
-                        reference_batch=v3_reference_batch,
-                        normalizers=v3_pair_normalizers,
-                    )
-                else:
+
+                def _cmd_call() -> tuple[Tensor, dict[str, float]]:
+                    if v3_cmd_weight > 0.0:
+                        return self._v3_cmd_loss(
+                            v3_pair_labels,
+                            trace_collector=v3_trace_collector,
+                            reference_batch=v3_reference_batch,
+                            normalizers=v3_pair_normalizers,
+                            stream_backward=_stream_cmd if stream_v3 else None,
+                            stream_weight=1.0,
+                        )
                     # QH2L-only retains the complete writer meta-gradient but
                     # intentionally removes CMD's reader/action audit.
-                    cmd_loss = zero_v3
-                    cmd_metrics = {
+                    return zero_v3, {
                         "hd_v3_cmd": 0.0,
                         "hd_v3_cmd_pairs": 0.0,
                         "hd_v3_cmd_pairs_skipped": 0.0,
                         "hd_v3_cmd_disabled": 1.0,
                     }
+
+                # CMD has detached event states and can release each replay
+                # graph immediately.  Running it before writer-connected QH2L
+                # keeps its peak activation memory independent of the QH2L
+                # graph.  The default (non-streaming) order is unchanged for
+                # compatibility with direct callers and old diagnostics.
+                if stream_v3:
+                    cmd_loss, cmd_metrics = _cmd_call()
+                    qh2l_loss, v3_metrics = _qh2l_call()
+                else:
+                    qh2l_loss, v3_metrics = _qh2l_call()
+                    cmd_loss, cmd_metrics = _cmd_call()
+                streamed_v3_loss = float(
+                    v3_metrics.get("hd_v3_qh2l_streamed_loss", 0.0)
+                ) + float(cmd_metrics.get("hd_v3_cmd_streamed_loss", 0.0))
                 bind_loss = (
                     local_ttt_loss.sum()
                     / torch.as_tensor(
@@ -3643,13 +3947,26 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     if local_ttt_loss is not None
                     else student_velocity.sum() * 0.0
                 )
+                # Streamed replay terms were already backwarded synchronously
+                # by the callback.  Add only a detached scalar to the returned
+                # loss so logs/metrics preserve the historical total while a
+                # later trainer backward cannot traverse the replay graphs a
+                # second time.
+                streamed_v3_tensor = torch.as_tensor(
+                    streamed_v3_loss,
+                    device=bind_loss.device,
+                    dtype=bind_loss.dtype,
+                )
                 hd_aux_loss = (
                     v3_local_weight * qh2l_loss
                     + v3_cmd_weight * cmd_loss
+                    + streamed_v3_tensor
                     + 0.01 * bind_loss
                 )
                 hd_metrics = dict(v3_metrics)
                 hd_metrics.update(cmd_metrics)
+                if stream_v3:
+                    hd_metrics["hd_v3_streamed_loss"] = streamed_v3_loss
                 hd_metrics["hd_v3_kvb_anchor"] = float(bind_loss.detach().item())
             else:
                 hd_aux_loss, hd_metrics = self._hd_auxiliary_losses(
