@@ -141,6 +141,16 @@ def _restore_checkpoint_model_fields(
     }
     requested_writer_mode = str(getattr(config, "ttt_writer_mode", None) or "suffix")
     source_writer_mode = str(getattr(source_config, "ttt_writer_mode", None) or "suffix")
+    # The v2 action-effect objective is a deliberate structural conversion
+    # from an ordinary first-order TTT checkpoint to a differentiable
+    # (second-order) inner update.  ``ttt_second_order`` lives in the
+    # checkpoint-architecture set for ordinary loads, but restoring the
+    # source value here would silently turn the requested v2 path back off
+    # (and fail validation) when the teacher checkpoint predates v2.
+    requested_effect_weight = float(requested_hd.get("hd_effect_weight") or 0.0)
+    preserve_second_order_for_effect = bool(
+        requested_effect_weight > 0.0 and getattr(config, "ttt_second_order", False)
+    )
     explicit_hd_opt_in = bool(
         requested_hd.get("hd_ttt_enabled", False)
         or requested_hd.get("hd_learned_write_gate", False)
@@ -167,6 +177,8 @@ def _restore_checkpoint_model_fields(
     for field_name in _CHECKPOINT_ARCHITECTURE_FIELDS:
         if field_name in raw_config:
             setattr(config, field_name, getattr(source_config, field_name))
+    if preserve_second_order_for_effect:
+        config.ttt_second_order = True
     if explicit_hd_override:
         for field_name, value in requested_hd.items():
             setattr(config, field_name, value)
@@ -464,6 +476,15 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         for flag_name in ("hd_ttt_enabled", "hd_learned_write_gate"):
             if values.get(flag_name) is None:
                 values[flag_name] = False
+        # The v2 fields were added after several internal checkpoints had
+        # already been written.  Some of those configs contain an explicit
+        # JSON ``null`` instead of omitting the new field.  Normalize the
+        # nullable representation here as a second guard (the dataclass
+        # annotation also accepts it for the generic draccus path).
+        if values.get("hd_effect_weight") is None:
+            values["hd_effect_weight"] = 0.0
+        if values.get("hd_attribution_protocol") is None:
+            values["hd_attribution_protocol"] = "legacy_raw_hinge_max"
         # ``ttt_writer_mode`` was added after the original suffix writer and
         # a few checkpoints serialized the optional field as JSON ``null``.
         # Treat null exactly like an absent field (the legacy suffix path),

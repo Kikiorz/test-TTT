@@ -2,10 +2,12 @@ import json
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
+import draccus
 import pytest
 import torch
 from torch.utils.data import Dataset
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.smolvla_ttt.configuration_smolvla_ttt import SmolVLATTTConfig
 from lerobot.policies.smolvla_ttt.hd_ttt import (
@@ -104,13 +106,70 @@ def test_legacy_null_hd_flags_decode_as_clean_checkpoint() -> None:
             "type": "smolvla_ttt",
             "hd_ttt_enabled": None,
             "hd_learned_write_gate": None,
+            "hd_effect_weight": None,
+            "hd_attribution_protocol": None,
             "ttt_writer_mode": None,
         }
     )
 
     assert source.hd_ttt_enabled is False
     assert source.hd_learned_write_gate is False
+    assert source.hd_effect_weight == 0.0
+    assert source.hd_attribution_protocol == "legacy_raw_hinge_max"
     assert source.ttt_writer_mode == "suffix"
+
+
+def test_pretrained_config_accepts_null_v2_fields(tmp_path: Path) -> None:
+    """A checkpoint with explicit JSON nulls remains loadable through draccus."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "smolvla_ttt",
+                "hd_effect_weight": None,
+                "hd_attribution_protocol": None,
+            }
+        )
+    )
+
+    loaded = PreTrainedConfig.from_pretrained(tmp_path)
+
+    assert isinstance(loaded, SmolVLATTTConfig)
+    assert loaded.hd_effect_weight == 0.0
+    assert loaded.hd_attribution_protocol == "legacy_raw_hinge_max"
+
+
+def test_pretrained_config_clean_opt_out_zeros_stale_effect_weight(tmp_path: Path) -> None:
+    """Explicit clean opt-out must convert a v2 source config to a valid clean config."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "smolvla_ttt",
+                "hd_ttt_enabled": True,
+                "hd_effect_weight": 1.0,
+                "hd_attribution_protocol": "v2_relative_antithetic_robust",
+                "ttt_second_order": True,
+            }
+        )
+    )
+
+    loaded = PreTrainedConfig.from_pretrained(
+        tmp_path,
+        cli_overrides=["--hd_ttt_enabled=false"],
+    )
+
+    assert isinstance(loaded, SmolVLATTTConfig)
+    assert loaded.hd_ttt_enabled is False
+    assert loaded.hd_effect_weight == 0.0
+
+    # An explicit positive effect override remains a deliberate invalid
+    # clean configuration rather than being silently rewritten.
+    with pytest.raises(draccus.utils.ParsingError):
+        PreTrainedConfig.from_pretrained(
+            tmp_path,
+            cli_overrides=["--hd_ttt_enabled=false", "--hd_effect_weight=1.0"],
+        )
 
 
 def test_config_allows_disabling_register_tokens_and_rejects_negative_count() -> None:
@@ -1370,6 +1429,33 @@ def test_checkpoint_restore_preserves_explicit_hd_opt_in_over_clean_ttt_source()
 
     assert target.hd_ttt_enabled is True
     assert target.hd_learned_write_gate is True
+
+
+def test_checkpoint_restore_keeps_second_order_for_v2_effect_conversion() -> None:
+    """Enabling v2 from a first-order teacher must not be overwritten by source fields."""
+
+    source = SmolVLATTTConfig(
+        ttt_second_order=False,
+        hd_ttt_enabled=False,
+        hd_effect_weight=0.0,
+    )
+    target = SmolVLATTTConfig(
+        ttt_second_order=True,
+        hd_ttt_enabled=True,
+        hd_effect_weight=1.0,
+        hd_attribution_protocol="v2_relative_antithetic_robust",
+    )
+    raw_config = {
+        "type": "smolvla_ttt",
+        "ttt_second_order": False,
+        "hd_ttt_enabled": False,
+    }
+
+    _restore_checkpoint_model_fields(target, source, raw_config)
+
+    assert target.ttt_second_order is True
+    assert target.hd_ttt_enabled is True
+    assert target.hd_effect_weight == 1.0
 
 
 def test_checkpoint_restore_preserves_explicit_hd_opt_out_over_hd_source() -> None:

@@ -239,5 +239,35 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
             config_file = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
+        # A clean evaluation/fine-tuning opt-out of an HD SmolVLA-TTT
+        # checkpoint should not fail while draccus reconstructs the source
+        # config.  The source may carry ``hd_effect_weight>0``; when the user
+        # explicitly sets ``hd_ttt_enabled=false`` and does not provide an
+        # effect override, inject the semantically implied zero before parsing
+        # so ``SmolVLATTTConfig.__post_init__`` can validate a coherent clean
+        # config.  Keep this narrowly scoped to the registered SmolVLA-TTT
+        # config so unrelated policy classes never receive an unknown option,
+        # and preserve an explicit positive effect value as a deliberate
+        # (and consequently rejected) configuration error.
+        cli_overrides = list(cli_overrides or [])
+        if getattr(orig_config, "type", None) == "smolvla_ttt":
+
+            def _override_value(field_name: str) -> str | None:
+                prefix = f"--{field_name}="
+                # YAML-derived overrides precede command-line overrides; use
+                # the last occurrence to mirror argparse/draccus precedence
+                # when callers intentionally provide the same field twice.
+                for argument in reversed(cli_overrides):
+                    if argument.startswith(prefix):
+                        return argument[len(prefix) :].strip().lower()
+                return None
+
+            hd_enabled_override = _override_value("hd_ttt_enabled")
+            effect_override = _override_value("hd_effect_weight")
+            if (
+                hd_enabled_override in {"false", "0", "no", "off"}
+                and effect_override is None
+            ):
+                cli_overrides.append("--hd_effect_weight=0.0")
         with draccus.config_type("json"):
             return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)

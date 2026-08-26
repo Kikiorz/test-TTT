@@ -157,7 +157,11 @@ class SmolVLATTTConfig(PreTrainedConfig):
     hd_h2l_weight: float = 1.0
     # v2 compact action-effect/content distillation.  Zero preserves the
     # legacy HD objective unless a v2 recipe opts in explicitly.
-    hd_effect_weight: float = 0.0
+    # ``None`` is accepted at the decode boundary for checkpoints produced by
+    # an early config writer which serialized this optional extension as JSON
+    # ``null``.  ``__post_init__`` canonicalizes it back to the numeric
+    # compatibility default before any model/loss code reads the field.
+    hd_effect_weight: float | None = 0.0
     hd_grounding_weight: float = 1.0
     hd_invariance_weight: float = 0.25
     hd_event_block_size: int = 4
@@ -178,7 +182,9 @@ class SmolVLATTTConfig(PreTrainedConfig):
     # Label provenance selector.  Keep legacy as the serialization default so
     # old HD artifacts/checkpoints remain loadable; v2 experiments pass the
     # explicit protocol string.
-    hd_attribution_protocol: str = "legacy_raw_hinge_max"
+    # As above, retain a nullable annotation solely for backwards-compatible
+    # JSON decoding; runtime configs are always canonical strings.
+    hd_attribution_protocol: str | None = "legacy_raw_hinge_max"
     # Flow velocities in MIKASA's normalized action space are often much
     # smaller than 0.05.  A non-zero dead-zone would therefore erase most of
     # the counterfactual grounding signal before it reaches the reader.  Keep
@@ -200,6 +206,17 @@ class SmolVLATTTConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # A handful of pre-v2 checkpoints contain explicit JSON ``null`` for
+        # fields that were introduced after the original SmolVLA-TTT config.
+        # Normalize those values before numeric/comparison validation below so
+        # both the generic draccus loader and the custom policy loader have the
+        # same clean semantics.  The canonical values are serialized on the
+        # next checkpoint save, so null does not propagate indefinitely.
+        if self.hd_effect_weight is None:
+            self.hd_effect_weight = 0.0
+        if self.hd_attribution_protocol is None:
+            self.hd_attribution_protocol = "legacy_raw_hinge_max"
 
         """Input validation (not exhaustive)."""
         if self.n_action_steps > self.chunk_size:
