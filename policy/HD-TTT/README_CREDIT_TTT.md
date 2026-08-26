@@ -325,6 +325,12 @@ uses the episode reset sentinel.  Nonzero-offset windows must include the
 causal predecessor explicitly; silently zeroing or borrowing it would violate
 the teacher/student contract.
 
+For the published four-task benchmark, each task is a separate training run
+with its own native initialization, normalization statistics, teacher, labels,
+and CreditTTT student checkpoint.  The manifest accepts per-task checkpoint
+maps and fails closed when any task entry is missing; no weights are shared
+across tasks.
+
 ## 7. Artifacts and canonical identity
 
 ### 7.1 Pair-label fields
