@@ -26,6 +26,7 @@ import math
 import os
 import re
 import time
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
 from pprint import pformat
@@ -113,6 +114,71 @@ def _normalize_hd_attribution_protocol(value: Any, *, default: str) -> str:
     if value == "v2":
         return _HD_ATTRIBUTION_PROTOCOL_V2
     return value
+
+
+def _validate_hd_v2_label_contract(
+    metadata: Mapping[str, Any],
+    *,
+    label_keys: set[str] | None = None,
+) -> str:
+    """Validate the immutable protocol fields required by an HD-v2 artifact.
+
+    The causal attribution/effect labels are a coupled offline protocol, not
+    independently swappable columns.  Checking these fields at trainer
+    startup prevents a legacy all-slot artifact (or a partially regenerated
+    effect target) from silently being optimized as the paper method.  The
+    effect branch count intentionally remains ``> 0`` rather than hard-coding
+    two, so an artifact with a different fixed branch budget remains readable
+    by the selected-branch student implementation.
+
+    Returns the canonical protocol string.  Legacy artifacts are accepted and
+    returned as ``legacy_raw_hinge_max``; callers can then skip v2-only checks.
+    """
+
+    protocol = _normalize_hd_attribution_protocol(
+        metadata.get("attribution_protocol"),
+        default=_HD_ATTRIBUTION_PROTOCOL_LEGACY,
+    )
+    if protocol != _HD_ATTRIBUTION_PROTOCOL_V2:
+        if protocol != _HD_ATTRIBUTION_PROTOCOL_LEGACY:
+            raise ValueError(f"HD labels have unsupported attribution_protocol={protocol!r}")
+        return protocol
+
+    required_fields = {
+        "attribution_slot_mode": "slot0",
+        "attribution_replays": 2,
+        "effect_target": "plus_noise_full_minus_wrong",
+    }
+    mismatches: dict[str, tuple[Any, Any]] = {}
+    for field_name, expected in required_fields.items():
+        actual = metadata.get(field_name)
+        # ``bool`` is an ``int`` subclass; reject it explicitly for the replay
+        # count so malformed JSON cannot pass as a valid protocol declaration.
+        if field_name == "attribution_replays":
+            valid = type(actual) is int and actual == expected
+        else:
+            valid = actual == expected
+        if not valid:
+            mismatches[field_name] = (actual, expected)
+    effect_branches = metadata.get("effect_branches")
+    if type(effect_branches) is not int or effect_branches <= 0:
+        mismatches["effect_branches"] = (effect_branches, "> 0")
+    if mismatches:
+        raise ValueError(
+            "HD v2 label protocol contract mismatch: "
+            f"{mismatches} (expected slot0/2/plus_noise_full_minus_wrong and positive effect_branches)"
+        )
+    if label_keys is not None:
+        required_labels = {
+            "hd_teacher_effect",
+            "hd_effect_rho",
+            "hd_effect_write_gate",
+            "hd_effect_valid",
+        }
+        missing = sorted(required_labels - set(label_keys))
+        if missing:
+            raise ValueError(f"HD v2 label artifact is missing action-effect columns: {missing}")
+    return protocol
 
 
 def _hd_ttt_finite_guard(
@@ -482,30 +548,15 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             raise ValueError(
                 "HD v2 labels must declare teacher_ttt_writer_mode='suffix' or 'prefix_only'"
             )
-        required_v2_labels = {
-            "hd_teacher_effect",
-            "hd_effect_rho",
-            "hd_effect_write_gate",
-            "hd_effect_valid",
-        }
-        missing_v2_labels = sorted(required_v2_labels - set(labeled_dataset.label_keys))
-        if missing_v2_labels:
-            raise ValueError(
-                "HD v2 label artifact is missing action-effect columns: "
-                f"{missing_v2_labels}"
-            )
-        # The formal builder emits one selected event branch.  Keep the reader
-        # backward-compatible with older K>1 artifacts, but reject malformed
-        # zero/negative declarations before the model indexes branch zero.
-        declared_effect_branches = metadata.get("effect_branches", 1)
-        if (
-            type(declared_effect_branches) is not int
-            or declared_effect_branches < 1
-        ):
-            raise ValueError(
-                "HD v2 label metadata effect_branches must be a positive integer; "
-                f"got {declared_effect_branches!r}"
-            )
+        # Validate the immutable v2 replay contract at the trainer boundary.
+        # In particular, do not allow an artifact with the right protocol name
+        # but legacy all-slot attribution, a single replay, or a mismatched
+        # effect target to silently train.  ``effect_branches`` remains a
+        # positive-count compatibility field (the student consumes slot 0).
+        _validate_hd_v2_label_contract(
+            metadata,
+            label_keys=set(labeled_dataset.label_keys),
+        )
     common_required_metadata = {
         "phase_mode",
         "history_mode",
