@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from examples.mikasa import benchmark_credit_ttt_v3 as benchmark
 
 
@@ -34,6 +36,28 @@ def _manifest(tmp_path: Path, *, n_episodes: int = 2) -> dict:
     return benchmark.build_manifest(args)
 
 
+def _published_checkpoint_map_args(tmp_path: Path) -> list[str]:
+    """Return complete per-task maps for the canonical four-task profile."""
+
+    task_ids = [task["id"] for task in benchmark.PUBLISHED_COMPARABLE_TASKS]
+    maps = {
+        "native": {task_id: f"/ckpt/native/{task_id}" for task_id in task_ids},
+        "clean": {task_id: f"/ckpt/clean/{task_id}" for task_id in task_ids},
+        "credit": {task_id: f"/ckpt/credit/{task_id}" for task_id in task_ids},
+    }
+    option_names = {
+        "native": "--native-checkpoints-json",
+        "clean": "--clean-checkpoints-json",
+        "credit": "--credit-checkpoints-json",
+    }
+    args: list[str] = []
+    for name, payload in maps.items():
+        path = tmp_path / f"{name}_published.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        args.extend([option_names[name], str(path)])
+    return args
+
+
 def test_published_four_task_profile_schema(tmp_path: Path) -> None:
     parser = benchmark._build_parser()
     args = parser.parse_args(
@@ -51,6 +75,7 @@ def test_published_four_task_profile_schema(tmp_path: Path) -> None:
             "1000",
             "--task-set",
             "published_four",
+            *_published_checkpoint_map_args(tmp_path),
         ]
     )
     manifest = benchmark.build_manifest(args)
@@ -76,11 +101,35 @@ def test_published_four_task_profile_schema(tmp_path: Path) -> None:
     }
     assert manifest["mechanism_audits"]["delay_bins"] == ["1-16"]
     # Four tasks × one train seed × four method variants.  Native K=50 and K=1
-    # still point to the same frozen checkpoint, differing only in cadence.
+    # use the same task-local native checkpoint, differing only in cadence.
     assert len(manifest["commands"]) == 16
+    assert all(scope == "per_task" for scope in manifest["checkpoint_scope"].values())
 
 
-def test_published_profile_uses_all_official_demos() -> None:
+def test_published_four_requires_per_task_checkpoint_maps(tmp_path: Path) -> None:
+    parser = benchmark._build_parser()
+    args = parser.parse_args(
+        [
+            "manifest",
+            "--output",
+            str(tmp_path / "published_manifest.json"),
+            "--repo-root",
+            str(tmp_path),
+            "--python-bin",
+            "python",
+            "--n-episodes",
+            "1",
+            "--train-seeds",
+            "1000",
+            "--task-set",
+            "published_four",
+        ]
+    )
+    with pytest.raises(ValueError, match="published_four requires.*per-task checkpoint map"):
+        benchmark.build_manifest(args)
+
+
+def test_published_profile_uses_all_official_demos(tmp_path: Path) -> None:
     """The canonical four-task recipe must not reserve an implicit 20% split."""
     for task in benchmark.PUBLISHED_COMPARABLE_TASKS:
         assert task["demo_count"] == 250
@@ -89,7 +138,16 @@ def test_published_profile_uses_all_official_demos() -> None:
 
     parser = benchmark._build_parser()
     args = parser.parse_args(
-        ["manifest", "--output", "manifest.json", "--repo-root", ".", "--task-set", "published_four"]
+        [
+            "manifest",
+            "--output",
+            str(tmp_path / "manifest.json"),
+            "--repo-root",
+            str(tmp_path),
+            "--task-set",
+            "published_four",
+            *_published_checkpoint_map_args(tmp_path),
+        ]
     )
     manifest = benchmark.build_manifest(args)
     split = manifest["training"]["demo_split"]
@@ -137,6 +195,7 @@ def test_task_checkpoint_maps_are_frozen_per_task(tmp_path: Path) -> None:
     )
     manifest = benchmark.build_manifest(args)
     assert manifest["checkpoint_scope"]["native_smolvla"] == "per_task"
+    assert manifest["checkpoint_scope"]["native_smolvla_k1"] == "per_task"
     assert manifest["checkpoint_scope"]["clean_ttt"] == "per_task"
     assert manifest["checkpoint_scope"]["credit_ttt"] == "per_task"
     for command in manifest["commands"]:

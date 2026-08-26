@@ -448,11 +448,18 @@ profile: `shell_touch` (SGT), `intercept_medium` (IM), `remember_color3`
 experiment envelope, pass `--task-set legacy_two`; old manifests with the
 two-task protocol ID remain readable.
 
-Student checkpoints are task-local in the recommended protocol because action
-normalization statistics are task-local.  The legacy singular checkpoint flags
-remain valid for an intentionally shared/multitask model.  For independently
-trained tasks, pass a JSON object (a file path or inline object) mapping stable
-task IDs to checkpoints, for example:
+The canonical `published_four` protocol is a one-model/one-task comparison:
+every selected method (Native K=50, Native K=1, Clean-TTT, CreditTTT, and the
+optional Utility-KVB when requested) must use a complete task-local checkpoint
+map.  This is required because action-normalization statistics and the TTT
+state are task-local; allowing a shared checkpoint would change the scientific
+question and can silently apply the wrong task's statistics.  The coordinator
+therefore fails closed if any map is absent or incomplete.  The singular
+`--*-checkpoint` flags remain a compatibility fallback for the historical
+`legacy_two` profile only.
+
+For independently trained tasks, pass a JSON object (a file path or inline
+object) mapping stable task IDs to checkpoints, for example:
 
 ```json
 {
@@ -463,10 +470,13 @@ task IDs to checkpoints, for example:
 }
 ```
 
-Use `--clean-checkpoints-json` and `--credit-checkpoints-json` (and, when
-needed, `--native-checkpoints-json`) with `manifest`.  The frozen manifest
-records `checkpoint_scope` and `checkpoints_by_task`; an incomplete map is
-rejected instead of silently falling back to a different task's checkpoint.
+Use `--native-checkpoints-json`, `--clean-checkpoints-json`, and
+`--credit-checkpoints-json` with `manifest` (and
+`--utility-checkpoints-json` when `--include-optional` is enabled).  The frozen
+manifest records `checkpoint_scope` and `checkpoints_by_task`; an incomplete
+or shared map is rejected instead of silently falling back to a different
+task's checkpoint.  To replay the historical shared-checkpoint envelope, pass
+`--task-set legacy_two`.
 
 All paths below are placeholders; replace them with real checkpoint and dataset
 paths.  The launcher never fabricates an evaluation JSON.

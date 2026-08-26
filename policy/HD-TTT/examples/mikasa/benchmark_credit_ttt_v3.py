@@ -867,6 +867,46 @@ def _method_specs(include_optional: bool) -> list[dict[str, Any]]:
     return [dict(method) for method in METHODS if include_optional or not method["optional"]]
 
 
+def _require_published_four_per_task_checkpoints(
+    task_set: str,
+    methods: Sequence[Mapping[str, Any]],
+    checkpoint_scope: Mapping[str, Any],
+    *,
+    path: str = "manifest",
+) -> None:
+    """Enforce the one-model/one-task contract of the canonical profile.
+
+    ``published_four`` compares independently trained policies on four tasks.
+    A shared checkpoint would conflate a task-generalisation result with a
+    task-normalisation result (and, for TTT students, could silently reuse the
+    wrong action statistics).  The legacy two-task profile intentionally keeps
+    its historical shared-checkpoint fallback, so this guard is profile
+    specific rather than a global restriction on old manifests.
+    """
+
+    if task_set != "published_four":
+        return
+    method_ids = [
+        str(method["id"])
+        for method in methods
+        if isinstance(method, Mapping) and method.get("id") is not None
+    ]
+    non_per_task = sorted(
+        method_id
+        for method_id in method_ids
+        if checkpoint_scope.get(method_id) != "per_task"
+    )
+    if non_per_task:
+        raise ValueError(
+            f"{path}: published_four requires a complete per-task checkpoint map "
+            "for every selected method (one model/checkpoint per task); "
+            f"non-per-task methods: {non_per_task}. "
+            "Supply the corresponding --*-checkpoints-json maps. "
+            "Singular --*-checkpoint flags remain a shared-checkpoint fallback "
+            "for legacy_two only."
+        )
+
+
 def _eval_command(
     *,
     repo_root: str,
@@ -982,6 +1022,12 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         else:
             task_checkpoint_maps[method_id] = mapped
             checkpoint_scope[method_id] = "per_task"
+    _require_published_four_per_task_checkpoints(
+        task_set,
+        methods,
+        checkpoint_scope,
+        path="manifest",
+    )
     checkpoint_map = {
         NATIVE_VARIANT_CHUNK: str(args.native_checkpoint),
         # Same frozen native checkpoint as K=50; this map entry changes only
@@ -2161,7 +2207,10 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     inferred_task_set = (
         "legacy_two" if protocol_id == LEGACY_TWO_TASK_PROTOCOL_ID else "published_four"
     )
-    task_set = _normalize_task_set(manifest.get("task_set", inferred_task_set))
+    raw_task_set = manifest.get("task_set")
+    if raw_task_set is None:
+        raw_task_set = inferred_task_set
+    task_set = _normalize_task_set(raw_task_set)
     expected_protocol = TASK_SET_PROTOCOL_IDS[task_set]
     if protocol_id != expected_protocol:
         raise ValueError(
@@ -2230,17 +2279,40 @@ def _validate_cadence_manifest(manifest: Mapping[str, Any], *, path: Path | str)
 
 
 def _validate_checkpoint_manifest(manifest: Mapping[str, Any], *, path: Path | str) -> None:
-    """Validate optional per-task checkpoint provenance in a frozen manifest.
+    """Validate checkpoint provenance and the canonical one-task contract.
 
-    Older manifests predate ``checkpoints_by_task`` and remain valid; new
-    manifests carry both the map and an explicit ``checkpoint_scope`` so a
-    reviewer can tell whether one student checkpoint was intentionally shared
-    or independently trained for each task.
+    Older ``legacy_two`` manifests predate ``checkpoints_by_task`` and remain
+    valid.  New manifests carry both the map and an explicit
+    ``checkpoint_scope``.  The canonical ``published_four`` profile is stricter:
+    every selected method must be backed by a complete per-task map, otherwise
+    a shared or missing checkpoint could invalidate the cross-task comparison.
     """
 
     raw_maps = manifest.get("checkpoints_by_task")
     raw_scope = manifest.get("checkpoint_scope")
+    protocol_id = str(manifest.get("protocol_id", ""))
+    inferred_task_set = (
+        "published_four"
+        if protocol_id == PUBLISHED_FOUR_TASK_PROTOCOL_ID
+        else "legacy_two"
+    )
+    # Normalize aliases here as well as in ``_load_manifest``.  The validator
+    # is also called directly by tests/tools, and an alias must not provide a
+    # loophole around the canonical published-four guard.
+    task_set = _normalize_task_set(manifest.get("task_set", inferred_task_set))
+    raw_methods = manifest.get("methods")
+    methods = (
+        [item for item in raw_methods if isinstance(item, Mapping)]
+        if isinstance(raw_methods, Sequence) and not isinstance(raw_methods, (str, bytes))
+        else []
+    )
     if raw_maps is None and raw_scope is None:
+        _require_published_four_per_task_checkpoints(
+            task_set,
+            methods,
+            {},
+            path=path,
+        )
         return
     if not isinstance(raw_maps, Mapping) or not isinstance(raw_scope, Mapping):
         raise ValueError(f"{path}: checkpoints_by_task and checkpoint_scope must both be objects")
@@ -2252,7 +2324,7 @@ def _validate_checkpoint_manifest(manifest: Mapping[str, Any], *, path: Path | s
         raise ValueError(f"{path}: manifest has no task IDs for checkpoint map")
     required_methods = {
         str(item["id"])
-        for item in manifest.get("methods", [])
+        for item in methods
         if isinstance(item, Mapping) and item.get("id") is not None
     }
     for method_id in required_methods:
@@ -2276,6 +2348,12 @@ def _validate_checkpoint_manifest(manifest: Mapping[str, Any], *, path: Path | s
             raise ValueError(
                 f"{path}: checkpoint_scope={scope!r} for {method_id!r} but paths differ"
             )
+    _require_published_four_per_task_checkpoints(
+        task_set,
+        methods,
+        raw_scope,
+        path=path,
+    )
 
 
 def _cmd_manifest(args: argparse.Namespace) -> int:
@@ -2605,7 +2683,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TASK_SET,
         help=(
             "Task profile: published_four (default; SGT/IM/RC3/RC9) or "
-            "legacy_two (historical color/shuffle_long). Aliases are accepted."
+            "legacy_two (historical color/shuffle_long). published_four requires "
+            "per-task checkpoint JSON maps; legacy_two permits shared flags. "
+            "Aliases are accepted."
         ),
     )
     manifest.add_argument("--native-checkpoint", default="<CHECKPOINT_NATIVE_SMOLVLA>")
