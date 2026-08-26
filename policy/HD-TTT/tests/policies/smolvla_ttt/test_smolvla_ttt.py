@@ -27,6 +27,7 @@ from lerobot.policies.smolvla_ttt.hd_ttt import (
 from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import (
     SmolVLATTTFlowMatching,
     SmolVLATTTPolicy,
+    _CHECKPOINT_ARCHITECTURE_FIELDS,
     _CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV,
     _CREDIT_TTT_REPLAY_PAIR_CHUNK_SIZE_ENV,
     _credit_ttt_replay_save_on_cpu_enabled,
@@ -231,6 +232,7 @@ def test_legacy_null_hd_flags_decode_as_clean_checkpoint() -> None:
             "hd_learned_write_gate": None,
             "hd_effect_weight": None,
             "hd_attribution_protocol": None,
+            "hd_v3_global_pair_normalization": None,
             "ttt_writer_mode": None,
             "ttt_stable_inner_update": None,
         }
@@ -240,6 +242,7 @@ def test_legacy_null_hd_flags_decode_as_clean_checkpoint() -> None:
     assert source.hd_learned_write_gate is False
     assert source.hd_effect_weight == 0.0
     assert source.hd_attribution_protocol == "legacy_raw_hinge_max"
+    assert source.hd_v3_global_pair_normalization is True
     assert source.ttt_writer_mode == "suffix"
     assert source.ttt_stable_inner_update is False
 
@@ -391,6 +394,50 @@ def test_v3_conversion_preserves_explicit_second_order_from_clean_checkpoint() -
     raw_source = asdict(source)
     _restore_checkpoint_model_fields(target, source, raw_source)
     assert target.ttt_second_order is True
+
+
+def test_v3_global_pair_normalization_is_checkpoint_owned_and_overrideable() -> None:
+    """The DDP objective switch survives restore and explicit ablations."""
+
+    assert "hd_v3_global_pair_normalization" in _CHECKPOINT_ARCHITECTURE_FIELDS
+
+    source = SmolVLATTTConfig(
+        device="cpu",
+        ttt_writer_mode="prefix_only",
+        ttt_second_order=True,
+        hd_ttt_enabled=True,
+        hd_attribution_protocol="credit_ttt_v3_query_effect",
+        hd_v3_global_pair_normalization=False,
+    )
+    target = SmolVLATTTConfig(
+        device="cpu",
+        ttt_writer_mode="prefix_only",
+        ttt_second_order=True,
+        hd_ttt_enabled=True,
+        hd_attribution_protocol="credit_ttt_v3_query_effect",
+        hd_v3_global_pair_normalization=False,
+    )
+    raw_source = {
+        "type": "smolvla_ttt",
+        "hd_ttt_enabled": True,
+        "hd_attribution_protocol": "credit_ttt_v3_query_effect",
+        "hd_v3_global_pair_normalization": False,
+    }
+    _restore_checkpoint_model_fields(target, source, raw_source)
+    assert target.hd_v3_global_pair_normalization is False
+
+    # A parser-provided explicit true value must remain an opt-in when loading
+    # a checkpoint whose source config disables the compatibility ablation.
+    target_opt_in = SmolVLATTTConfig(
+        device="cpu",
+        ttt_writer_mode="prefix_only",
+        ttt_second_order=True,
+        hd_ttt_enabled=True,
+        hd_attribution_protocol="credit_ttt_v3_query_effect",
+        hd_v3_global_pair_normalization=True,
+    )
+    _restore_checkpoint_model_fields(target_opt_in, source, raw_source)
+    assert target_opt_in.hd_v3_global_pair_normalization is True
 
 
 def test_v3_ablation_contract_makes_zero_weight_explicit() -> None:

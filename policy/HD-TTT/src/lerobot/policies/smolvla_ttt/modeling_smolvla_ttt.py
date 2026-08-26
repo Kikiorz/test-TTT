@@ -321,6 +321,7 @@ _CHECKPOINT_ARCHITECTURE_FIELDS = {
     "hd_v3_pair_k",
     "hd_v3_local_weight",
     "hd_v3_cmd_weight",
+    "hd_v3_global_pair_normalization",
     "hd_v3_ablation",
     "hd_v3_cmd_margin",
     "hd_v3_null_weight",
@@ -379,6 +380,7 @@ def _restore_checkpoint_model_fields(
         "hd_v3_pair_k",
         "hd_v3_local_weight",
         "hd_v3_cmd_weight",
+        "hd_v3_global_pair_normalization",
         "hd_v3_ablation",
         "hd_v3_cmd_margin",
         "hd_v3_null_weight",
@@ -791,6 +793,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             values["hd_effect_weight"] = 0.0
         if values.get("hd_attribution_protocol") is None:
             values["hd_attribution_protocol"] = "legacy_raw_hinge_max"
+        if values.get("hd_v3_global_pair_normalization") is None:
+            # This switch was introduced after early V3 checkpoints.  Decode
+            # an explicit JSON null as the canonical default before draccus
+            # sees the non-optional boolean annotation.
+            values["hd_v3_global_pair_normalization"] = True
         # ``ttt_writer_mode`` was added after the original suffix writer and
         # a few checkpoints serialized the optional field as JSON ``null``.
         # Treat null exactly like an absent field (the legacy suffix path),

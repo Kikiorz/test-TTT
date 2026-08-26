@@ -246,9 +246,10 @@ class SmolVLATTTConfig(PreTrainedConfig):
     # In distributed B>1 sequence training, normalize each V3 stratum with
     # the all-rank pair population (rather than a rank-local denominator).
     # The trainer compensates for Accelerate's explicit gradient mean so the
-    # resulting objective is the global pair-weighted mean.  Single-process
-    # and historical B=1 paths are unchanged; setting this false is retained
-    # as an explicit compatibility/ablation switch.
+    # resulting objective is the global pair-weighted mean.  The
+    # single-process path is unchanged; distributed B=1 intentionally uses
+    # the same all-rank contract as larger local batches.  Setting this false
+    # is retained as an explicit compatibility/ablation switch.
     hd_v3_global_pair_normalization: bool = True
     # Explicit objective-family selector for preregistered V3 ablations.
     # ``full`` is the canonical method; the two ablation names make a zero

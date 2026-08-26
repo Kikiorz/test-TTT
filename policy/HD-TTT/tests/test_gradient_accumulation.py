@@ -294,7 +294,7 @@ def test_v3_ddp_pair_normalizers_disabled_and_single_process_are_noops() -> None
     assert single.calls == 0
 
 
-def test_v3_b1_normalizer_formula_remains_the_historical_local_value() -> None:
+def test_v3_single_process_normalizer_formula_remains_local_value() -> None:
     labels = {
         "valid": torch.tensor([True, True, False]),
         "positive": torch.tensor([True, False, True]),

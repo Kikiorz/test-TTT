@@ -1645,8 +1645,11 @@ def _v3_ddp_pair_normalizers(
     gradient is the global pair-weighted numerator divided by the global
     denominator.
 
-    The helper is deliberately a no-op for single-process/B=1 compatibility,
-    for missing reference windows, or when the policy switch is false.  It
+    The helper is deliberately a no-op for single-process compatibility, for
+    missing reference windows, or when the policy switch is false.  In a
+    distributed run it also applies when each rank has ``B=1``: the objective
+    is global pair-weighted across ranks rather than an average of rank-local
+    ratios.  It
     invokes the model's existing private label-preparation routine instead of
     reimplementing pair validity/utility rules, keeping the protocol identical
     to the direct V3 path.  A missing pair artifact contributes zero
@@ -1716,8 +1719,9 @@ def _ddp_reduce_gradients(
     corresponding parameters take the compatibility per-parameter path on all
     ranks, preventing collective-order divergence.  Ordinary dense models use
     one all-reduce per dtype/device group instead of one per parameter.  The
-    function is only called for multi-process sequence training; the B=1 /
-    single-process path is therefore untouched.
+    function is only called for multi-process sequence training; the
+    single-process path is therefore untouched.  A distributed local ``B=1``
+    run still uses this reducer, as required by the explicit global objective.
     """
 
     if accelerator.num_processes <= 1:
@@ -2049,7 +2053,7 @@ def update_policy_tbptt(
     # chunk synchronously and release its checkpoint graph before constructing
     # the next one.  ``accelerator.backward`` is intentionally kept here,
     # outside the model, so the policy remains framework-agnostic and the
-    # historical non-V3/B=1 call path is unchanged.
+    # historical non-V3 callback path is unchanged.
     stream_v3_replay = bool(
         str(getattr(policy_config, "hd_attribution_protocol", ""))
         == _HD_ATTRIBUTION_PROTOCOL_V3

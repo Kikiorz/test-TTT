@@ -371,19 +371,28 @@ all-reduced across DDP ranks before replay.  Each rank receives the global
 denominator divided by the world size; this exactly cancels the trainer's
 explicit gradient mean, yielding a global pair-weighted numerator/denominator
 for every stratum instead of an average of rank-local ratios.  The switch is
-`hd_v3_global_pair_normalization` (default `true`); single-process and B=1
-paths do not issue these collectives and retain their historical values.  A
-`false` value is only a named compatibility/ablation setting.
+`hd_v3_global_pair_normalization` (default `true`); only the single-process
+path omits these collectives.  Distributed runs use the same contract even
+when each rank has `B=1`, which is the canonical per-device sequence setting.
+A `false` value is only a named compatibility/ablation setting.
 
 When memory limits the per-device trajectory batch, the top-level
-`gradient_accumulation_steps` option (default `1`) averages gradients from that
-many independent windows before one optimizer/scheduler update.  Fast-weight
+`gradient_accumulation_steps` option (default `1`) averages the losses/gradients
+of that many independent windows with equal window weight before one
+optimizer/scheduler update.  It does not pool pair denominators across those
+windows.  Fast-weight
 and grounding states are reset at each window, while all TBPTT segments within
 one window retain their existing recurrent carry.  V3 replay callbacks receive
 the same `1/N` scale as the ordinary flow loss, so QH2L/CMD ratios and the
 writer/reader gradient split are unchanged.  DDP reduction, clipping,
 checkpoint, and evaluation cadence occur only on the final micro-window; the
 sidecar records the resulting effective batch.
+
+For executable student stages, an explicitly supplied `STEPS` must be a
+positive integer and, in canonical mode, an integer number of complete
+sequence epochs and at least `MIN_SEQUENCE_EPOCHS`.  `ALLOW_SHORT_RUN=1` is the
+named smoke/pilot escape hatch for a partial epoch.  The provenance sidecar
+records whether `STEPS` was explicit and the resulting complete-epoch count.
 
 The four-card launcher can run two independent tasks on two cards each, or one
 task on all four cards.  Native (non-TTT) SmolVLA has no recurrent-state

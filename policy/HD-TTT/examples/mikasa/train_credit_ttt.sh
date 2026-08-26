@@ -60,6 +60,9 @@ Useful overrides:
   FEATURE_EPISODE_END=250, OUTPUT_ROOT=..., SEED=1000,
   EPOCHS=150 (canonical student minimum; one sequence epoch = one pass over
   the selected episode windows),
+  STEPS=<optional override> (canonical runs must contain complete sequence
+  epochs and satisfy MIN_SEQUENCE_EPOCHS; partial/short values require
+  ALLOW_SHORT_RUN=1),
   BATCH_SIZE=1 (per-device; set to 2 or 4 with EQUAL_LENGTH_BATCHING=1 for
   exact-length trajectory buckets),
   GRADIENT_ACCUMULATION_STEPS=1 (sequence windows averaged per optimizer step;
@@ -232,6 +235,15 @@ esac
 EPOCHS="${EPOCHS:-150}"
 MIN_SEQUENCE_EPOCHS="${MIN_SEQUENCE_EPOCHS:-150}"
 ALLOW_SHORT_RUN="${ALLOW_SHORT_RUN:-0}"
+# Preserve whether the caller supplied STEPS explicitly.  The canonical
+# default is resolved from the exact sampler arithmetic below; an explicit
+# value is accepted only when it denotes complete sequence epochs (unless the
+# caller has explicitly marked a smoke/pilot run).
+if [[ "${STEPS+x}" == "x" && -n "${STEPS}" ]]; then
+  STEPS_WAS_EXPLICIT=1
+else
+  STEPS_WAS_EXPLICIT=0
+fi
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 EQUAL_LENGTH_BATCHING="${EQUAL_LENGTH_BATCHING:-0}"
@@ -483,7 +495,45 @@ PY
   fi
   MICRO_BATCHES_PER_EPOCH="${BATCHES_PER_RANK}"
   STEPS_PER_EPOCH="$((BATCHES_PER_RANK / GRADIENT_ACCUMULATION_STEPS))"
-  STEPS="${STEPS:-$((STEPS_PER_EPOCH * EPOCHS))}"
+  if (( STEPS_WAS_EXPLICIT == 0 )); then
+    STEPS="$((STEPS_PER_EPOCH * EPOCHS))"
+  fi
+}
+
+validate_student_step_contract() {
+  if ! [[ "${MIN_SEQUENCE_EPOCHS}" =~ ^[0-9]+$ && "${EPOCHS}" =~ ^[0-9]+$ ]]; then
+    echo "MIN_SEQUENCE_EPOCHS and EPOCHS must be non-negative integers" >&2
+    return 2
+  fi
+  if ! [[ "${STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "STEPS must be a positive integer; got '${STEPS}'" >&2
+    return 2
+  fi
+  if (( STEPS_PER_EPOCH <= 0 )); then
+    echo "Resolved STEPS_PER_EPOCH must be positive; got '${STEPS_PER_EPOCH}'" >&2
+    return 2
+  fi
+  if (( STEPS_WAS_EXPLICIT == 1 && ALLOW_SHORT_RUN != 1 \
+        && STEPS % STEPS_PER_EPOCH != 0 )); then
+    echo "Refusing explicit STEPS=${STEPS}: it is not a complete number of sequence epochs (${STEPS_PER_EPOCH} optimizer steps/epoch). Set ALLOW_SHORT_RUN=1 only for a named smoke/pilot run." >&2
+    return 2
+  fi
+  if [[ "${ALLOW_SHORT_RUN}" != "1" ]]; then
+    if (( EPOCHS < MIN_SEQUENCE_EPOCHS )); then
+      echo "Refusing a canonical student run with EPOCHS=${EPOCHS}; minimum is "\
+           "${MIN_SEQUENCE_EPOCHS}. Set ALLOW_SHORT_RUN=1 only for a named "\
+           "smoke/pilot experiment." >&2
+      return 2
+    fi
+    local minimum_steps=$((STEPS_PER_EPOCH * MIN_SEQUENCE_EPOCHS))
+    if (( STEPS < minimum_steps )); then
+      echo "Refusing a canonical student run with STEPS=${STEPS}; minimum is "\
+           "${minimum_steps} (${MIN_SEQUENCE_EPOCHS} sequence epochs x "\
+           "${STEPS_PER_EPOCH} optimizer steps/sequence epoch). Set "\
+           "ALLOW_SHORT_RUN=1 only for a named smoke/pilot experiment." >&2
+      return 2
+    fi
+  fi
 }
 
 write_training_metadata() {
@@ -502,6 +552,7 @@ write_training_metadata() {
     "${EPOCHS}" \
     "${STEPS}" \
     "${STEPS_PER_EPOCH}" \
+    "${STEPS_WAS_EXPLICIT}" \
     "${SEQUENCE_LENGTH}" \
     "${SEQUENCE_STRIDE}" \
     "${MIN_EPISODE_LENGTH}" \
@@ -529,6 +580,7 @@ from pathlib import Path
     epochs,
     steps,
     steps_per_epoch,
+    steps_was_explicit,
     sequence_length,
     sequence_stride,
     min_episode_length,
@@ -557,6 +609,12 @@ payload = {
     "epochs": int(epochs),
     "steps": int(steps),
     "steps_per_epoch": int(steps_per_epoch),
+    "steps_was_explicit": bool(int(steps_was_explicit)),
+    "complete_sequence_epochs": (
+        int(steps) // int(steps_per_epoch)
+        if int(steps) % int(steps_per_epoch) == 0
+        else None
+    ),
     "gradient_accumulation_steps": int(gradient_accumulation_steps),
     "effective_batch_size": int(batching["global_batch_size"] * int(gradient_accumulation_steps)),
     "hd_v3_global_pair_normalization": bool(int(global_pair_normalization)),
@@ -835,27 +893,7 @@ fi
 require_runtime_inputs
 if [[ "${STAGE}" == "student" || "${STAGE}" == "all" ]]; then
   resolve_full_history_window
-  if [[ "${ALLOW_SHORT_RUN}" != "1" ]]; then
-    if ! [[ "${MIN_SEQUENCE_EPOCHS}" =~ ^[0-9]+$ && "${EPOCHS}" =~ ^[0-9]+$ ]]; then
-      echo "MIN_SEQUENCE_EPOCHS and EPOCHS must be non-negative integers" >&2
-      exit 2
-    fi
-    if (( EPOCHS < MIN_SEQUENCE_EPOCHS )); then
-      echo "Refusing a canonical student run with EPOCHS=${EPOCHS}; minimum is "\
-           "${MIN_SEQUENCE_EPOCHS}. Set ALLOW_SHORT_RUN=1 only for a named "\
-           "smoke/pilot experiment." >&2
-      exit 2
-    fi
-    minimum_steps=$((STEPS_PER_EPOCH * MIN_SEQUENCE_EPOCHS))
-    if (( STEPS < minimum_steps )); then
-      echo "Refusing a canonical student run with STEPS=${STEPS}; minimum is "\
-           "${minimum_steps} (${MIN_SEQUENCE_EPOCHS} sequence epochs x "\
-           "${STEPS_PER_EPOCH} optimizer steps/sequence epoch). Set "\
-           "ALLOW_SHORT_RUN=1 only "\
-           "for a named smoke/pilot experiment." >&2
-      exit 2
-    fi
-  fi
+  validate_student_step_contract || exit $?
 else
   # Teacher/label stages do not launch the sequence trainer.  Keep symbolic
   # values available for a concise status line without pretending that a
