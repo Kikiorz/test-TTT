@@ -164,6 +164,11 @@ _COMPLEMENTARY_KEYS = (
     "messages",
     "message_streams",
     "target_message_indices",
+    # Sequence metadata used by the SmolVLA-TTT CreditTTT path.  It is kept
+    # outside the ``hd_*`` namespace so its presence does not signal that a
+    # batch carries hindsight labels, but it must survive the generic policy
+    # preprocessor's batch<->transition conversion.
+    "_lerobot_sequence_offset",
 )
 
 

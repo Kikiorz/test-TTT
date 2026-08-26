@@ -23,6 +23,13 @@ from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import ACTION
 
 SEQUENCE_SHAPE_KEY = "_lerobot_sequence_shape"
+# Episode-local index of the first physical frame represented by a sampled
+# sequence.  Unlike ``SEQUENCE_SHAPE_KEY`` this metadata must survive the
+# policy preprocessor: CreditTTT pair labels are episode-local, while the
+# dataloader flattens a selected episode view into one contiguous tensor.
+# Keeping the key outside the ``hd_*`` namespace is intentional; its presence
+# must not make an otherwise unlabeled/clean batch look like an HD-label batch.
+SEQUENCE_OFFSET_KEY = "_lerobot_sequence_offset"
 # Complementary frame mask for training-only HD writer objectives.  Unlike
 # ``action_is_pad`` it remains true on replayed history frames: those frames
 # have no imitation target in the current window, but their causal interaction
@@ -114,6 +121,12 @@ class TailPreservingSequenceDataset(Dataset):
         self.hd_window_keyed = bool(getattr(dataset, "hd_window_keyed", False))
         self.window_specs: list[tuple[int, int]] = []
         self.history_specs: list[tuple[int, int]] = []
+        # One entry per sampled target window.  Values are episode-local (not
+        # global selected-view indices) and include any replayed warm-up rows.
+        # For a window beginning at frame ``o`` with a warm-up of ``w``, the
+        # value is ``max(0, o-w)``; this is exactly the coordinate origin used
+        # by the offline event/future pair artifact.
+        self.window_sequence_offsets: list[int] = []
 
         episode_start = 0
         for episode_length in _dataset_episode_lengths(dataset):
@@ -167,6 +180,7 @@ class TailPreservingSequenceDataset(Dataset):
                     else max(episode_start, target_start - self.history_warmup_length)
                 )
                 self.history_specs.append((history_start, target_start))
+                self.window_sequence_offsets.append(int(history_start - episode_start))
             episode_start += episode_length
 
         if episode_start != len(dataset):
@@ -182,6 +196,9 @@ class TailPreservingSequenceDataset(Dataset):
     def __getitem__(self, index: int) -> list[dict[str, Any]]:
         start_index, window_length = self.window_specs[index]
         history_start, target_start = self.history_specs[index]
+        sequence_offset = self.window_sequence_offsets[index]
+        if sequence_offset < 0:
+            raise RuntimeError("Internal sequence offset bookkeeping produced a negative value")
         if target_start != start_index:
             raise RuntimeError("Internal history/target window bookkeeping is inconsistent")
         window_labels = None
@@ -198,6 +215,11 @@ class TailPreservingSequenceDataset(Dataset):
         samples: list[dict[str, Any]] = []
         for absolute_index in range(history_start, start_index + window_length):
             sample = dict(self.dataset[absolute_index])
+            # Attach the same scalar to every row so ordinary/default collate
+            # cannot accidentally infer a different origin from one timestep.
+            # ``sequence_collate_fn`` validates consistency and stores a
+            # single scalar in the flattened batch.
+            sample[SEQUENCE_OFFSET_KEY] = torch.tensor(sequence_offset, dtype=torch.int64)
             # Save the physical action-slot mask before the warm-up convention
             # below replaces ``action_is_pad`` with all-true values.  This
             # auxiliary mask is consumed only by the HD local writer loss;
@@ -287,8 +309,56 @@ def sequence_collate_fn(batch: list[list[dict[str, Any]]]) -> dict[str, Any]:
     if any(sample is None for sample in batch[0]):
         raise ValueError("Sequence samples cannot be None because dropping a timestep corrupts TTT state")
 
+    # All rows in one sampled window share one episode-local origin.  Keep a
+    # backward-compatible fallback for direct callers that construct legacy
+    # sequences without metadata, but reject partial/mixed metadata rather
+    # than silently training against misaligned pair labels.
+    raw_offsets = [sample.get(SEQUENCE_OFFSET_KEY) for sample in batch[0]]
+    present = [value is not None for value in raw_offsets]
+    if any(present) and not all(present):
+        raise ValueError(
+            f"Inconsistent sequence batch: {SEQUENCE_OFFSET_KEY!r} is present on only "
+            f"{sum(present)}/{len(present)} timesteps"
+        )
+    if any(present):
+        offsets: list[int] = []
+        for value in raw_offsets:
+            try:
+                tensor = torch.as_tensor(value)
+            except Exception as exc:
+                raise ValueError(
+                    f"{SEQUENCE_OFFSET_KEY!r} must be an integer scalar"
+                ) from exc
+            if tensor.numel() != 1:
+                raise ValueError(
+                    f"{SEQUENCE_OFFSET_KEY!r} must be scalar per timestep, "
+                    f"got shape {tuple(tensor.shape)}"
+                )
+            scalar = tensor.reshape(()).item()
+            if isinstance(scalar, float) and not scalar.is_integer():
+                raise ValueError(
+                    f"{SEQUENCE_OFFSET_KEY!r} must be integral, got {scalar!r}"
+                )
+            offset = int(scalar)
+            if offset < 0:
+                raise ValueError(
+                    f"{SEQUENCE_OFFSET_KEY!r} must be non-negative, got {offset}"
+                )
+            offsets.append(offset)
+        if len(set(offsets)) != 1:
+            raise ValueError(
+                f"All timesteps in a sequence must share {SEQUENCE_OFFSET_KEY!r}; "
+                f"got {offsets}"
+            )
+        sequence_offset = offsets[0]
+    else:
+        sequence_offset = 0
+
     collated = lerobot_collate_fn(batch[0])
     if collated is None:
         raise ValueError("Sequence collation unexpectedly produced an empty batch")
     collated[SEQUENCE_SHAPE_KEY] = torch.tensor([1, sequence_length], dtype=torch.int64)
+    # Override default_collate's [T] representation with one scalar.  This
+    # keeps the metadata invariant under TBPTT slicing and processor batching.
+    collated[SEQUENCE_OFFSET_KEY] = torch.tensor(sequence_offset, dtype=torch.int64)
     return collated

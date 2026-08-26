@@ -5,7 +5,11 @@ import torch
 from torch.utils.data import Dataset
 
 from lerobot.policies.smolvla_ttt.hd_dataset import HindsightLabelDataset
-from lerobot.policies.smolvla_ttt.sequence import TailPreservingSequenceDataset, sequence_collate_fn
+from lerobot.policies.smolvla_ttt.sequence import (
+    SEQUENCE_OFFSET_KEY,
+    TailPreservingSequenceDataset,
+    sequence_collate_fn,
+)
 from lerobot.processor.converters import batch_to_transition, transition_to_batch
 
 
@@ -125,10 +129,58 @@ def test_labels_survive_sequence_collation_and_processor_transition(tmp_path) ->
     assert batch["hd_rho"].shape == (3,)
 
     transition = batch_to_transition(
-        {"observation.state": batch["observation.state"], "hd_rho": batch["hd_rho"]}
+        {
+            "observation.state": batch["observation.state"],
+            "hd_rho": batch["hd_rho"],
+            SEQUENCE_OFFSET_KEY: batch[SEQUENCE_OFFSET_KEY],
+        }
     )
     round_trip = transition_to_batch(transition)
     torch.testing.assert_close(round_trip["hd_rho"], batch["hd_rho"])
+    torch.testing.assert_close(round_trip[SEQUENCE_OFFSET_KEY], batch[SEQUENCE_OFFSET_KEY])
+
+
+def test_sequence_offset_is_episode_local_and_includes_warmup() -> None:
+    dataset = _EpisodeDataset([20])
+    sequences = TailPreservingSequenceDataset(
+        dataset,
+        sequence_length=4,
+        sequence_stride=4,
+        history_warmup_length=3,
+    )
+
+    # Window 1 targets frame 4 and replays frames 1..3, so pair indices must
+    # be interpreted relative to episode frame 1 rather than selected-view 0.
+    assert sequences.window_sequence_offsets[:3] == [0, 1, 5]
+    samples = sequences[1]
+    assert [sample[SEQUENCE_OFFSET_KEY].item() for sample in samples] == [1] * len(samples)
+    collated = sequence_collate_fn([samples])
+    assert collated[SEQUENCE_OFFSET_KEY].ndim == 0
+    assert collated[SEQUENCE_OFFSET_KEY].item() == 1
+
+
+def test_sequence_offset_resets_at_episode_boundary() -> None:
+    dataset = _EpisodeDataset([3, 4])
+    sequences = TailPreservingSequenceDataset(
+        dataset,
+        sequence_length=4,
+        sequence_stride=4,
+        history_warmup_length=3,
+    )
+
+    # The second episode starts at selected-view index 3, but its first window
+    # is episode-local frame 0 and must not inherit the previous episode's 3.
+    assert sequences.window_sequence_offsets == [0, 0]
+    assert [sample["observation.state"].item() for sample in sequences[1]] == [3, 4, 5, 6]
+
+
+def test_sequence_collate_rejects_mixed_offsets() -> None:
+    dataset = _EpisodeDataset([4])
+    sequences = TailPreservingSequenceDataset(dataset, sequence_length=4, sequence_stride=4)
+    samples = sequences[0]
+    samples[0][SEQUENCE_OFFSET_KEY] = torch.tensor(1, dtype=torch.int64)
+    with pytest.raises(ValueError, match="share .*sequence_offset"):
+        sequence_collate_fn([samples])
 
 
 def test_window_keyed_labels_preserve_the_exact_replay_context(tmp_path) -> None:
