@@ -151,9 +151,10 @@ def test_pretrained_config_clean_opt_out_zeros_stale_effect_weight(tmp_path: Pat
             {
                 "type": "smolvla_ttt",
                 "hd_ttt_enabled": True,
-                "hd_effect_weight": 1.0,
-                "hd_attribution_protocol": "v2_relative_antithetic_robust",
-                "ttt_second_order": True,
+                "hd_learned_write_gate": True,
+                "hd_effect_weight": 0.0,
+                "hd_attribution_protocol": "legacy_raw_hinge_max",
+                "ttt_second_order": False,
             }
         )
     )
@@ -165,6 +166,7 @@ def test_pretrained_config_clean_opt_out_zeros_stale_effect_weight(tmp_path: Pat
 
     assert isinstance(loaded, SmolVLATTTConfig)
     assert loaded.hd_ttt_enabled is False
+    assert loaded.hd_learned_write_gate is False
     assert loaded.hd_effect_weight == 0.0
 
     # An explicit positive effect override remains a deliberate invalid

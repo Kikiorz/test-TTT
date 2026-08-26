@@ -286,11 +286,17 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
             hd_enabled_override = _override_value("hd_ttt_enabled")
             effect_override = _override_value("hd_effect_weight")
+            gate_override = _override_value("hd_learned_write_gate")
             if (
                 hd_enabled_override in {"false", "0", "no", "off"}
                 and effect_override is None
             ):
                 cli_overrides.append("--hd_effect_weight=0.0")
+            if (
+                hd_enabled_override in {"false", "0", "no", "off"}
+                and gate_override is None
+            ):
+                cli_overrides.append("--hd_learned_write_gate=false")
         with draccus.config_type("json"):
             parsed_config = draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
         # Keep the generic parser and the custom SmolVLA-TTT checkpoint
