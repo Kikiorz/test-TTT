@@ -239,6 +239,34 @@ def _hd_ttt_finite_guard(
     if python_bad_names:
         local_bad = torch.maximum(local_bad, torch.ones_like(local_bad))
 
+    # Distributed failures otherwise report only ``another distributed rank``
+    # on the main process.  Keep an opt-in, rank-local report for numerical
+    # bring-up; the normal path does not format tensors or synchronize any
+    # additional values.  This is intentionally an execution diagnostic, not
+    # part of the training objective.
+    if os.environ.get("HD_TTT_DEBUG_FINITE", "0") == "1":
+        local_bad_names = list(python_bad_names)
+        for name, value in tensor_values:
+            if value.numel() == 0 or not (value.is_floating_point() or value.is_complex()):
+                if name.endswith("nonfinite_seen") and value.numel() > 0 and bool(value.detach().bool().any().item()):
+                    local_bad_names.append(name)
+                continue
+            try:
+                if not bool(torch.isfinite(value.detach()).all().item()):
+                    local_bad_names.append(name)
+                elif name.endswith("nonfinite_seen") and bool(value.detach().bool().any().item()):
+                    local_bad_names.append(name)
+            except RuntimeError:
+                local_bad_names.append(f"{name}(uncheckable)")
+        process_index = getattr(accelerator, "process_index", 0) if accelerator is not None else 0
+        print(
+            "[HD-TTT finite debug] "
+            f"rank={process_index} stage={stage!r} segment={segment_index} "
+            f"local_bad={bool(local_bad.detach().item())} "
+            f"names={local_bad_names[:16]}",
+            flush=True,
+        )
+
     if accelerator is not None and getattr(accelerator, "num_processes", 1) > 1:
         global_bad = accelerator.reduce(local_bad, reduction="sum")
         has_bad_value = bool(global_bad.detach().item() > 0)
