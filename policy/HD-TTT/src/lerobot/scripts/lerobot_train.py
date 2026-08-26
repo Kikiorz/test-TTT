@@ -19,11 +19,14 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import hashlib
+import json
 import logging
 import os
 import re
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -86,6 +89,90 @@ from .lerobot_eval import eval_policy_all
 # frame/window label artifact generated with a different rule can have a
 # single-branch ``hd_rho`` that no longer matches its stored wrong velocity.
 _HD_GROUNDING_EVENT_POLICY = "min_future_horizon_mean_else_total_credit"
+
+
+def _teacher_config_sha256(checkpoint: str | Path | None) -> str:
+    """Resolve and hash the exact teacher ``config.json`` used for labels.
+
+    HD labels are counterfactual outputs of one specific clean teacher.  A
+    path string alone is not a sufficient provenance key because the same
+    path can be replaced or a Hub alias can resolve to a different revision.
+    The label builders record the raw config-file SHA; training therefore
+    hashes the current ``pretrained_path`` before attaching labels and fails
+    on any mismatch.  Hub resolution is deliberately lazy so ordinary
+    non-HD training does not import or contact the Hub.
+    """
+
+    if checkpoint is None:
+        raise ValueError(
+            "HD labels require policy.pretrained_path so the teacher config can be verified"
+        )
+    checkpoint_text = str(checkpoint)
+    checkpoint_path = Path(checkpoint_text).expanduser()
+    if checkpoint_path.is_dir():
+        config_path = checkpoint_path / "config.json"
+    elif checkpoint_path.is_file() and checkpoint_path.name == "config.json":
+        config_path = checkpoint_path
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            config_path = Path(
+                hf_hub_download(repo_id=checkpoint_text, filename="config.json")
+            )
+        except Exception as error:
+            raise ValueError(
+                "Could not resolve config.json for the current HD teacher "
+                f"{checkpoint_text!r}: {error}"
+            ) from error
+    if not config_path.is_file():
+        raise ValueError(
+            "Current HD teacher is missing config.json: "
+            f"{config_path} (from {checkpoint_text!r})"
+        )
+    try:
+        config_bytes = config_path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"Could not read current HD teacher config {config_path}: {error}") from error
+    return hashlib.sha256(config_bytes).hexdigest()
+
+
+def _configured_hd_teacher_checkpoint(cfg: TrainPipelineConfig) -> str | Path | None:
+    """Return the clean teacher path recorded by an initial run.
+
+    On resume, LeRobot intentionally changes ``policy.pretrained_path`` to the
+    HD checkpoint being restored.  That checkpoint's config contains the HD
+    switches and therefore cannot have the clean-teacher SHA stored in a
+    hindsight artifact.  The checkpoint also preserves the original
+    ``train_config.json``; recover its ``policy.pretrained_path`` so resuming a
+    valid run keeps the same provenance check instead of spuriously failing.
+    """
+
+    if not getattr(cfg, "resume", False):
+        return getattr(cfg.policy, "pretrained_path", None)
+    checkpoint_dir = getattr(cfg, "checkpoint_path", None)
+    if checkpoint_dir is not None:
+        checkpoint_dir = Path(checkpoint_dir)
+        candidates = (
+            checkpoint_dir / "pretrained_model" / "train_config.json",
+            checkpoint_dir / "train_config.json",
+        )
+        for train_config_path in candidates:
+            if not train_config_path.is_file():
+                continue
+            try:
+                raw = json.loads(train_config_path.read_text(encoding="utf-8"))
+                original = raw.get("policy", {}).get("pretrained_path")
+            except (OSError, json.JSONDecodeError, AttributeError) as error:
+                raise ValueError(
+                    f"Could not read resumed HD train config {train_config_path}: {error}"
+                ) from error
+            if original:
+                return original
+    # A hand-built resume config may not retain the original train config.  In
+    # that case use the active path and let the normal SHA check produce a
+    # precise mismatch rather than silently disabling provenance validation.
+    return getattr(cfg.policy, "pretrained_path", None)
 
 
 def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool):
@@ -293,10 +380,46 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
         )
     artifact_repo = metadata.get("dataset_repo_id")
     configured_repo = getattr(cfg.dataset, "repo_id", None)
-    if artifact_repo is not None and configured_repo is not None and str(artifact_repo) != str(configured_repo):
+    if artifact_repo is None or configured_repo is None or str(artifact_repo) != str(configured_repo):
         raise ValueError(
             "HD label dataset mismatch: artifact was generated for "
             f"{artifact_repo!r}, training dataset is {configured_repo!r}"
+        )
+    # The dataset root is intentionally not part of the identity check: a
+    # byte-identical LeRobot tree may be staged at a different local path on a
+    # worker.  Dataset identity and sampling rate are stable, however, and a
+    # mismatch would invalidate frame-indexed hindsight credits.
+    artifact_fps = metadata.get("fps")
+    dataset_meta = getattr(dataset, "meta", None)
+    dataset_fps = getattr(dataset_meta, "fps", None)
+    if artifact_fps is None or dataset_fps is None:
+        raise ValueError("HD label/dataset provenance is missing fps")
+    try:
+        artifact_fps_int = int(artifact_fps)
+        dataset_fps_int = int(dataset_fps)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"HD label/dataset fps must be integer-like, got artifact={artifact_fps!r}, "
+            f"dataset={dataset_fps!r}"
+        ) from error
+    if type(artifact_fps) is bool or artifact_fps_int != dataset_fps_int:
+        raise ValueError(
+            "HD label fps mismatch: artifact was generated at "
+            f"{artifact_fps!r} Hz, training dataset is {dataset_fps!r} Hz"
+        )
+
+    # ``teacher_config_sha256`` is the strongest portable identity for the
+    # clean replay teacher.  Verify it against the exact config currently
+    # requested by the training run, not merely against the path string stored
+    # in the label artifact.
+    artifact_teacher_hash = str(metadata.get("teacher_config_sha256", ""))
+    teacher_checkpoint = _configured_hd_teacher_checkpoint(cfg)
+    current_teacher_hash = _teacher_config_sha256(teacher_checkpoint)
+    if artifact_teacher_hash != current_teacher_hash:
+        raise ValueError(
+            "HD teacher config mismatch: label artifact SHA256="
+            f"{artifact_teacher_hash}, current pretrained_path SHA256={current_teacher_hash}; "
+            "regenerate labels with the exact clean teacher used for training"
         )
     if (
         labeled_dataset.hd_window_local
@@ -313,8 +436,9 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
         artifact_phase,
         labeled_dataset.hd_window_local,
         metadata.get("checkpoint", "unknown"),
-        metadata.get("teacher_config_sha256", "unknown"),
+        current_teacher_hash,
     )
+    logging.info("HD teacher provenance path used for hash: %s", teacher_checkpoint)
     return labeled_dataset
 
 
