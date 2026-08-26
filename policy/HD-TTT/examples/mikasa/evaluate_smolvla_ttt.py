@@ -78,6 +78,12 @@ def _credit_ttt_protocol_identity(config: Any) -> dict[str, Any] | None:
     # content-replacement schema.
     identity["attribution_protocol"] = getattr(config, "hd_attribution_protocol", None)
     identity["intervention_mode"] = getattr(config, "hd_v3_intervention", None)
+    # The objective-family selector is provenance for explicitly named
+    # QH2L-only/CMD-only ablations.  It is deliberately an extra field: the
+    # immutable protocol identity above remains identical to the canonical
+    # event-write method, while result consumers can no longer mistake a
+    # zero-weight ablation for a full CreditTTT checkpoint.
+    identity["ablation"] = getattr(config, "hd_v3_ablation", "full")
     identity["writer_mode"] = getattr(config, "ttt_writer_mode", None)
     identity["second_order"] = bool(getattr(config, "ttt_second_order", False))
     return identity
@@ -425,6 +431,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 "hd_learned_write_gate": bool(policy.policy.config.hd_learned_write_gate),
                 "hd_attribution_protocol": getattr(
                     policy.policy.config, "hd_attribution_protocol", None
+                ),
+                "hd_v3_ablation": getattr(
+                    policy.policy.config, "hd_v3_ablation", "full"
                 ),
                 "ttt_writer_mode": getattr(policy.policy.config, "ttt_writer_mode", None),
                 "ttt_second_order": bool(getattr(policy.policy.config, "ttt_second_order", False)),
