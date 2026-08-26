@@ -603,9 +603,26 @@ def _iter_result_records(payload: Any, path: Path) -> Iterable[dict[str, Any]]:
     """Yield per-task records from either adapter JSON envelope."""
 
     if isinstance(payload, Mapping) and isinstance(payload.get("results"), list):
+        inherited = {
+            key: payload[key]
+            for key in (
+                "model",
+                "benchmark_protocol",
+                "benchmark_commit",
+                "protocol_id",
+                "protocol_version",
+            )
+            if key in payload
+        }
         for item in payload["results"]:
             if isinstance(item, Mapping):
-                yield dict(item)
+                record = dict(item)
+                # Some lightweight evaluators put provenance on the envelope
+                # rather than repeating it for each task.  Inherit only
+                # absent keys; a per-task value remains authoritative.
+                for key, value in inherited.items():
+                    record.setdefault(key, value)
+                yield record
         return
     if isinstance(payload, Mapping) and "successes" in payload and "env_id" in payload:
         yield dict(payload)
