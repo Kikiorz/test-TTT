@@ -58,7 +58,7 @@ Useful overrides:
   TASK_ID=color|shuffle_long|shell_touch|intercept_medium|remember_color3|remember_color9,
   TRAIN_EPISODE_END=250 (canonical: all 250 demos),
   FEATURE_EPISODE_END=250, OUTPUT_ROOT=..., SEED=1000,
-  EPOCHS=100 (canonical student minimum; one sequence epoch = one pass over
+  EPOCHS=150 (canonical student minimum; one sequence epoch = one pass over
   the selected episode windows),
   BATCH_SIZE=1 (per-device; set to 2 or 4 with EQUAL_LENGTH_BATCHING=1 for
   exact-length trajectory buckets),
@@ -218,8 +218,8 @@ esac
 # passes over the selected episode windows.  A shorter run is allowed only
 # when the caller explicitly marks it as a smoke/pilot run; this prevents a
 # 3k-step diagnostic from being accidentally promoted to a paper checkpoint.
-EPOCHS="${EPOCHS:-100}"
-MIN_SEQUENCE_EPOCHS="${MIN_SEQUENCE_EPOCHS:-100}"
+EPOCHS="${EPOCHS:-150}"
+MIN_SEQUENCE_EPOCHS="${MIN_SEQUENCE_EPOCHS:-150}"
 ALLOW_SHORT_RUN="${ALLOW_SHORT_RUN:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 EQUAL_LENGTH_BATCHING="${EQUAL_LENGTH_BATCHING:-0}"
