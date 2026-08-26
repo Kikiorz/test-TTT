@@ -247,6 +247,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                 config_for_probe["hd_effect_weight"] = 0.0
             if config_for_probe.get("hd_attribution_protocol") is None:
                 config_for_probe["hd_attribution_protocol"] = "legacy_raw_hinge_max"
+            if config_for_probe.get("ttt_writer_mode") is None:
+                config_for_probe["ttt_writer_mode"] = "suffix"
             if config_for_probe != config:
                 config = config_for_probe
                 with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as probe:
