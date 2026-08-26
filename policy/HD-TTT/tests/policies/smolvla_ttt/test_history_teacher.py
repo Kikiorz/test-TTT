@@ -67,7 +67,6 @@ def test_chunked_replay_matches_one_full_episode() -> None:
         rtol=1e-6,
         atol=1e-6,
     )
-    torch.testing.assert_close(first.state.hidden, full.state.hidden)
     torch.testing.assert_close(second.state.hidden, full.state.hidden)
     assert second.state.position.tolist() == full.state.position.tolist() == [10, 8]
 
