@@ -748,8 +748,8 @@ slot 0 后进入下一物理时刻。部署侧没有 teacher、未来帧或专�
 | --- | --- | --- |
 | 已修复（`58db6d4`） | DDP 各 rank 的 episode 长度不同，TBPTT segment 数不同 | 原先 rank 在不同 collective 位置调用 reduce，主进程会误报 “another distributed rank”。现在先同步最大 segment 数，短 rank 用 differentiable zero loss 参与 collective，且不推进 fast state。 |
 | 已验证 | clean prefix one-step、V2 label smoke、writer-connected effect/second-order one-step | 这些只证明张量/梯度路径 finite，不代表 benchmark success rate。 |
-| 已验证 | 修复后的 3-GPU fp32 variable-length DDP 1-step | 不同 Color episode 长度可安全混合；4-GPU bf16 仍需复验。 |
-| 待验证 | 4-GPU bf16 长训练的数值和吞吐 | `MIXED_PRECISION=bf16` 是默认；如失败先保留 rank/local-batch 日志，再与 `MIXED_PRECISION=no` 对照，不能静默吞掉 finite marker。 |
+| 已验证 | 修复后的 3-GPU fp32 与 4-GPU bf16 variable-length DDP 1-step | 不同 Color episode 长度可安全混合；修复后两种精度均通过，state RMS ratio 保持在约 `0.97–1.02`。 |
+| 进行中 | 4-GPU bf16 长训练的数值和吞吐 | `MIXED_PRECISION=bf16` 是默认；长跑仍需观察，不应把 1-step 通过外推为 150-epoch 结论。若失败先保留 rank/local-batch 日志，再与 `MIXED_PRECISION=no` 对照，不能静默吞掉 finite marker。 |
 | 协议边界 | Shuffle-Long 的 label teacher | Color teacher 不能用于 Shuffle 的科学标签；必须先在 Shuffle 自己的数据上训练 clean prefix teacher。现有单 episode Shuffle smoke 仅用于格式/计时检查。 |
 | 计算边界 | Shuffle episode 长度 145–513，full replay 很慢 | 采用预注册的 bounded `L=64, stride=64, context=128, K=4`，并明确 `history_mode=bounded_window_replay`，不能冒充 full-history。 |
 | 研究边界 | HCA 的监督对象 | 它是“删除 learned fast-weight event 后未来动作预测的退化”，不是任意历史 oracle 的真实 action value；论文应写成 control attribution under the clean teacher。 |
