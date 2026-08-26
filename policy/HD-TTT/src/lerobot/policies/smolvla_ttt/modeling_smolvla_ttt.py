@@ -1850,11 +1850,24 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 normalization_floor = compute_action_effect_normalization_floor(
                     teacher_effect[..., :active_dim]
                 )
-                total_value = 0.0
-                positive_value = 0.0
-                null_value = 0.0
-                student_square_sum = 0.0
-                teacher_square_sum = 0.0
+                # Keep metric reductions on the device while replay chunks
+                # are being processed. Calling ``.item()`` for every
+                # component of every chunk forces a host/device
+                # synchronization (ten synchronizations per pair chunk when
+                # QH2L and CMD are both enabled), which can dominate the
+                # otherwise asynchronous replay work. These detached scalar
+                # accumulators retain no autograd graph; only the final
+                # ``.item()`` calls below synchronize.
+                total_metric: Tensor | None = None
+                positive_metric: Tensor | None = None
+                null_metric: Tensor | None = None
+                student_square_metric: Tensor | None = None
+                teacher_square_metric: Tensor | None = None
+
+                def _accumulate_metric(current: Tensor | None, value: Tensor) -> Tensor:
+                    value = value.detach().to(dtype=torch.float64)
+                    return value if current is None else current + value
+
                 feature_count = 0
                 delay_sum = float(
                     pair_labels["delay"].index_select(0, indices).float().sum().item()
@@ -1918,16 +1931,40 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                         return_components=True,
                     )
                     stream_backward(chunk_breakdown.total * stream_scale, True)
-                    total_value += float(chunk_breakdown.total.detach().item())
-                    positive_value += float(chunk_breakdown.positive.detach().item())
-                    null_value += float(chunk_breakdown.null.detach().item())
-                    student_square_sum += float(chunk_student.detach().square().sum().item())
-                    teacher_square_sum += float(chunk_teacher.detach().square().sum().item())
+                    total_metric = _accumulate_metric(total_metric, chunk_breakdown.total)
+                    positive_metric = _accumulate_metric(positive_metric, chunk_breakdown.positive)
+                    null_metric = _accumulate_metric(null_metric, chunk_breakdown.null)
+                    student_square_metric = _accumulate_metric(
+                        student_square_metric, chunk_student.detach().square().sum()
+                    )
+                    teacher_square_metric = _accumulate_metric(
+                        teacher_square_metric, chunk_teacher.detach().square().sum()
+                    )
                     feature_count += int(chunk_student.numel())
                     # Explicitly drop replay outputs before constructing the
                     # next checkpoint graph.  No differentiable tensor is
                     # retained in the metric accumulator.
                     del chunk_breakdown, chunk_student, chunk_teacher
+                # ``pair_count`` is positive, so every accumulator was set by
+                # at least one replay chunk. Keep this explicit: a future
+                # change to chunk filtering should fail loudly instead of
+                # silently reporting a partial metric.
+                if any(
+                    metric is None
+                    for metric in (
+                        total_metric,
+                        positive_metric,
+                        null_metric,
+                        student_square_metric,
+                        teacher_square_metric,
+                    )
+                ):
+                    raise RuntimeError("CreditTTT QH2L streamed metric accumulator is empty")
+                total_value = float(total_metric.item())
+                positive_value = float(positive_metric.item())
+                null_value = float(null_metric.item())
+                student_square_sum = float(student_square_metric.item())
+                teacher_square_sum = float(teacher_square_metric.item())
                 zero = self.model.action_out_proj.weight.sum() * 0.0
                 metrics = {
                     "hd_v3_qh2l": total_value,
@@ -2113,11 +2150,20 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             normalization_floor = compute_action_effect_normalization_floor(
                 teacher_effect_all[..., :active_dim]
             )
-            total_value = 0.0
-            full_value = 0.0
-            effect_value = 0.0
-            rank_value = 0.0
-            null_value = 0.0
+            # Accumulate detached scalar metrics on the device and synchronize
+            # once after all replay chunks. Per-chunk ``.item()`` calls here
+            # serialize the CUDA stream and are especially costly for the
+            # full-flow CMD replay.
+            total_metric: Tensor | None = None
+            full_metric: Tensor | None = None
+            effect_metric: Tensor | None = None
+            rank_metric: Tensor | None = None
+            null_metric: Tensor | None = None
+
+            def _accumulate_metric(current: Tensor | None, value: Tensor) -> Tensor:
+                value = value.detach().to(dtype=torch.float64)
+                return value if current is None else current + value
+
             for start in range(0, pair_count, chunk_size):
                 stop = min(start + chunk_size, pair_count)
                 chunk_indices = indices[start:stop]
@@ -2194,11 +2240,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 # backward.  QH2L uses retain_graph=True below because its
                 # writer-connected state is also needed by the main flow.
                 stream_backward(chunk_breakdown.total * stream_scale, False)
-                total_value += float(chunk_breakdown.total.detach().item())
-                full_value += float(chunk_breakdown.full.detach().item())
-                effect_value += float(chunk_breakdown.effect.detach().item())
-                rank_value += float(chunk_breakdown.rank.detach().item())
-                null_value += float(chunk_breakdown.null.detach().item())
+                total_metric = _accumulate_metric(total_metric, chunk_breakdown.total)
+                full_metric = _accumulate_metric(full_metric, chunk_breakdown.full)
+                effect_metric = _accumulate_metric(effect_metric, chunk_breakdown.effect)
+                rank_metric = _accumulate_metric(rank_metric, chunk_breakdown.rank)
+                null_metric = _accumulate_metric(null_metric, chunk_breakdown.null)
                 del (
                     chunk_breakdown,
                     before_action,
@@ -2208,6 +2254,22 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     chunk_expert,
                     chunk_teacher_effect,
                 )
+            if any(
+                metric is None
+                for metric in (
+                    total_metric,
+                    full_metric,
+                    effect_metric,
+                    rank_metric,
+                    null_metric,
+                )
+            ):
+                raise RuntimeError("CreditTTT CMD streamed metric accumulator is empty")
+            total_value = float(total_metric.item())
+            full_value = float(full_metric.item())
+            effect_value = float(effect_metric.item())
+            rank_value = float(rank_metric.item())
+            null_value = float(null_metric.item())
             zero = self.model.action_out_proj.weight.sum() * 0.0
             metrics.update(
                 {
