@@ -1060,38 +1060,76 @@ def update_policy_tbptt(
         float(batch_size * sequence_length) if use_global_hd_normalization else None
     )
 
-    for segment_index, segment_start in enumerate(range(0, sequence_length, segment_length)):
-        segment_end = min(segment_start + segment_length, sequence_length)
-        current_segment_length = segment_end - segment_start
-        segment_batch = _slice_flattened_sequence_batch(
-            batch,
-            batch_size,
-            sequence_length,
-            segment_start,
-            segment_end,
+    local_num_segments = len(segment_loss_weights)
+    # Tail-preserving windows intentionally have variable physical lengths.
+    # In DDP, ranks can therefore reach the end of their local sequence at
+    # different TBPTT segment indices.  Every rank must nevertheless execute
+    # the same sequence of finite-guard and reduction collectives.  Determine
+    # a common loop bound once; shorter ranks contribute a differentiable zero
+    # loss for the missing suffix and keep their local fast state unchanged.
+    if accelerator.num_processes > 1:
+        segment_count = torch.tensor(
+            local_num_segments, dtype=torch.int32, device=accelerator.device
         )
+        global_num_segments = int(accelerator.reduce(segment_count, reduction="max").item())
+    else:
+        global_num_segments = local_num_segments
+    last_segment_output: dict[str, Any] = {}
 
-        with accelerator.autocast():
-            segment_kwargs = {
-                "sequence_shape": (batch_size, current_segment_length),
-                "fast_states": fast_states,
-            }
-            if grounding_states is not None:
-                # Only SmolVLA-TTT exposes the optional grounding container;
-                # PI0/PI05 sequence policies keep their historical signature.
-                segment_kwargs["grounding_states"] = grounding_states
-            if use_global_hd_normalization:
-                segment_kwargs["flow_loss_weight"] = segment_loss_weights[segment_index]
-                segment_kwargs["hd_normalization_denominator"] = hd_normalization_denominator
-            segment_loss, segment_output, fast_states = unwrapped_policy.forward_sequence_segment(
-                segment_batch,
-                **segment_kwargs,
+    for segment_index in range(global_num_segments):
+        has_local_segment = segment_index < local_num_segments
+        if has_local_segment:
+            segment_start = segment_index * segment_length
+            segment_end = min(segment_start + segment_length, sequence_length)
+            current_segment_length = segment_end - segment_start
+            segment_batch = _slice_flattened_sequence_batch(
+                batch,
+                batch_size,
+                sequence_length,
+                segment_start,
+                segment_end,
             )
-            segment_weight = segment_loss_weights[segment_index]
-            # In the v2 path the policy has already separated and normalized
-            # the two objectives.  Multiplying the combined scalar here would
-            # attenuate warm-up/effect supervision by the action-valid mask.
-            weighted_segment_loss = segment_loss if use_global_hd_normalization else segment_loss * segment_weight
+
+            with accelerator.autocast():
+                segment_kwargs = {
+                    "sequence_shape": (batch_size, current_segment_length),
+                    "fast_states": fast_states,
+                }
+                if grounding_states is not None:
+                    # Only SmolVLA-TTT exposes the optional grounding container;
+                    # PI0/PI05 sequence policies keep their historical signature.
+                    segment_kwargs["grounding_states"] = grounding_states
+                if use_global_hd_normalization:
+                    segment_kwargs["flow_loss_weight"] = segment_loss_weights[segment_index]
+                    segment_kwargs["hd_normalization_denominator"] = hd_normalization_denominator
+                segment_loss, segment_output, fast_states = unwrapped_policy.forward_sequence_segment(
+                    segment_batch,
+                    **segment_kwargs,
+                )
+                segment_weight = segment_loss_weights[segment_index]
+                # In the v2 path the policy has already separated and normalized
+                # the two objectives.  Multiplying the combined scalar here would
+                # attenuate warm-up/effect supervision by the action-valid mask.
+                weighted_segment_loss = (
+                    segment_loss
+                    if use_global_hd_normalization
+                    else segment_loss * segment_weight
+                )
+            last_segment_output = segment_output
+        else:
+            segment_weight = 0.0
+            # ``requires_grad`` lets Accelerator.backward follow the same
+            # control path on every rank without fabricating gradients for any
+            # policy parameter.  The subsequent presence-aware reduction fills
+            # zeros only where another rank used that parameter.
+            weighted_segment_loss = torch.zeros(
+                (), device=accelerator.device, requires_grad=True
+            )
+            segment_output = {
+                "ttt_nonfinite_seen": torch.zeros(
+                    (), device=accelerator.device, dtype=torch.bool
+                )
+            }
 
         if finite_guard_enabled:
             # Check before autograd can propagate a malformed segment.  The
@@ -1113,50 +1151,53 @@ def update_policy_tbptt(
 
         accelerator.backward(weighted_segment_loss)
         total_loss += weighted_segment_loss.detach()
-        segment_loss_per_dim = torch.tensor(
-            segment_output["loss_per_dim"], device=accelerator.device
-        )
-        if loss_per_dim is None:
-            loss_per_dim = segment_loss_per_dim * segment_weight
-        else:
-            loss_per_dim += segment_loss_per_dim * segment_weight
-        for metric_name, metric_value in segment_output.items():
-            if metric_name.startswith("hd_"):
-                # Ratios are recomputed from the sequence-level sums below;
-                # averaging per-segment ratios would make them depend on the
-                # TBPTT partition, especially under v2 global normalization.
-                if metric_name in {"hd_aux_to_flow_ratio", "hd_aux_fraction"}:
-                    continue
-                additive_metric = metric_name in {
-                    "hd_hca",
-                    "hd_h2l",
-                    "hd_effect",
-                    "hd_grounding",
-                    "hd_gate",
-                    "hd_auxiliary_loss",
-                    "hd_flow_loss",
-                }
-                metric_weight = 1.0 if use_global_hd_normalization and additive_metric else segment_weight
-                auxiliary_metric_sums[metric_name] = auxiliary_metric_sums.get(metric_name, 0.0) + float(
-                    metric_value
-                ) * metric_weight
-            elif metric_name.startswith("ttt_"):
-                value = float(metric_value)
-                if metric_name.endswith("_max") or metric_name == "ttt_nonfinite_seen":
-                    auxiliary_metric_sums[metric_name] = max(
-                        auxiliary_metric_sums.get(metric_name, value), value
+        if has_local_segment:
+            segment_loss_per_dim = torch.tensor(
+                segment_output["loss_per_dim"], device=accelerator.device
+            )
+            if loss_per_dim is None:
+                loss_per_dim = segment_loss_per_dim * segment_weight
+            else:
+                loss_per_dim += segment_loss_per_dim * segment_weight
+            for metric_name, metric_value in segment_output.items():
+                if metric_name.startswith("hd_"):
+                    # Ratios are recomputed from the sequence-level sums below;
+                    # averaging per-segment ratios would make them depend on the
+                    # TBPTT partition, especially under v2 global normalization.
+                    if metric_name in {"hd_aux_to_flow_ratio", "hd_aux_fraction"}:
+                        continue
+                    additive_metric = metric_name in {
+                        "hd_hca",
+                        "hd_h2l",
+                        "hd_effect",
+                        "hd_grounding",
+                        "hd_gate",
+                        "hd_auxiliary_loss",
+                        "hd_flow_loss",
+                    }
+                    metric_weight = (
+                        1.0 if use_global_hd_normalization and additive_metric else segment_weight
                     )
-                elif metric_name.endswith("_min"):
-                    auxiliary_metric_sums[metric_name] = min(
-                        auxiliary_metric_sums.get(metric_name, value), value
-                    )
-                else:
                     auxiliary_metric_sums[metric_name] = auxiliary_metric_sums.get(
                         metric_name, 0.0
-                    ) + value * segment_weight
-        fast_states = {
-            layer_index: fast_state.detach() for layer_index, fast_state in fast_states.items()
-        }
+                    ) + float(metric_value) * metric_weight
+                elif metric_name.startswith("ttt_"):
+                    value = float(metric_value)
+                    if metric_name.endswith("_max") or metric_name == "ttt_nonfinite_seen":
+                        auxiliary_metric_sums[metric_name] = max(
+                            auxiliary_metric_sums.get(metric_name, value), value
+                        )
+                    elif metric_name.endswith("_min"):
+                        auxiliary_metric_sums[metric_name] = min(
+                            auxiliary_metric_sums.get(metric_name, value), value
+                        )
+                    else:
+                        auxiliary_metric_sums[metric_name] = auxiliary_metric_sums.get(
+                            metric_name, 0.0
+                        ) + value * segment_weight
+            fast_states = {
+                layer_index: fast_state.detach() for layer_index, fast_state in fast_states.items()
+            }
         num_segments += 1
 
     if accelerator.num_processes > 1:
@@ -1211,9 +1252,7 @@ def update_policy_tbptt(
                 ("loss_per_dim", loss_per_dim),
                 (
                     "ttt_nonfinite_seen",
-                    segment_output.get("ttt_nonfinite_seen")
-                    if "segment_output" in locals()
-                    else None,
+                    last_segment_output.get("ttt_nonfinite_seen"),
                 ),
             ),
             accelerator=accelerator,
@@ -1299,8 +1338,8 @@ def update_policy_tbptt(
         "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
         "tbptt_segments": num_segments,
     }
-    if "segment_output" in locals() and "ttt_nonfinite_seen" in segment_output:
-        output_dict["ttt_nonfinite_seen"] = segment_output["ttt_nonfinite_seen"]
+    if "ttt_nonfinite_seen" in last_segment_output:
+        output_dict["ttt_nonfinite_seen"] = last_segment_output["ttt_nonfinite_seen"]
     output_dict.update(auxiliary_metric_sums)
     return train_metrics, output_dict
 
