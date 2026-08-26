@@ -1,4 +1,14 @@
-# LeRobot PI0-TTT
+# HD-TTT algorithm
+
+> **算法说明请先阅读：[README_HD_TTT.md](./README_HD_TTT.md)**。其中包含 HD-TTT 的完整定义、网络位置、训练/部署协议、MIKASA 命令、消融和验证口径。
+
+本目录同时保留了下面的 LeRobot 上游说明，便于查找通用安装和库信息；它不是 HD-TTT 方法定义。HD-TTT 的实现与实验入口均在 `src/lerobot/policies/smolvla_ttt` 和 `examples/mikasa`。
+
+---
+
+## Legacy LeRobot/PI0-TTT reference (not the HD-TTT method)
+
+The remainder of this file is retained historical upstream material. It describes the older PI0-TTT adaptation and may mention settings that do not apply to HD-TTT; use [`README_HD_TTT.md`](./README_HD_TTT.md) for the active algorithm.
 
 This repository is an experimental adaptation of the sequence-memory mechanism from
 **RoboTTT: Context Scaling for Robot Policies** to LeRobot's PI0 implementation. It adds an independent
