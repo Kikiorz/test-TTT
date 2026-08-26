@@ -46,6 +46,42 @@ def _set_torch_seed(seed: int | None) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _credit_ttt_protocol_identity(config: Any) -> dict[str, Any] | None:
+    """Return the exact model-method identity required by the V3 coordinator.
+
+    This is provenance only and does not alter policy execution.  Importing
+    the protocol object lazily keeps this evaluator importable by the native
+    SmolVLA adapter while making the policy module the single source of truth
+    for canonical strings.
+    """
+
+    if not bool(getattr(config, "credit_ttt_enabled", False)):
+        return None
+    from lerobot.policies.smolvla_ttt.credit_ttt_v3 import DEFAULT_CREDIT_TTT_PROTOCOL
+
+    protocol = DEFAULT_CREDIT_TTT_PROTOCOL.as_dict()
+    identity_fields = (
+        "format",
+        "protocol",
+        "version",
+        "pair_schema",
+        "intervention",
+        "target",
+        "state",
+        "causal",
+    )
+    identity = {field: protocol[field] for field in identity_fields}
+    # Concrete implementation choices are recorded as extra fields.  The
+    # benchmark validates the immutable protocol identity separately and
+    # therefore cannot confuse ``intervention_mode`` with the protocol-level
+    # content-replacement schema.
+    identity["attribution_protocol"] = getattr(config, "hd_attribution_protocol", None)
+    identity["intervention_mode"] = getattr(config, "hd_v3_intervention", None)
+    identity["writer_mode"] = getattr(config, "ttt_writer_mode", None)
+    identity["second_order"] = bool(getattr(config, "ttt_second_order", False))
+    return identity
+
+
 class SmolVLAMikasaPolicy:
     """Bridge MIKASA's packed RGB observation to LeRobot processors."""
 
@@ -383,6 +419,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     "credit_ttt_v3"
                     if bool(getattr(policy.policy.config, "credit_ttt_enabled", False))
                     else None
+                ),
+                # Required by the paper benchmark: a scalar V3 marker is
+                # human-readable, while this complete identity object makes
+                # legacy/V2 relabeling fail closed during aggregation.
+                "credit_ttt_protocol": _credit_ttt_protocol_identity(
+                    policy.policy.config
                 ),
             },
             "episode_lengths": [int(ep.n_steps) for ep in episodes],

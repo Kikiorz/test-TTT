@@ -65,6 +65,23 @@ V3_PROTOCOL_MARKERS = {
     "credit_ttt_v3_query_effect",
     "creditttt_qh2l_v3",
 }
+# ``PROTOCOL_ID``/``PROTOCOL_VERSION`` identify this *benchmark envelope*;
+# they do not authenticate a checkpoint.  A CreditTTT result must carry this
+# independent, exact identity object.  Keeping the fields here (rather than
+# accepting a free-form ``protocol_version`` string) prevents an old HD-TTT
+# or a hand-edited result from being promoted to the paper method merely by
+# changing its directory name.
+CANONICAL_V3_PROTOCOL_IDENTITY: dict[str, Any] = {
+    "format": "credit_ttt_v3",
+    "protocol": "creditttt_qh2l_v3",
+    "version": 3,
+    "pair_schema": "event_future_control_pair_v3",
+    "intervention": "content_replacement",
+    "target": "final_slot0_action",
+    "state": "causal_fast_weights",
+    "causal": True,
+}
+CANONICAL_V3_PROTOCOL_FIELDS = tuple(CANONICAL_V3_PROTOCOL_IDENTITY)
 OFFICIAL_PROTOCOL = "MIKASA-Robo-VLA official runner"
 DEFAULT_START_SEED = 4_242_424_242
 DEFAULT_EPISODES = 50
@@ -387,8 +404,154 @@ def _stable_seed(*parts: Any) -> int:
 def _is_v3_marker(value: Any) -> bool:
     if value is None:
         return False
+    if isinstance(value, Mapping):
+        # A nested identity is handled by ``_validate_canonical_v3_identity``;
+        # only its canonical protocol string is a marker here.  Converting a
+        # mapping to ``str`` would make malformed metadata look like a valid
+        # marker and would also produce process-dependent key ordering.
+        value = value.get("protocol")
+        if value is None:
+            return False
     text = str(value).strip().lower()
     return text in V3_PROTOCOL_MARKERS or text.startswith("creditttt_qh2l_v3")
+
+
+def _validate_canonical_v3_identity(
+    value: Any,
+    *,
+    path: Path | str = "result",
+) -> dict[str, Any]:
+    """Validate the non-negotiable identity of a deployed CreditTTT model.
+
+    The benchmark envelope has its own version and is intentionally *not*
+    accepted as a substitute for this object.  Extra implementation fields
+    (for example ``denoise_steps`` or ``intervention_mode``) are allowed, but
+    every canonical field is required and type-checked.  In particular,
+    Python's ``bool`` is an ``int`` subclass, so ``causal=1`` is rejected.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"{path}: canonical CreditTTT protocol identity must be a JSON object, "
+            f"got {type(value).__name__}"
+        )
+    missing = [key for key in CANONICAL_V3_PROTOCOL_FIELDS if key not in value]
+    if missing:
+        raise ValueError(
+            f"{path}: canonical CreditTTT protocol identity is missing {missing}"
+        )
+    for key, expected in CANONICAL_V3_PROTOCOL_IDENTITY.items():
+        actual = value[key]
+        if key == "causal":
+            if type(actual) is not bool:
+                raise ValueError(
+                    f"{path}: canonical field causal must be a JSON boolean, got {actual!r}"
+                )
+        elif key == "version":
+            if type(actual) is not int:
+                raise ValueError(
+                    f"{path}: canonical field version must be an integer, got {actual!r}"
+                )
+        elif not isinstance(actual, str):
+            raise ValueError(
+                f"{path}: canonical field {key!r} must be a string, got {actual!r}"
+            )
+        if actual != expected:
+            raise ValueError(
+                f"{path}: canonical field {key!r}={actual!r} does not match "
+                f"{expected!r}"
+            )
+    return {key: value[key] for key in CANONICAL_V3_PROTOCOL_FIELDS}
+
+
+def _canonical_identity_from_result(
+    result: Mapping[str, Any],
+    *,
+    path: Path | str,
+    required: bool,
+) -> dict[str, Any] | None:
+    """Read and cross-check nested identity objects on a result/envelope.
+
+    Evaluators may put provenance on ``model`` or on the result envelope.  If
+    both are present they must be byte-for-byte equivalent on canonical
+    fields; accepting one over a contradictory other would make provenance
+    order-dependent.
+    """
+
+    model = result.get("model")
+    model = model if isinstance(model, Mapping) else {}
+    candidates: list[tuple[str, Any]] = []
+    for owner, container in (("result", result), ("model", model)):
+        if "credit_ttt_protocol" in container:
+            candidates.append((f"{path}:{owner}.credit_ttt_protocol", container["credit_ttt_protocol"]))
+    if not candidates:
+        if required:
+            raise ValueError(
+                f"{path}: CreditTTT requires nested credit_ttt_protocol canonical identity; "
+                "benchmark envelope protocol_version alone is not sufficient"
+            )
+        return None
+    identities = [
+        _validate_canonical_v3_identity(candidate, path=location)
+        for location, candidate in candidates
+    ]
+    first = identities[0]
+    if any(identity != first for identity in identities[1:]):
+        raise ValueError(f"{path}: contradictory CreditTTT canonical protocol identities")
+    return first
+
+
+def _canonical_identity_from_artifact(
+    payload: Mapping[str, Any],
+    *,
+    path: Path | str,
+    required: bool,
+) -> dict[str, Any] | None:
+    """Validate canonical identity carried by a mechanism/label artifact.
+
+    Offline artifacts historically store protocol fields flat in
+    ``metadata`` whereas evaluators use ``credit_ttt_protocol``.  Both are
+    accepted only when the complete immutable field set is present; a lone
+    ``protocol=creditttt_qh2l_v3`` marker never authenticates an audit.
+    """
+
+    candidates: list[tuple[str, Any]] = []
+    containers: list[tuple[str, Mapping[str, Any]]] = [("artifact", payload)]
+    metadata = payload.get("metadata")
+    if isinstance(metadata, Mapping):
+        containers.append(("metadata", metadata))
+    for owner, container in containers:
+        if "credit_ttt_protocol" in container:
+            candidates.append(
+                (f"{path}:{owner}.credit_ttt_protocol", container["credit_ttt_protocol"])
+            )
+        # Canonical pair-label artifacts use a flat metadata schema.  Treat a
+        # partial set as an error rather than silently falling back to a
+        # scalar marker.
+        declares_v3 = (
+            container.get("format") == CANONICAL_V3_PROTOCOL_IDENTITY["format"]
+            or _is_v3_marker(container.get("protocol"))
+        )
+        # A label payload itself has a convenience top-level ``format`` and a
+        # nested ``metadata`` object.  Do not mistake that wrapper for a flat
+        # identity unless at least one additional canonical field is present.
+        flat_identity_fields = set(CANONICAL_V3_PROTOCOL_FIELDS) & set(container)
+        if declares_v3 and (len(flat_identity_fields) > 1 or "protocol" in container):
+            candidates.append((f"{path}:{owner}", container))
+    if not candidates:
+        if required:
+            raise ValueError(
+                f"{path}: strict CreditTTT mechanism audit is missing canonical protocol identity"
+            )
+        return None
+    identities = [
+        _validate_canonical_v3_identity(candidate, path=location)
+        for location, candidate in candidates
+    ]
+    first = identities[0]
+    if any(identity != first for identity in identities[1:]):
+        raise ValueError(f"{path}: contradictory canonical identities in mechanism artifact")
+    return first
 
 
 def _manifest_with_hash(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -522,6 +685,11 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "protocol_id": PROTOCOL_ID,
         "protocol_version": PROTOCOL_VERSION,
+        # This object authenticates the *model method* and is deliberately
+        # independent from the benchmark-envelope version above.  It is
+        # copied into every frozen manifest and required on CreditTTT eval
+        # records by ``_validate_eval_record``.
+        "credit_ttt_protocol": dict(CANONICAL_V3_PROTOCOL_IDENTITY),
         "benchmark": "MIKASA-Robo-VLA",
         "created_by": "benchmark_credit_ttt_v3.py",
         "tasks": tasks,
@@ -687,11 +855,21 @@ def _method_from_metadata(result: Mapping[str, Any], path: Path) -> tuple[str, s
     model = result.get("model")
     model = model if isinstance(model, Mapping) else {}
     method = str(model.get("method") or result.get("method") or "")
+    # Nested canonical provenance is the authoritative V3 marker.  Use its
+    # scalar protocol value for classification; passing the mapping itself to
+    # ``str`` would make a malformed object look like a marker.
+    nested_protocol_values: list[Any] = []
+    for container in (result, model):
+        identity = container.get("credit_ttt_protocol")
+        if isinstance(identity, Mapping):
+            nested_protocol_values.append(identity.get("protocol"))
+        elif identity is not None:
+            nested_protocol_values.append(identity)
     protocol_candidates = (
         model.get("protocol_version"),
         model.get("protocol_id"),
         model.get("protocol"),
-        model.get("credit_ttt_protocol"),
+        *nested_protocol_values,
         model.get("hd_attribution_protocol"),
         model.get("format"),
         result.get("protocol_version"),
@@ -754,6 +932,7 @@ def _iter_result_records(payload: Any, path: Path) -> Iterable[dict[str, Any]]:
                 "benchmark_commit",
                 "protocol_id",
                 "protocol_version",
+                "credit_ttt_protocol",
             )
             if key in payload
         }
@@ -793,12 +972,21 @@ def _validate_eval_record(
             f"{path}: metadata resolves to method {method!r}, but result directory/manifest "
             f"expects {expected_method!r}"
         )
+    canonical_identity: dict[str, Any] | None = None
     if expected_method == "credit_ttt":
         if not _is_v3_marker(protocol):
             raise ValueError(
                 f"{path}: CreditTTT requires an explicit V3 protocol marker; "
                 f"got {protocol!r}"
             )
+        # A scalar marker is useful for human-readable summaries, but it is
+        # not sufficient provenance.  Require and validate the complete
+        # canonical identity object emitted by the V3 evaluator.
+        canonical_identity = _canonical_identity_from_result(
+            result,
+            path=path,
+            required=True,
+        )
     model = result.get("model")
     model = model if isinstance(model, Mapping) else {}
     if expected_method in {"native_smolvla", "clean_ttt"} and bool(model.get("hd_ttt_enabled", False)):
@@ -879,6 +1067,7 @@ def _validate_eval_record(
         "returns": result.get("returns"),
         "source": str(path),
         "protocol_version": protocol,
+        "credit_ttt_protocol": canonical_identity,
         "train_seed": str(result.get("train_seed") or _path_train_seed(path)),
         "raw": dict(result),
     }
@@ -1215,6 +1404,7 @@ def aggregate_results(
     payload: dict[str, Any] = {
         "protocol_id": manifest["protocol_id"],
         "protocol_version": manifest["protocol_version"],
+        "credit_ttt_protocol": dict(manifest["credit_ttt_protocol"]),
         "manifest_sha256": manifest["manifest_sha256"],
         "results_root": str(results_root),
         "bootstrap": {"replicates": int(n_bootstrap), "seed": int(seed)},
@@ -1384,6 +1574,10 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     _verify_manifest(manifest)
     if manifest.get("protocol_id") != PROTOCOL_ID:
         raise ValueError(f"Unsupported protocol_id={manifest.get('protocol_id')!r}")
+    _validate_canonical_v3_identity(
+        manifest.get("credit_ttt_protocol"),
+        path=f"{path}:credit_ttt_protocol",
+    )
     return dict(manifest)
 
 
@@ -1454,6 +1648,11 @@ def _cmd_check(args: argparse.Namespace) -> int:
     mechanism = _read_json(Path(args.mechanism_json))
     if not isinstance(mechanism, Mapping):
         raise ValueError("mechanism JSON must be an object")
+    mechanism_identity = _canonical_identity_from_artifact(
+        mechanism,
+        path=Path(args.mechanism_json),
+        required=bool(args.strict),
+    )
     aggregate = None
     if args.aggregate_json:
         aggregate = _read_json(Path(args.aggregate_json))
@@ -1463,6 +1662,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
             raise ValueError("aggregate JSON was produced from a different manifest")
     payload = run_go_no_go_checks(mechanism, aggregate_payload=aggregate, strict=bool(args.strict))
     payload["manifest_sha256"] = manifest["manifest_sha256"]
+    payload["credit_ttt_protocol"] = mechanism_identity
     _write_json(Path(args.output), payload)
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0 if payload["overall"] == "GO" else 1
@@ -1487,6 +1687,9 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
     assert manifest["manifest_sha256"] == sha256_json(
         {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     )
+    assert _validate_canonical_v3_identity(
+        manifest["credit_ttt_protocol"], path="self-check manifest"
+    ) == CANONICAL_V3_PROTOCOL_IDENTITY
     assert sum(command["method_id"] == "native_smolvla" for command in manifest["commands"]) == 2
     assert all(
         command["train_seed"] == "fixed"
@@ -1531,6 +1734,55 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
         pass
     else:  # pragma: no cover - defensive assertion for the self-check itself
         raise AssertionError("benchmark envelope version must not authenticate a V3 model")
+    canonical_record = {
+        "model": {
+            "method": "CreditTTT",
+            "protocol_id": "credit_ttt_v3",
+            "protocol_version": "creditttt_qh2l_v3",
+            "credit_ttt_protocol": dict(CANONICAL_V3_PROTOCOL_IDENTITY),
+        },
+        "benchmark_protocol": OFFICIAL_PROTOCOL,
+        "env_id": DEFAULT_TASKS[0]["env_id"],
+        "successes": [True],
+        "episode_seeds": [DEFAULT_START_SEED],
+        "action_chunk_size": 1,
+    }
+    validated = _validate_eval_record(
+        canonical_record,
+        path=Path("canonical.json"),
+        expected_method="credit_ttt",
+        expected_task=DEFAULT_TASKS[0],
+        expected_episode_seeds=[DEFAULT_START_SEED],
+    )
+    assert validated["credit_ttt_protocol"] == CANONICAL_V3_PROTOCOL_IDENTITY
+    assert _canonical_identity_from_artifact(
+        {"metadata": dict(CANONICAL_V3_PROTOCOL_IDENTITY)},
+        path="self-check artifact",
+        required=True,
+    ) == CANONICAL_V3_PROTOCOL_IDENTITY
+    for field, bad_value in (
+        ("target", "denoising_velocity"),
+        ("causal", 1),
+        ("intervention", "content_deletion"),
+    ):
+        malformed = dict(canonical_record)
+        malformed_model = dict(canonical_record["model"])
+        malformed_identity = dict(CANONICAL_V3_PROTOCOL_IDENTITY)
+        malformed_identity[field] = bad_value
+        malformed_model["credit_ttt_protocol"] = malformed_identity
+        malformed["model"] = malformed_model
+        try:
+            _validate_eval_record(
+                malformed,
+                path=Path(f"malformed_{field}.json"),
+                expected_method="credit_ttt",
+                expected_task=DEFAULT_TASKS[0],
+                expected_episode_seeds=[DEFAULT_START_SEED],
+            )
+        except ValueError:
+            pass
+        else:  # pragma: no cover - defensive assertion for the self-check itself
+            raise AssertionError(f"malformed canonical field {field!r} was accepted")
     print("CreditTTT V3 benchmark self-check: PASS")
     return 0
 
