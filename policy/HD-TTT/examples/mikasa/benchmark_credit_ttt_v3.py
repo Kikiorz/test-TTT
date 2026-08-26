@@ -707,6 +707,205 @@ def _manifest_with_hash(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+# This metadata is deliberately separate from the model/protocol identity.
+# It describes how a particular student was sampled, so a checkpoint can be
+# reproduced without making the batching choice part of the scientific method
+# marker.  Older manifests do not contain this object and remain valid.
+TRAINING_BATCH_METADATA_SCHEMA = "credit_ttt_training_batch_v1"
+
+
+def _positive_int(value: Any, *, name: str) -> int:
+    """Coerce a positive integer while rejecting booleans/fractional values."""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from exc
+    if result <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return result
+
+
+def _nonnegative_int(value: Any, *, name: str) -> int:
+    """Coerce a non-negative integer while rejecting booleans/fractions."""
+
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}") from exc
+    if result < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return result
+
+
+def _strict_bool(value: Any, *, name: str) -> bool:
+    """Parse the small bool vocabulary used by shell/JSON metadata."""
+
+    if type(value) is bool:
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
+def build_training_batch_metadata(
+    *,
+    per_device_batch_size: int = 1,
+    world_size: int = 1,
+    equal_length_batching: bool = False,
+    episode_lengths: Sequence[int] | None = None,
+    sequence_offsets: Sequence[int] | None = None,
+) -> dict[str, Any]:
+    """Build deterministic, JSON-safe sampling metadata for a TTT run.
+
+    ``EqualLengthBatchSampler`` groups complete trajectory windows by
+    ``(physical_length, episode_local_offset)``.  A short bucket is completed
+    by repeating an index from that same bucket, and DDP then repeats complete
+    groups so every rank has the same number of optimizer steps.  This helper
+    mirrors that arithmetic without importing torch or instantiating a
+    dataset.  It is used for provenance only; it never changes the sampler.
+
+    If ``episode_lengths`` is omitted, only the requested batching contract is
+    recorded and the exact bucket/repeat fields are ``None``.  This keeps
+    manifest generation usable before a dataset is mounted.  The canonical
+    shell launcher writes the resolved lengths into a sidecar artifact, which
+    can be embedded in the manifest with ``--training-metadata-json``.
+    """
+
+    batch_size = _positive_int(per_device_batch_size, name="per_device_batch_size")
+    replicas = _positive_int(world_size, name="world_size")
+    equal = _strict_bool(equal_length_batching, name="equal_length_batching")
+    if batch_size > 1 and not equal:
+        raise ValueError(
+            "SmolVLA-TTT per-device batch_size>1 requires equal_length_batching=true"
+        )
+
+    metadata: dict[str, Any] = {
+        "schema": TRAINING_BATCH_METADATA_SCHEMA,
+        "per_device_batch_size": batch_size,
+        "world_size": replicas,
+        "global_batch_size": batch_size * replicas,
+        "equal_length_batching": equal,
+        "sampler": "EqualLengthBatchSampler" if equal else "accelerate_default",
+        # The legacy TTT path is B=1, so it also carries no temporal padding;
+        # exact-length mode is what permits that invariant for B>1.
+        "no_temporal_padding": bool(equal or batch_size == 1),
+        "stats_available": episode_lengths is not None,
+        "raw_windows": None,
+        "offset_domains": None,
+        "bucket_count": None,
+        "buckets": [],
+        "groups_before_ddp": None,
+        "ddp_repeated_groups": None,
+        "total_groups": None,
+        "bucket_fill_repeated_rows": None,
+        "ddp_repeated_rows": None,
+        "total_repeated_rows": None,
+        "effective_rows": None,
+        "repeat_rate": None,
+        "steps_per_epoch_per_rank": None,
+    }
+    if episode_lengths is None:
+        return metadata
+
+    lengths: list[int] = []
+    for index, value in enumerate(episode_lengths):
+        lengths.append(_positive_int(value, name=f"episode_lengths[{index}]"))
+    if not lengths:
+        raise ValueError("episode_lengths must contain at least one value")
+    if sequence_offsets is None:
+        offsets = [0] * len(lengths)
+    else:
+        if len(sequence_offsets) != len(lengths):
+            raise ValueError(
+                "sequence_offsets must have the same length as episode_lengths"
+            )
+        offsets = []
+        for index, value in enumerate(sequence_offsets):
+            offsets.append(_nonnegative_int(value, name=f"sequence_offsets[{index}]"))
+
+    metadata["raw_windows"] = len(lengths)
+    metadata["offset_domains"] = len(set(offsets))
+
+    # With the ordinary TTT path the launcher enforces B=1.  Its DDP padding
+    # is still useful to report, but there is no exact-length bucket sampler.
+    if not equal:
+        groups_before = len(lengths)
+        ddp_groups = (-groups_before) % replicas
+        total_groups = groups_before + ddp_groups
+        effective_rows = total_groups * batch_size
+        metadata.update(
+            {
+                "stats_available": True,
+                "groups_before_ddp": groups_before,
+                "ddp_repeated_groups": ddp_groups,
+                "total_groups": total_groups,
+                "bucket_fill_repeated_rows": 0,
+                "ddp_repeated_rows": ddp_groups * batch_size,
+                "total_repeated_rows": effective_rows - len(lengths),
+                "effective_rows": effective_rows,
+                "repeat_rate": (effective_rows - len(lengths)) / len(lengths),
+                "steps_per_epoch_per_rank": total_groups // replicas,
+            }
+        )
+        return metadata
+
+    # The runtime sampler keys by both length and local offset.  Keeping the
+    # same key in the sidecar makes bounded-window runs auditable too.
+    bucket_counts: dict[tuple[int, int], int] = {}
+    for length, offset in zip(lengths, offsets, strict=True):
+        bucket_counts[(length, offset)] = bucket_counts.get((length, offset), 0) + 1
+    buckets: list[dict[str, Any]] = []
+    for (length, offset), count in sorted(bucket_counts.items()):
+        groups = (count + batch_size - 1) // batch_size
+        slots = groups * batch_size
+        buckets.append(
+            {
+                "length": length,
+                "offset": offset,
+                "count": count,
+                "groups": groups,
+                "slots": slots,
+                "fill_repeated_rows": slots - count,
+            }
+        )
+    groups_before = sum(int(bucket["groups"]) for bucket in buckets)
+    ddp_groups = (-groups_before) % replicas
+    total_groups = groups_before + ddp_groups
+    effective_rows = total_groups * batch_size
+    bucket_fill = sum(int(bucket["fill_repeated_rows"]) for bucket in buckets)
+    ddp_rows = ddp_groups * batch_size
+    repeated_rows = effective_rows - len(lengths)
+    metadata.update(
+        {
+            "bucket_count": len(buckets),
+            "buckets": buckets,
+            "groups_before_ddp": groups_before,
+            "ddp_repeated_groups": ddp_groups,
+            "total_groups": total_groups,
+            "bucket_fill_repeated_rows": bucket_fill,
+            "ddp_repeated_rows": ddp_rows,
+            "total_repeated_rows": repeated_rows,
+            "effective_rows": effective_rows,
+            "repeat_rate": repeated_rows / len(lengths),
+            "steps_per_epoch_per_rank": total_groups // replicas,
+        }
+    )
+    return metadata
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -717,6 +916,123 @@ def _read_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Could not read JSON {path}: {exc}") from exc
+
+
+def _read_json_argument(value: Any, *, option_name: str) -> Any:
+    """Read a JSON file or an inline JSON object supplied on the CLI."""
+
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{option_name} cannot be empty")
+    source = Path(text).expanduser()
+    if source.is_file():
+        return _read_json(source)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{option_name} must be a JSON object or a path to one; could not parse {text!r}"
+        ) from exc
+
+
+def _manifest_training_batching(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve batching config and optionally embed a launcher sidecar.
+
+    The command-line fields are intentionally optional so a pre-existing
+    manifest invocation keeps its historical B=1/world-size=1 defaults.  If a
+    sidecar is supplied, its batching contract is cross-checked against any
+    explicit CLI values and its exact bucket/repeat statistics are embedded in
+    the hash-protected manifest.
+    """
+
+    artifact: Mapping[str, Any] | None = None
+    artifact_source = getattr(args, "training_metadata_json", None)
+    if artifact_source:
+        loaded = _read_json_argument(
+            artifact_source, option_name="--training-metadata-json"
+        )
+        if not isinstance(loaded, Mapping):
+            raise ValueError("--training-metadata-json must contain a JSON object")
+        declared_schema = loaded.get("schema")
+        if declared_schema not in {None, TRAINING_BATCH_METADATA_SCHEMA}:
+            raise ValueError(
+                "--training-metadata-json has unsupported schema "
+                f"{declared_schema!r}; expected {TRAINING_BATCH_METADATA_SCHEMA!r}"
+            )
+        artifact = loaded
+    nested: Mapping[str, Any] = artifact or {}
+    if "batching" in nested:
+        if not isinstance(nested["batching"], Mapping):
+            raise ValueError("training metadata 'batching' field must be a JSON object")
+        nested = nested["batching"]
+
+    def _field(*names: str) -> Any:
+        for name in names:
+            if name in nested:
+                return nested[name]
+        return None
+
+    cli_batch = getattr(args, "per_device_batch_size", None)
+    cli_world = getattr(args, "world_size", None)
+    cli_equal = getattr(args, "equal_length_batching", None)
+    artifact_batch = _field("per_device_batch_size", "batch_size")
+    artifact_world = _field("world_size", "num_replicas", "processes")
+    artifact_equal = _field("equal_length_batching", "equal_length")
+    if cli_batch is not None and artifact_batch is not None:
+        if _positive_int(cli_batch, name="per_device_batch_size") != _positive_int(
+            artifact_batch, name="training metadata per_device_batch_size"
+        ):
+            raise ValueError(
+                "--per-device-batch-size conflicts with training metadata sidecar"
+            )
+    if cli_world is not None and artifact_world is not None:
+        if _positive_int(cli_world, name="world_size") != _positive_int(
+            artifact_world, name="training metadata world_size"
+        ):
+            raise ValueError("--world-size conflicts with training metadata sidecar")
+    if cli_equal is not None and artifact_equal is not None:
+        if _strict_bool(cli_equal, name="equal_length_batching") != _strict_bool(
+            artifact_equal, name="training metadata equal_length_batching"
+        ):
+            raise ValueError(
+                "--equal-length-batching conflicts with training metadata sidecar"
+            )
+
+    batch_size = cli_batch if cli_batch is not None else artifact_batch
+    world_size = cli_world if cli_world is not None else artifact_world
+    equal_length = cli_equal if cli_equal is not None else artifact_equal
+    metadata = build_training_batch_metadata(
+        per_device_batch_size=1 if batch_size is None else batch_size,
+        world_size=1 if world_size is None else world_size,
+        equal_length_batching=False if equal_length is None else equal_length,
+    )
+    if artifact is not None:
+        # Keep the complete sidecar (including task/dataset provenance) rather
+        # than attempting to reconstruct it from a potentially newer schema.
+        # Well-known computed fields are also promoted for convenient table
+        # generation; unknown future fields remain inside ``artifact``.
+        computed_fields = (
+            "stats_available",
+            "raw_windows",
+            "offset_domains",
+            "bucket_count",
+            "buckets",
+            "groups_before_ddp",
+            "ddp_repeated_groups",
+            "total_groups",
+            "bucket_fill_repeated_rows",
+            "ddp_repeated_rows",
+            "total_repeated_rows",
+            "effective_rows",
+            "repeat_rate",
+            "steps_per_epoch_per_rank",
+        )
+        for key in computed_fields:
+            if key in nested:
+                metadata[key] = nested[key]
+        metadata["artifact"] = dict(artifact)
+        metadata["artifact_source"] = str(artifact_source)
+    return metadata
 
 
 def _verify_manifest(manifest: Mapping[str, Any]) -> None:
@@ -1058,6 +1374,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint_maps=task_checkpoint_maps,
         path="manifest",
     )
+    training_batching = _manifest_training_batching(args)
     checkpoint_map = {
         NATIVE_VARIANT_CHUNK: str(args.native_checkpoint),
         # Same frozen native checkpoint as K=50; this map entry changes only
@@ -1112,6 +1429,11 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "student_train_seeds": train_seeds,
             "student_budget_policy": "same optimizer updates and seen frames for every student baseline",
             "teacher_cost_accounting": "reported separately; teacher is not deployed",
+            # Batching is provenance, not a method switch.  The sidecar is
+            # optional so manifests can be frozen before a dataset is mounted;
+            # executable launcher runs should embed it once preflight resolves
+            # the exact (length, offset) buckets.
+            "batching": training_batching,
             "demo_split": {
                 "train_and_label": (
                     "all official demonstrations [0, 249]"
@@ -2755,6 +3077,43 @@ def _build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--start-seed", type=int, default=DEFAULT_START_SEED)
     manifest.add_argument("--torch-seed", type=int, default=DEFAULT_TORCH_SEED)
     manifest.add_argument("--sim-backend", choices=("cpu", "gpu"), default="gpu")
+    manifest.add_argument(
+        "--per-device-batch-size",
+        "--batch-size",
+        dest="per_device_batch_size",
+        type=int,
+        default=None,
+        help=(
+            "Per-device student batch size to record. If omitted, use the value "
+            "from --training-metadata-json or the historical default B=1."
+        ),
+    )
+    manifest.add_argument(
+        "--world-size",
+        type=int,
+        default=None,
+        help=(
+            "Accelerate/DDP world size to record. If omitted, use the sidecar "
+            "value or the historical default 1."
+        ),
+    )
+    manifest.add_argument(
+        "--equal-length-batching",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Record exact-length trajectory batching. The flag is metadata-only; "
+            "the training launcher controls the actual sampler."
+        ),
+    )
+    manifest.add_argument(
+        "--training-metadata-json",
+        default=None,
+        help=(
+            "Optional training_metadata.json sidecar (or inline JSON object) to "
+            "embed exact bucket/repeat statistics in the frozen manifest."
+        ),
+    )
     manifest.add_argument("--include-optional", action="store_true")
     manifest.set_defaults(func=_cmd_manifest)
 

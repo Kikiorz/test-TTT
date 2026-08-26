@@ -351,6 +351,15 @@ The four-card launcher can run two independent tasks on two cards each, or one
 task on all four cards.  Native (non-TTT) SmolVLA has no recurrent-state
 restriction and may use an ordinary batch of 4--8 per card.
 
+Every executable student preflight writes
+`<student_output>/training_metadata.json`.  This sidecar records the
+per-device batch, Accelerate world size, exact `(length, offset)` bucket
+counts, bucket-fill repeats, DDP group repeats, effective rows, and
+steps-per-sequence-epoch.  Embed the reviewed sidecar when freezing the
+benchmark envelope with
+`benchmark_credit_ttt_v3.py manifest --training-metadata-json <path>`; the
+metadata is hash-protected provenance and is never read by the optimizer.
+
 The V3 full-flow reference replay uses activation offloading to host RAM by
 default so the second-order graph fits on 32-GB cards.  On a separately
 profiled job with sufficient device headroom, setting

@@ -58,6 +58,123 @@ def _published_checkpoint_map_args(tmp_path: Path) -> list[str]:
     return args
 
 
+def test_training_batch_metadata_matches_equal_length_sampler_arithmetic() -> None:
+    # Three length buckets intentionally leave both bucket tails and one DDP
+    # group to pad.  The helper is metadata-only but must mirror the runtime
+    # sampler exactly so a paper table cannot under-report repeated rows.
+    metadata = benchmark.build_training_batch_metadata(
+        per_device_batch_size=2,
+        world_size=4,
+        equal_length_batching=True,
+        episode_lengths=[11, 11, 11, 12, 12, 13],
+    )
+    assert metadata["schema"] == benchmark.TRAINING_BATCH_METADATA_SCHEMA
+    assert metadata["global_batch_size"] == 8
+    assert metadata["bucket_count"] == 3
+    assert metadata["groups_before_ddp"] == 4  # 2 + 1 + 1
+    assert metadata["ddp_repeated_groups"] == 0
+    assert metadata["bucket_fill_repeated_rows"] == 2
+    assert metadata["total_repeated_rows"] == 2
+    assert metadata["effective_rows"] == 8
+    assert metadata["steps_per_epoch_per_rank"] == 1
+
+
+def test_training_batch_metadata_records_ddp_padding() -> None:
+    metadata = benchmark.build_training_batch_metadata(
+        per_device_batch_size=4,
+        world_size=4,
+        equal_length_batching=True,
+        episode_lengths=[11, 12, 13, 14, 15],
+    )
+    # Five singleton buckets become five local groups; DDP adds three whole
+    # groups, each carrying four rows.
+    assert metadata["groups_before_ddp"] == 5
+    assert metadata["ddp_repeated_groups"] == 3
+    assert metadata["bucket_fill_repeated_rows"] == 15
+    assert metadata["ddp_repeated_rows"] == 12
+    assert metadata["total_repeated_rows"] == 27
+    assert metadata["effective_rows"] == 32
+    assert metadata["steps_per_epoch_per_rank"] == 2
+
+
+def test_manifest_embeds_training_batch_sidecar(tmp_path: Path) -> None:
+    parser = benchmark._build_parser()
+    sidecar = tmp_path / "training_metadata.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "schema": benchmark.TRAINING_BATCH_METADATA_SCHEMA,
+                "task_id": "color",
+                "batching": benchmark.build_training_batch_metadata(
+                    per_device_batch_size=2,
+                    world_size=2,
+                    equal_length_batching=True,
+                    episode_lengths=[3, 3, 4],
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = parser.parse_args(
+        [
+            "manifest",
+            "--output",
+            str(tmp_path / "manifest.json"),
+            "--repo-root",
+            str(tmp_path),
+            "--python-bin",
+            "python",
+            "--task-set",
+            "legacy_two",
+            "--training-metadata-json",
+            str(sidecar),
+        ]
+    )
+    manifest = benchmark.build_manifest(args)
+    batching = manifest["training"]["batching"]
+    assert batching["per_device_batch_size"] == 2
+    assert batching["world_size"] == 2
+    assert batching["equal_length_batching"] is True
+    assert batching["total_repeated_rows"] == 1
+    assert batching["artifact"]["task_id"] == "color"
+
+
+def test_manifest_rejects_batch_sidecar_cli_conflict(tmp_path: Path) -> None:
+    parser = benchmark._build_parser()
+    sidecar = tmp_path / "training_metadata.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "batching": {
+                    "per_device_batch_size": 2,
+                    "world_size": 2,
+                    "equal_length_batching": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = parser.parse_args(
+        [
+            "manifest",
+            "--output",
+            str(tmp_path / "manifest.json"),
+            "--repo-root",
+            str(tmp_path),
+            "--python-bin",
+            "python",
+            "--task-set",
+            "legacy_two",
+            "--per-device-batch-size",
+            "4",
+            "--training-metadata-json",
+            str(sidecar),
+        ]
+    )
+    with pytest.raises(ValueError, match="conflicts with training metadata"):
+        benchmark.build_manifest(args)
+
+
 def test_published_four_task_profile_schema(tmp_path: Path) -> None:
     parser = benchmark._build_parser()
     args = parser.parse_args(

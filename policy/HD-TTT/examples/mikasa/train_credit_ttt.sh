@@ -64,6 +64,7 @@ Useful overrides:
   exact-length trajectory buckets),
   NUM_PROCESSES=4 (use all four GPUs on the reference server),
   EQUAL_LENGTH_BATCHING=0 (opt-in; never pads time or mixes offset domains),
+  TRAINING_METADATA_PATH=... (default: <student_output>/training_metadata.json),
   NATIVE_CHECKPOINT=..., CLEAN_CHECKPOINT=...
 
 The V3 loss weights are exposed for explicitly named ablations/smoke tests
@@ -136,6 +137,7 @@ FEATURES_PATH="${FEATURES_PATH:-${OUTPUT_ROOT}/full_history_features.pt}"
 TEACHER_CHECKPOINT="${TEACHER_CHECKPOINT:-${OUTPUT_ROOT}/full_history_teacher.pt}"
 LABEL_PATH="${LABEL_PATH:-${OUTPUT_ROOT}/credit_pairs.pt}"
 STUDENT_OUTPUT_DIR="${STUDENT_OUTPUT_DIR:-${OUTPUT_ROOT}/student}"
+TRAINING_METADATA_PATH="${TRAINING_METADATA_PATH:-${STUDENT_OUTPUT_DIR}/training_metadata.json}"
 
 FEATURE_EPISODE_START="${FEATURE_EPISODE_START:-0}"
 FEATURE_EPISODE_END="${FEATURE_EPISODE_END:-250}"
@@ -221,6 +223,7 @@ MIN_SEQUENCE_EPOCHS="${MIN_SEQUENCE_EPOCHS:-100}"
 ALLOW_SHORT_RUN="${ALLOW_SHORT_RUN:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 EQUAL_LENGTH_BATCHING="${EQUAL_LENGTH_BATCHING:-0}"
+BATCHING_METADATA_JSON="{}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 TEACHER_HIDDEN_DIM="${TEACHER_HIDDEN_DIM:-256}"
 TEACHER_LR="${TEACHER_LR:-0.001}"
@@ -362,18 +365,41 @@ if batch_size > 1 and not equal_length:
 # same bucket to complete a final group), then pads the *number of groups* for
 # DDP synchronization.  This mirrors EqualLengthBatchSampler.__len__.
 from collections import Counter
+bucket_rows = []
 if equal_length:
-    bucket_counts = Counter(chosen)
-    total_groups = sum(
-        (count + batch_size - 1) // batch_size for count in bucket_counts.values()
-    )
+    # Keep this arithmetic aligned with EqualLengthBatchSampler: each bucket
+    # is keyed by (T, offset), and canonical full-history windows have offset
+    # zero.
+    bucket_counts = Counter((length, 0) for length in chosen)
+    for (length, offset), count in sorted(bucket_counts.items()):
+        groups = (count + batch_size - 1) // batch_size
+        slots = groups * batch_size
+        bucket_rows.append({
+            "length": int(length),
+            "offset": int(offset),
+            "count": int(count),
+            "groups": int(groups),
+            "slots": int(slots),
+            "fill_repeated_rows": int(slots - count),
+        })
+    groups_before_ddp = sum(row["groups"] for row in bucket_rows)
+    bucket_fill_repeated_rows = sum(row["fill_repeated_rows"] for row in bucket_rows)
 else:
-    total_groups = len(chosen)
-if total_groups:
-    total_groups += (-total_groups) % num_replicas
+    # B>1 is rejected above for the ordinary ragged path. At B=1 this is the
+    # same sample-count arithmetic used by Accelerate's distributed loader.
+    bucket_counts = Counter()
+    groups_before_ddp = len(chosen)
+    bucket_fill_repeated_rows = 0
+ddp_repeated_groups = (-groups_before_ddp) % num_replicas if groups_before_ddp else 0
+total_groups = groups_before_ddp + ddp_repeated_groups
+effective_rows = total_groups * batch_size
+ddp_repeated_rows = ddp_repeated_groups * batch_size
+total_repeated_rows = effective_rows - len(chosen)
 batches_per_rank = total_groups // num_replicas
 print(json.dumps({
+    "schema": "credit_ttt_training_batch_v1",
     "windows": len(selected),
+    "raw_windows": len(selected),
     "min_episode_length": min(chosen),
     "max_episode_length": max_len,
     "sequence_length": sequence_length,
@@ -382,7 +408,25 @@ print(json.dumps({
     "total_batches": total_groups,
     "batches_per_rank": batches_per_rank,
     "batch_size": batch_size,
+    "per_device_batch_size": batch_size,
+    "world_size": num_replicas,
+    "global_batch_size": batch_size * num_replicas,
     "equal_length_batching": equal_length,
+    "sampler": "EqualLengthBatchSampler" if equal_length else "accelerate_default",
+    "no_temporal_padding": equal_length or batch_size == 1,
+    "stats_available": True,
+    "offset_domains": 1,
+    "bucket_count": len(bucket_rows) if equal_length else None,
+    "buckets": bucket_rows,
+    "groups_before_ddp": groups_before_ddp,
+    "ddp_repeated_groups": ddp_repeated_groups,
+    "total_groups": total_groups,
+    "bucket_fill_repeated_rows": bucket_fill_repeated_rows,
+    "ddp_repeated_rows": ddp_repeated_rows,
+    "total_repeated_rows": total_repeated_rows,
+    "effective_rows": effective_rows,
+    "repeat_rate": total_repeated_rows / len(chosen),
+    "steps_per_epoch_per_rank": batches_per_rank,
 }))
 PY
   )"
@@ -394,12 +438,100 @@ PY
   DATASET_FPS="$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["fps"])' "${stats}")"
   TOTAL_BATCHES="$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["total_batches"])' "${stats}")"
   BATCHES_PER_RANK="$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["batches_per_rank"])' "${stats}")"
+  BATCHING_METADATA_JSON="${stats}"
   if [[ "${DATASET_FPS}" == "0" ]]; then
     echo "Dataset metadata did not expose a positive fps" >&2
     return 2
   fi
   STEPS_PER_EPOCH="${BATCHES_PER_RANK}"
   STEPS="${STEPS:-$((STEPS_PER_EPOCH * EPOCHS))}"
+}
+
+write_training_metadata() {
+  # This sidecar is provenance only. It is written after the same metadata
+  # preflight that determines STEPS_PER_EPOCH and is never read by the model
+  # or sampler, so enabling it cannot alter training behavior.
+  local metadata_path="${TRAINING_METADATA_PATH}"
+  "${PYTHON_BIN}" - \
+    "${BATCHING_METADATA_JSON}" \
+    "${metadata_path}" \
+    "${TASK_ID}" \
+    "${DATASET_REPO_ID}" \
+    "${DATASET_ROOT}" \
+    "${TRAIN_EPISODES_JSON}" \
+    "${SEED}" \
+    "${EPOCHS}" \
+    "${STEPS}" \
+    "${STEPS_PER_EPOCH}" \
+    "${SEQUENCE_LENGTH}" \
+    "${SEQUENCE_STRIDE}" \
+    "${MIN_EPISODE_LENGTH}" \
+    "${MAX_EPISODE_LENGTH}" \
+    "${DATASET_FPS}" \
+    "${V3_ABLATION}" \
+    "${INTERVENTION}" \
+    "${TTT_LAYERS}" \
+    "${TTT_HIDDEN_DIM}" \
+    "${REGISTER_TOKENS}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+(
+    batching_raw,
+    output_raw,
+    task_id,
+    repo_id,
+    dataset_root,
+    episodes_raw,
+    seed,
+    epochs,
+    steps,
+    steps_per_epoch,
+    sequence_length,
+    sequence_stride,
+    min_episode_length,
+    max_episode_length,
+    fps,
+    ablation,
+    intervention,
+    ttt_layers,
+    ttt_hidden_dim,
+    register_tokens,
+) = sys.argv[1:]
+batching = json.loads(batching_raw)
+episodes = json.loads(episodes_raw)
+if not isinstance(batching, dict) or not isinstance(episodes, list):
+    raise SystemExit("internal metadata preflight produced malformed JSON")
+payload = {
+    "schema": "credit_ttt_training_metadata_v1",
+    "created_by": "train_credit_ttt.sh",
+    "task_id": task_id,
+    "dataset_repo_id": repo_id,
+    "dataset_root": dataset_root,
+    "train_episode_indices": [int(value) for value in episodes],
+    "seed": int(seed),
+    "epochs": int(epochs),
+    "steps": int(steps),
+    "steps_per_epoch": int(steps_per_epoch),
+    "sequence_length": int(sequence_length),
+    "sequence_stride": int(sequence_stride),
+    "min_episode_length": int(min_episode_length),
+    "max_episode_length": int(max_episode_length),
+    "dataset_fps": int(fps),
+    "student_protocol": "creditttt_qh2l_v3",
+    "v3_ablation": ablation,
+    "intervention": intervention,
+    "ttt_layer_indices": ttt_layers,
+    "ttt_hidden_dim": int(ttt_hidden_dim),
+    "register_tokens": int(register_tokens),
+    "batching": batching,
+}
+output = Path(output_raw)
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  echo "Wrote training metadata: ${metadata_path}"
 }
 
 teacher_command() {
@@ -570,7 +702,19 @@ baseline_commands() {
     --python-bin "${PYTHON_BIN}" --results-root "${RESULTS_ROOT}"
     --native-checkpoint "${NATIVE_CHECKPOINT}" --clean-checkpoint "${CLEAN_CHECKPOINT}"
     --credit-checkpoint "${CREDIT_CHECKPOINT}"
+    --per-device-batch-size "${BATCH_SIZE}" --world-size "${NUM_PROCESSES}"
   )
+  if [[ "${EQUAL_LENGTH_BATCHING}" == "1" ]]; then
+    manifest_cmd+=(--equal-length-batching)
+  else
+    manifest_cmd+=(--no-equal-length-batching)
+  fi
+  # The sidecar is produced by an executable student preflight.  Keep plan
+  # mode usable before that file exists, while embedding exact bucket/repeat
+  # statistics whenever baselines are frozen after training setup.
+  if [[ -f "${TRAINING_METADATA_PATH}" ]]; then
+    manifest_cmd+=(--training-metadata-json "${TRAINING_METADATA_PATH}")
+  fi
   print_cmd "${manifest_cmd[@]}"
   echo "# Native-SmolVLA (canonical native action chunk K=50):"
   print_cmd "${native_cmd[@]}"
@@ -600,7 +744,7 @@ print_protocol() {
   echo "trajectory batch: per_device=${BATCH_SIZE} equal_length=${EQUAL_LENGTH_BATCHING} processes=${NUM_PROCESSES} (no temporal padding)"
   echo "offset contract: episode-local origin; full window offset=0; TBPTT segment offset=window_offset+segment_start; reset at episode boundary"
   echo "stages: full-history teacher -> pair labels -> QH2L student; baseline commands are evaluation-only"
-  echo "outputs: features=${FEATURES_PATH} teacher=${TEACHER_CHECKPOINT} labels=${LABEL_PATH} student=${STUDENT_OUTPUT_DIR}"
+  echo "outputs: features=${FEATURES_PATH} teacher=${TEACHER_CHECKPOINT} labels=${LABEL_PATH} student=${STUDENT_OUTPUT_DIR} training_metadata=${TRAINING_METADATA_PATH}"
 }
 
 if [[ "${STAGE}" == "plan" ]]; then
@@ -672,6 +816,9 @@ else
   STEPS="unknown"
 fi
 mkdir -p "${OUTPUT_ROOT}"
+if [[ "${STAGE}" == "student" || "${STAGE}" == "all" ]]; then
+  write_training_metadata
+fi
 echo "Resolved full-history windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, sequence=${SEQUENCE_LENGTH}, batch/device=${BATCH_SIZE}, processes=${NUM_PROCESSES}, steps/epoch=${STEPS_PER_EPOCH}, total_steps=${STEPS}"
 
 run_cmd() {
