@@ -58,6 +58,12 @@ Useful overrides:
   TASK_ID=color|shuffle_long, TRAIN_EPISODE_END=200,
   FEATURE_EPISODE_END=250, OUTPUT_ROOT=..., SEED=1000,
   NATIVE_CHECKPOINT=..., CLEAN_CHECKPOINT=...
+
+The V3 loss weights are exposed for explicitly named ablations/smoke tests
+(`HD_V3_LOCAL_WEIGHT`, `HD_V3_CMD_WEIGHT`, `HD_V3_NULL_WEIGHT`).  The
+canonical recipe keeps local=1, CMD=1, null=0.25; changing them does not
+silently alter the benchmark manifest and must be recorded in the output
+directory/experiment name.
 EOF
 }
 
@@ -148,6 +154,9 @@ INTERVENTION="${INTERVENTION:-delete}"
 TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
 REGISTER_TOKENS="${REGISTER_TOKENS:-16}"
+HD_V3_LOCAL_WEIGHT="${HD_V3_LOCAL_WEIGHT:-1.0}"
+HD_V3_CMD_WEIGHT="${HD_V3_CMD_WEIGHT:-1.0}"
+HD_V3_NULL_WEIGHT="${HD_V3_NULL_WEIGHT:-0.25}"
 EPOCHS="${EPOCHS:-20}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 TEACHER_HIDDEN_DIM="${TEACHER_HIDDEN_DIM:-256}"
@@ -377,10 +386,10 @@ student_command() {
     --policy.hd_learned_write_gate=false
     --policy.hd_phase_mode=deployment
     --policy.hd_v3_pair_k="${PAIR_K}"
-    --policy.hd_v3_local_weight=1.0
-    --policy.hd_v3_cmd_weight=1.0
+    --policy.hd_v3_local_weight="${HD_V3_LOCAL_WEIGHT}"
+    --policy.hd_v3_cmd_weight="${HD_V3_CMD_WEIGHT}"
     --policy.hd_v3_cmd_margin=0.05
-    --policy.hd_v3_null_weight=0.25
+    --policy.hd_v3_null_weight="${HD_V3_NULL_WEIGHT}"
     --policy.hd_v3_null_threshold="${POSITIVE_THRESHOLD}"
     --policy.hd_v3_include_previous_action=true
     --policy.hd_v3_intervention="${INTERVENTION}"
