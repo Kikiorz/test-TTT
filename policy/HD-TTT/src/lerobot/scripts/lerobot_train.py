@@ -1071,7 +1071,13 @@ def update_policy_tbptt(
         segment_count = torch.tensor(
             local_num_segments, dtype=torch.int32, device=accelerator.device
         )
-        global_num_segments = int(accelerator.reduce(segment_count, reduction="max").item())
+        # Accelerate's public reduction contract is sum/mean; passing "max"
+        # is backend/version dependent and has silently behaved like a sum in
+        # supported MIKASA environments.  Gather one scalar per rank and take
+        # the maximum explicitly so short trajectories do not create spurious
+        # extra dummy segments.
+        gathered_segment_counts = accelerator.gather(segment_count.reshape(1))
+        global_num_segments = int(gathered_segment_counts.amax().item())
     else:
         global_num_segments = local_num_segments
     last_segment_output: dict[str, Any] = {}
@@ -1231,14 +1237,15 @@ def update_policy_tbptt(
         for metric_name, metric_value in list(auxiliary_metric_sums.items()):
             metric_tensor = torch.tensor(metric_value, device=accelerator.device)
             if metric_name.endswith("_max") or metric_name == "ttt_nonfinite_seen":
-                reduction = "max"
+                gathered_metric = accelerator.gather(metric_tensor.reshape(1))
+                auxiliary_metric_sums[metric_name] = float(gathered_metric.amax().item())
             elif metric_name.endswith("_min"):
-                reduction = "min"
+                gathered_metric = accelerator.gather(metric_tensor.reshape(1))
+                auxiliary_metric_sums[metric_name] = float(gathered_metric.amin().item())
             else:
-                reduction = "mean"
-            auxiliary_metric_sums[metric_name] = float(
-                accelerator.reduce(metric_tensor, reduction=reduction).item()
-            )
+                auxiliary_metric_sums[metric_name] = float(
+                    accelerator.reduce(metric_tensor, reduction="mean").item()
+                )
 
     if finite_guard_enabled:
         # This is the last point before gradient clipping and the optimizer
