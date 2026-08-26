@@ -551,6 +551,97 @@ def test_ttt_can_return_per_timestep_local_kv_loss() -> None:
     assert layer.v_proj.weight.grad is not None
 
 
+def test_prefix_only_writer_updates_from_writer_inputs_not_read_noise() -> None:
+    """The separated writer/read API makes the fast state noise-independent."""
+
+    torch.manual_seed(19)
+    layer = TTTMLPLayer(dim=8, hidden_dim=16, second_order=False)
+    writer = torch.randn(1, 2, 3, 8)
+    read_a = torch.randn(1, 2, 5, 8)
+    read_b = torch.randn(1, 2, 5, 8)
+    _, state_a = layer(read_a, writer_inputs=writer, update=True, create_graph=False)
+    _, state_b = layer(read_b, writer_inputs=writer, update=True, create_graph=False)
+
+    assert state_a.position.tolist() == [1]
+    assert state_b.position.tolist() == [1]
+    for tensor_a, tensor_b in zip(state_a.tensors(), state_b.tensors(), strict=True):
+        torch.testing.assert_close(tensor_a, tensor_b)
+
+
+def test_explicit_suffix_writer_inputs_match_legacy_default() -> None:
+    """Leaving the new option unset preserves the old suffix K/V update."""
+
+    torch.manual_seed(23)
+    layer = TTTMLPLayer(dim=6, hidden_dim=12, second_order=False)
+    inputs = torch.randn(2, 2, 4, 6)
+    output_default, state_default = layer(inputs, update=True, create_graph=False)
+    output_explicit, state_explicit = layer(
+        inputs, writer_inputs=inputs, update=True, create_graph=False
+    )
+    torch.testing.assert_close(output_default, output_explicit)
+    for default, explicit in zip(state_default.tensors(), state_explicit.tensors(), strict=True):
+        torch.testing.assert_close(default, explicit)
+
+
+def test_writer_inputs_shape_is_checked_and_read_only_steps_ignore_it() -> None:
+    layer = TTTMLPLayer(dim=4, hidden_dim=8, second_order=False)
+    inputs = torch.randn(2, 3, 2, 4)
+    with pytest.raises(ValueError, match="writer_inputs"):
+        layer(inputs, writer_inputs=torch.randn(2, 2, 4), update=True, create_graph=False)
+
+    state = layer.initial_state(2)
+    _, next_state = layer(
+        inputs,
+        state=state,
+        writer_inputs=torch.randn(2, 3, 7, 4),
+        update=False,
+        create_graph=False,
+    )
+    assert next_state.position.tolist() == [-1, -1]
+
+
+def test_config_writer_mode_is_explicit_and_checkpoint_default_is_legacy() -> None:
+    assert SmolVLATTTConfig().ttt_writer_mode == "suffix"
+    assert SmolVLATTTConfig(ttt_writer_mode="prefix_only").ttt_writer_mode == "prefix_only"
+    with pytest.raises(ValueError, match="ttt_writer_mode"):
+        SmolVLATTTConfig(ttt_writer_mode="action")
+
+
+def test_prefix_writer_callback_requires_and_uses_observation_inputs() -> None:
+    """The Flow callback cannot silently fall back to the suffix writer."""
+
+    flow = SmolVLATTTFlowMatching.__new__(SmolVLATTTFlowMatching)
+    torch.nn.Module.__init__(flow)
+    flow.config = SimpleNamespace(ttt_writer_mode="prefix_only")
+    flow.ttt_layers = torch.nn.ModuleDict({"0": TTTMLPLayer(dim=4, hidden_dim=8, second_order=False)})
+
+    callback = flow._make_expert_layer_callback((1, 2), {}, update=True, create_graph=False)
+    with pytest.raises(RuntimeError, match="requires set_writer_inputs"):
+        callback(0, torch.randn(2, 3, 4))
+
+    writer = torch.randn(2, 5, 4)
+    callback = flow._make_expert_layer_callback((1, 2), {}, update=True, create_graph=False)
+    callback.set_writer_inputs(writer)
+    callback(0, torch.randn(2, 3, 4))
+
+    with pytest.raises(ValueError, match="flattened sequence batch size"):
+        callback.set_writer_inputs(torch.randn(1, 5, 4))
+
+
+def test_prefix_writer_fixed_resampling_has_expert_width_and_masks_padding() -> None:
+    flow = SmolVLATTTFlowMatching.__new__(SmolVLATTTFlowMatching)
+    torch.nn.Module.__init__(flow)
+    flow.vlm_with_expert = SimpleNamespace(expert_hidden_size=3)
+    prefix = torch.tensor([[[1.0, 3.0, 5.0, 7.0], [11.0, 13.0, 17.0, 19.0]]])
+    writer = flow._make_prefix_writer_inputs(prefix, torch.tensor([[True, False]]))
+
+    assert writer.shape == (1, 2, 3)
+    assert torch.count_nonzero(writer[:, 1]) == 0
+    # Adaptive pooling uses both ends of the source feature axis rather than
+    # silently discarding the final prefix dimensions.
+    assert writer[0, 0, -1] > writer[0, 0, 0]
+
+
 def test_flow_forward_with_state_forwards_optional_local_loss() -> None:
     """FlowMatching returns one local loss per physical sequence timestep."""
 

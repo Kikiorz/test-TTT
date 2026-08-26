@@ -362,6 +362,7 @@ class TTTMLPLayer(nn.Module):
         inputs: Tensor,
         state: TTTFastState | None = None,
         *,
+        writer_inputs: Tensor | None = None,
         update: bool = True,
         create_graph: bool | None = None,
         write_gate: Tensor | None = None,
@@ -375,6 +376,14 @@ class TTTMLPLayer(nn.Module):
         | tuple[Tensor, TTTFastState, tuple[TTTFastState, ...], Tensor]
     ):
         """Process ``[batch, timesteps, tokens, dim]`` and return the next fast state.
+
+        ``writer_inputs`` optionally separates the K/V write path from the
+        suffix read/query path.  It must have shape ``[batch, timesteps,
+        writer_tokens, dim]`` and is used only when ``update=True``.  This is
+        the prefix-only HD writer mode: observation-prefix tokens update the
+        recurrent fast weights, while the current noisy action suffix still
+        reads the updated state.  The default ``None`` path is bit-compatible
+        with the original suffix writer.
 
         ``write_gate`` may be scalar, ``[batch]`` or ``[batch, timesteps]``. A
         zero gate skips a write exactly, while values in ``[0, 1]`` interpolate
@@ -392,6 +401,21 @@ class TTTMLPLayer(nn.Module):
             raise ValueError(
                 f"Expected inputs with shape [batch, timesteps, tokens, {self.dim}], got {tuple(inputs.shape)}"
             )
+        if writer_inputs is not None:
+            if writer_inputs.ndim != 4 or writer_inputs.shape[:2] != inputs.shape[:2]:
+                raise ValueError(
+                    "writer_inputs must have shape [batch, timesteps, writer_tokens, dim] "
+                    f"with matching batch/timesteps, got {tuple(writer_inputs.shape)}"
+                )
+            if writer_inputs.shape[-1] != self.dim or writer_inputs.shape[2] <= 0:
+                raise ValueError(
+                    f"writer_inputs must have a positive token axis and final dim {self.dim}, "
+                    f"got {tuple(writer_inputs.shape)}"
+                )
+            if not update:
+                # A read-only denoising step must not accidentally alter the
+                # state based on an unused writer tensor.
+                writer_inputs = None
         if state is not None and state.batch_size != inputs.shape[0]:
             raise ValueError(
                 f"Fast-state batch size {state.batch_size} does not match input batch size {inputs.shape[0]}"
@@ -421,6 +445,11 @@ class TTTMLPLayer(nn.Module):
                 write_gate = write_gate.detach().clone()
             projected_inputs = inputs.detach().clone() if outer_inference_enabled else inputs
             projected_inputs = projected_inputs.to(dtype=projection_dtype)
+            projected_writer_inputs = None
+            if writer_inputs is not None:
+                projected_writer_inputs = (
+                    writer_inputs.detach().clone() if outer_inference_enabled else writer_inputs
+                ).to(dtype=projection_dtype)
             if state is None:
                 state = self.initial_state(inputs.shape[0])
             # A frozen hindsight teacher legitimately has every module
@@ -483,18 +512,35 @@ class TTTMLPLayer(nn.Module):
                 )
                 queries = self._apply_rope(self.q_proj(normalized_inputs), token_positions)
                 if update:
+                    writer_timestep_inputs = (
+                        normalized_inputs
+                        if projected_writer_inputs is None
+                        else F.layer_norm(
+                            projected_writer_inputs[:, timestep_index],
+                            (self.dim,),
+                        )
+                    )
+                    writer_token_positions = (
+                        timestep_position[:, None] * writer_timestep_inputs.shape[1]
+                        + torch.arange(
+                            writer_timestep_inputs.shape[1], device=inputs.device
+                        )[None, :]
+                    )
                     if detach_writer:
                         # K/V are used to compute the intervention's numerical
                         # update, but their projections must not connect back to
                         # the input/action expert or writer parameters.
                         with torch.no_grad():
                             keys = self._apply_rope(
-                                self.k_proj(normalized_inputs.detach()), token_positions
+                                self.k_proj(writer_timestep_inputs.detach()),
+                                writer_token_positions,
                             )
-                            values = self.v_proj(normalized_inputs.detach())
+                            values = self.v_proj(writer_timestep_inputs.detach())
                     else:
-                        keys = self._apply_rope(self.k_proj(normalized_inputs), token_positions)
-                        values = self.v_proj(normalized_inputs)
+                        keys = self._apply_rope(
+                            self.k_proj(writer_timestep_inputs), writer_token_positions
+                        )
+                        values = self.v_proj(writer_timestep_inputs)
                     timestep_gate = None if write_gate is None else write_gate[:, timestep_index]
                     update_result = self._update(
                         keys,

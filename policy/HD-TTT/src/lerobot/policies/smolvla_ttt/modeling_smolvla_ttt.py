@@ -2164,16 +2164,32 @@ class SmolVLATTTFlowMatching(nn.Module):
         layer-wise losses before returning them.
         """
         batch_size, sequence_length = sequence_shape
+        writer_mode = getattr(getattr(self, "config", None), "ttt_writer_mode", "suffix")
 
         # The learned gate is deliberately shared by all selected layers.  A
         # closure-local cache ensures the first selected layer computes one
         # scalar per physical interaction and every later layer reuses it.
         predicted_write_gate: Tensor | None = None
         gate_context: Tensor | None = None
+        writer_inputs: Tensor | None = None
 
         def set_gate_context(context: Tensor) -> None:
             nonlocal gate_context
             gate_context = context
+
+        def set_writer_inputs(inputs: Tensor) -> None:
+            nonlocal writer_inputs
+            if inputs.ndim != 3:
+                raise ValueError(
+                    "prefix writer inputs must be flattened [B*T,N,D], "
+                    f"got {tuple(inputs.shape)}"
+                )
+            if inputs.shape[0] != batch_size * sequence_length:
+                raise ValueError(
+                    "prefix writer inputs must have the flattened sequence batch size "
+                    f"{batch_size * sequence_length}, got {inputs.shape[0]}"
+                )
+            writer_inputs = inputs
 
         def apply_ttt(layer_index: int, hidden_states: Tensor) -> Tensor:
             nonlocal predicted_write_gate
@@ -2221,9 +2237,27 @@ class SmolVLATTTFlowMatching(nn.Module):
                         "write_gate must match the callback sequence shape "
                         f"{(batch_size, sequence_length)}, got {tuple(layer_write_gate.shape)}"
                     )
+            if update and writer_mode == "prefix_only" and writer_inputs is None:
+                raise RuntimeError(
+                    "ttt_writer_mode='prefix_only' requires set_writer_inputs() before the expert callback"
+                )
             layer_output = self.ttt_layers[layer_key](
                 sequence,
                 fast_states.get(layer_index),
+                writer_inputs=(
+                    None
+                    if writer_mode == "suffix"
+                    else (
+                        writer_inputs.reshape(
+                            batch_size,
+                            sequence_length,
+                            writer_inputs.shape[1],
+                            writer_inputs.shape[2],
+                        )
+                        if writer_inputs is not None
+                        else None
+                    )
+                ),
                 update=update,
                 create_graph=create_graph,
                 write_gate=layer_write_gate,
@@ -2244,6 +2278,7 @@ class SmolVLATTTFlowMatching(nn.Module):
         # expert layer executes.  Keeping it as an attribute preserves the
         # existing two-argument callback API used by the sibling model/tests.
         apply_ttt.set_gate_context = set_gate_context
+        apply_ttt.set_writer_inputs = set_writer_inputs
         return apply_ttt
 
     def sample_noise(self, shape, device):
@@ -2355,6 +2390,41 @@ class SmolVLATTTFlowMatching(nn.Module):
         att_masks = att_masks.expand(bsize, -1)
 
         return embs, pad_masks, att_masks
+
+    def _make_prefix_writer_inputs(
+        self, prefix_embs: Tensor, prefix_pad_masks: Tensor
+    ) -> Tensor:
+        """Build deterministic observation-prefix inputs for the K/V writer.
+
+        The VLM prefix and action expert can have different widths.  To keep
+        the prefix-only writer checkpoint-compatible and avoid a second
+        learned adapter, adapt the feature axis with a fixed adaptive-average
+        resampling map.  Unlike truncation, every source feature participates
+        when the expert is narrower.  Padding tokens are zeroed so they do
+        not create bias-free K/V updates.  The returned tensor is flattened
+        like expert hidden states and is installed on the callback once per
+        physical observation.
+        """
+        if prefix_embs.ndim != 3 or prefix_pad_masks.ndim != 2:
+            raise ValueError(
+                "prefix writer inputs expect [B,P,D] embeddings and [B,P] padding mask, "
+                f"got {tuple(prefix_embs.shape)} and {tuple(prefix_pad_masks.shape)}"
+            )
+        if prefix_embs.shape[:2] != prefix_pad_masks.shape:
+            raise ValueError(
+                "prefix embeddings and padding mask must share [B,P], got "
+                f"{tuple(prefix_embs.shape)} and {tuple(prefix_pad_masks.shape)}"
+            )
+        expert_dim = self.vlm_with_expert.expert_hidden_size
+        prefix_dim = prefix_embs.shape[-1]
+        if prefix_dim == expert_dim:
+            writer = prefix_embs
+        else:
+            writer = F.adaptive_avg_pool1d(
+                prefix_embs.reshape(-1, 1, prefix_dim), expert_dim
+            ).reshape(*prefix_embs.shape[:2], expert_dim)
+        writer = writer * prefix_pad_masks.to(dtype=writer.dtype, device=writer.device).unsqueeze(-1)
+        return writer
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed action/time tokens and optional learned registers for the expert."""
@@ -2511,6 +2581,11 @@ class SmolVLATTTFlowMatching(nn.Module):
                 # the suffix is a strict causal gate context: no action chunk
                 # or denoising timestep can leak into the write decision.
                 set_gate_context(prefix_context)
+            if getattr(self.config, "ttt_writer_mode", "suffix") == "prefix_only":
+                set_writer_inputs = getattr(expert_layer_callback, "set_writer_inputs", None)
+                if set_writer_inputs is None:
+                    raise RuntimeError("prefix_only writer requires a callback writer-input setter")
+                set_writer_inputs(self._make_prefix_writer_inputs(prefix_embs, prefix_pad_masks))
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -2683,6 +2758,11 @@ class SmolVLATTTFlowMatching(nn.Module):
                 set_gate_context = getattr(expert_layer_callback, "set_gate_context", None)
                 if set_gate_context is not None and prefix_context is not None:
                     set_gate_context(prefix_context)
+                if getattr(self.config, "ttt_writer_mode", "suffix") == "prefix_only":
+                    set_writer_inputs = getattr(expert_layer_callback, "set_writer_inputs", None)
+                    if set_writer_inputs is None:
+                        raise RuntimeError("prefix_only writer requires a callback writer-input setter")
+                    set_writer_inputs(self._make_prefix_writer_inputs(prefix_embs, prefix_pad_masks))
 
             def denoise_step_partial_call(
                 input_x_t,

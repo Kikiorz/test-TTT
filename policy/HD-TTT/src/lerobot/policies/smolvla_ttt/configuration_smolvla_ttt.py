@@ -134,6 +134,13 @@ class SmolVLATTTConfig(PreTrainedConfig):
     ttt_second_order: bool = True
     ttt_start_layer: int = 12
     ttt_layer_indices: list[int] | None = field(default=None)
+    # ``suffix`` preserves the original RoboTTT writer (the current expert
+    # suffix, including action/time/register tokens).  ``prefix_only`` uses
+    # only the observation/language/state prefix as the K/V writer input while
+    # retaining the expert suffix as the query/read path.  The latter removes
+    # denoising-noise dependence from the write decision without changing the
+    # fast-weight state or checkpoint tensor shapes.
+    ttt_writer_mode: str = "suffix"
     # Learned expert-side tokens prepended before the action tokens. Register
     # queries may read the complete action suffix, while action queries cannot
     # directly read register columns and retain the original causal
@@ -225,6 +232,8 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("ttt_effective_gate_init must be in [0, 1)")
         if self.ttt_rope_theta <= 0:
             raise ValueError("ttt_rope_theta must be positive")
+        if self.ttt_writer_mode not in {"suffix", "prefix_only"}:
+            raise ValueError("ttt_writer_mode must be 'suffix' or 'prefix_only'")
         if self.ttt_num_register_tokens < 0:
             raise ValueError("ttt_num_register_tokens must be non-negative")
         if self.ttt_training_stage not in {"ttt_only", "action_head"}:
