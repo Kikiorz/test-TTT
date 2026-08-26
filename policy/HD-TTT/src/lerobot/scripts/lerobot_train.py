@@ -755,6 +755,13 @@ def update_policy_tbptt(
         in {"v2", "v2_relative_antithetic_robust"}
         and batch.get("hd_teacher_effect") is not None
     )
+    # Imported lazily so ordinary/non-SmolVLA training does not pull the
+    # heavyweight SmolVLA model module merely for a logging helper.
+    hd_balance_metrics = None
+    if bool(getattr(policy_config, "hd_ttt_enabled", False)):
+        from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import _hd_loss_balance_metrics
+
+        hd_balance_metrics = _hd_loss_balance_metrics
     # Hindsight grounding has two detached counterfactual trajectories.  Keep
     # them across TBPTT segments of this one sequence so an early zero-write
     # intervention remains present in later reads.  Ordinary TTT/clean batches
@@ -850,12 +857,19 @@ def update_policy_tbptt(
             loss_per_dim += segment_loss_per_dim * segment_weight
         for metric_name, metric_value in segment_output.items():
             if metric_name.startswith("hd_"):
+                # Ratios are recomputed from the sequence-level sums below;
+                # averaging per-segment ratios would make them depend on the
+                # TBPTT partition, especially under v2 global normalization.
+                if metric_name in {"hd_aux_to_flow_ratio", "hd_aux_fraction"}:
+                    continue
                 additive_metric = metric_name in {
                     "hd_hca",
                     "hd_h2l",
                     "hd_effect",
                     "hd_grounding",
                     "hd_gate",
+                    "hd_auxiliary_loss",
+                    "hd_flow_loss",
                 }
                 metric_weight = 1.0 if use_global_hd_normalization and additive_metric else segment_weight
                 auxiliary_metric_sums[metric_name] = auxiliary_metric_sums.get(metric_name, 0.0) + float(
@@ -899,6 +913,23 @@ def update_policy_tbptt(
             auxiliary_metric_sums[metric_name] = float(
                 accelerator.reduce(metric_tensor, reduction="mean").item()
             )
+
+    # Report a single sequence-level balance value.  For v2, each HD scalar is
+    # already normalized by the complete physical-frame denominator and each
+    # flow scalar carries its segment-valid fraction, so summing the two
+    # metrics above yields a TBPTT-partition-invariant ratio.  Legacy paths use
+    # the historical segment weights for both terms.
+    if (
+        hd_balance_metrics is not None
+        and "hd_auxiliary_loss" in auxiliary_metric_sums
+        and "hd_flow_loss" in auxiliary_metric_sums
+    ):
+        auxiliary_metric_sums.update(
+            hd_balance_metrics(
+                auxiliary_metric_sums["hd_auxiliary_loss"],
+                auxiliary_metric_sums["hd_flow_loss"],
+            )
+        )
 
     if grad_clip_norm > 0:
         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
@@ -1315,6 +1346,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             "hd_effect_direction",
             "hd_effect_invariance",
             "hd_effect_weight_mass",
+            "hd_aux_to_flow_ratio",
+            "hd_aux_fraction",
+            "hd_ttt_inner_lr_min",
+            "hd_ttt_inner_lr_max",
+            "hd_ttt_effective_gate_min",
+            "hd_ttt_effective_gate_max",
         ):
             train_metrics[metric_name] = AverageMeter(metric_name, ":.5f")
 
@@ -1405,6 +1442,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "hd_effect_direction",
                 "hd_effect_invariance",
                 "hd_effect_weight_mass",
+                "hd_aux_to_flow_ratio",
+                "hd_aux_fraction",
+                "hd_ttt_inner_lr_min",
+                "hd_ttt_inner_lr_max",
+                "hd_ttt_effective_gate_min",
+                "hd_ttt_effective_gate_max",
             ):
                 if metric_name in output_dict:
                     setattr(train_tracker, metric_name, output_dict[metric_name])

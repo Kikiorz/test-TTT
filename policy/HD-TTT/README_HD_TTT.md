@@ -468,6 +468,12 @@ HD-TTT 并不是“去掉参数”的方法。`η`、residual gate、各辅助�
    **结构性消融**，不应混在连续参数敏感性表里。所有结果使用同一个 checkpoint
    provenance/label protocol，并给出失败或不稳定的设置，而不是只展示成功项。
 
+训练日志还记录 `hd_aux_to_flow_ratio` 与 `hd_aux_fraction`，以及选中 TTT 层的
+`inner_lr`/`effective_gate` 最小值和最大值。这些字段是 detached stability
+diagnostics，只用于审计不同设置下的损失尺度和内循环控制范围，不会自动重标定
+loss，也不会引入新的训练旋钮；v2 的 TBPTT 汇总在整段序列的分子相加后再计算
+ratio，因此不会随 segment length 改变定义。
+
 若邻域内 SR 有平滑的小幅变化，说明结果依赖算法机制而非单点调参；若某一
 参数出现陡峭跃迁，应在正文中如实标注并增加更细的局部扫描，不能用默认值
 “写死”来隐藏敏感性。

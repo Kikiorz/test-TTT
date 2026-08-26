@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -24,6 +25,8 @@ from lerobot.policies.smolvla_ttt.hd_ttt import (
 from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import (
     SmolVLATTTFlowMatching,
     SmolVLATTTPolicy,
+    _hd_loss_balance_metrics,
+    _hd_ttt_parameter_range_metrics,
     _restore_checkpoint_model_fields,
     _validate_checkpoint_keys,
 )
@@ -81,6 +84,52 @@ def test_default_ttt_layers_match_last_four_smolvla_expert_layers() -> None:
     assert config.n_action_steps == 1
     assert config.hd_counterfactual_margin == 0.0
     assert config.hd_grounding_min_future_frames == 64
+
+
+def test_hd_loss_balance_diagnostics_are_scale_explicit_and_zero_safe() -> None:
+    """Loss-balance logs are detached observations, including empty-flow windows."""
+
+    metrics = _hd_loss_balance_metrics(2.0, 8.0)
+    assert metrics["hd_aux_to_flow_ratio"] == pytest.approx(0.25)
+    assert metrics["hd_aux_fraction"] == pytest.approx(0.2)
+
+    # A warm-up/effect-only segment can have no valid flow action.  Keep the
+    # ratio finite for dashboards while still exposing that HD is the only
+    # active contribution through the fraction.
+    zero_flow = _hd_loss_balance_metrics(1.0, 0.0)
+    assert zero_flow["hd_aux_to_flow_ratio"] == 0.0
+    assert zero_flow["hd_aux_fraction"] == 1.0
+
+    empty = _hd_loss_balance_metrics(0.0, 0.0)
+    assert empty["hd_aux_to_flow_ratio"] == 0.0
+    assert empty["hd_aux_fraction"] == 0.0
+
+    # Do not silently turn an exploding objective into a plausible-looking
+    # zero.  NaN is intentional and remains detached for the tracker.
+    assert math.isnan(_hd_loss_balance_metrics(float("nan"), 1.0)["hd_aux_fraction"])
+
+
+def test_hd_ttt_parameter_range_diagnostics_read_selected_layers_only() -> None:
+    """Inner-loop controls are logged without introducing gradient edges."""
+
+    first = TTTMLPLayer(dim=4, hidden_dim=8, base_inner_lr=0.1, second_order=False)
+    second = TTTMLPLayer(dim=4, hidden_dim=8, base_inner_lr=0.1, second_order=False)
+    with torch.no_grad():
+        first.log_inner_lr_multiplier.fill_(math.log(0.5))
+        second.log_inner_lr_multiplier.fill_(math.log(2.0))
+        first.gate.fill_(math.atanh(0.1))
+        second.gate.fill_(math.atanh(0.3))
+
+    metrics = _hd_ttt_parameter_range_metrics(
+        torch.nn.ModuleDict({"first": first, "second": second})
+    )
+
+    assert metrics["hd_ttt_inner_lr_min"] == pytest.approx(0.05)
+    assert metrics["hd_ttt_inner_lr_max"] == pytest.approx(0.2)
+    assert metrics["hd_ttt_effective_gate_min"] == pytest.approx(0.1, abs=1e-6)
+    assert metrics["hd_ttt_effective_gate_max"] == pytest.approx(0.3, abs=1e-6)
+    assert all(isinstance(value, float) for value in metrics.values())
+    assert all(not isinstance(value, torch.Tensor) for value in metrics.values())
 
 
 def test_grounding_min_future_horizon_is_non_negative() -> None:

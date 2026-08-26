@@ -57,6 +57,78 @@ from .ttt import TTTFastState, TTTMLPLayer
 
 TTTFastStates = dict[int, TTTFastState]
 
+
+def _hd_loss_balance_metrics(auxiliary_loss: float, flow_loss: float) -> dict[str, float]:
+    """Return scale diagnostics for the detached HD-vs-flow loss balance.
+
+    The metric is intentionally observational: it does not rescale either
+    objective or introduce another training knob.  ``hd_aux_to_flow_ratio``
+    is the absolute auxiliary contribution divided by the absolute flow
+    contribution.  A zero flow denominator yields ratio ``0`` (rather than
+    NaN/Inf); ``hd_aux_fraction`` still reports ``1`` when a non-zero HD term
+    is the only contribution.  Non-finite inputs are propagated as NaN so a
+    run cannot silently hide an exploding loss.
+    """
+
+    auxiliary_value = float(auxiliary_loss)
+    flow_value = float(flow_loss)
+    if not math.isfinite(auxiliary_value) or not math.isfinite(flow_value):
+        return {
+            "hd_aux_to_flow_ratio": float("nan"),
+            "hd_aux_fraction": float("nan"),
+        }
+
+    auxiliary_magnitude = abs(auxiliary_value)
+    flow_magnitude = abs(flow_value)
+    ratio = 0.0 if flow_magnitude <= 1e-8 else auxiliary_magnitude / flow_magnitude
+    total_magnitude = auxiliary_magnitude + flow_magnitude
+    fraction = 0.0 if total_magnitude <= 1e-8 else auxiliary_magnitude / total_magnitude
+    return {
+        "hd_aux_to_flow_ratio": ratio,
+        "hd_aux_fraction": fraction,
+    }
+
+
+def _hd_ttt_parameter_range_metrics(ttt_layers: nn.ModuleDict | None) -> dict[str, float]:
+    """Summarize selected TTT parameter ranges without touching gradients.
+
+    ``inner_lr`` and ``effective_gate`` are the two slow controls that can
+    make an otherwise identical HD recipe appear hyperparameter-sensitive.
+    Logging their ranges makes that sensitivity auditable while deliberately
+    leaving the update rule unchanged.  The helper tolerates lightweight fake
+    layer containers used by tests and returns an empty mapping when no
+    selected layers are available.
+    """
+
+    if ttt_layers is None:
+        return {}
+    try:
+        layers = tuple(ttt_layers.values())
+    except AttributeError:
+        return {}
+
+    inner_lrs: list[Tensor] = []
+    effective_gates: list[Tensor] = []
+    for layer in layers:
+        inner_lr = getattr(layer, "inner_lr", None)
+        if inner_lr is not None:
+            inner_lrs.append(torch.as_tensor(inner_lr).detach().float().reshape(-1))
+        effective_gate = getattr(layer, "effective_gate", None)
+        if effective_gate is not None:
+            effective_gates.append(torch.as_tensor(effective_gate).detach().float().reshape(-1))
+
+    metrics: dict[str, float] = {}
+    if inner_lrs:
+        inner_lr_values = torch.cat(inner_lrs)
+        metrics["hd_ttt_inner_lr_min"] = float(inner_lr_values.amin().item())
+        metrics["hd_ttt_inner_lr_max"] = float(inner_lr_values.amax().item())
+    if effective_gates:
+        gate_values = torch.cat(effective_gates)
+        metrics["hd_ttt_effective_gate_min"] = float(gate_values.amin().item())
+        metrics["hd_ttt_effective_gate_max"] = float(gate_values.amax().item())
+    return metrics
+
+
 _CHECKPOINT_ARCHITECTURE_FIELDS = {
     "n_obs_steps",
     "chunk_size",
@@ -2239,6 +2311,26 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             if flow_weight.numel() != 1:
                 raise ValueError("flow_loss_weight must be scalar")
             flow_loss = flow_loss * flow_weight.reshape(())
+
+        if hd_enabled:
+            # These values are diagnostics only.  In the v2 TBPTT path the
+            # trainer recomputes the two balance metrics after summing all
+            # segment numerators, so the reported ratio is invariant to the
+            # chosen segment length.  A direct one-segment call (including
+            # legacy/non-TBPTT training) receives the local balance instead.
+            loss_dict["hd_auxiliary_loss"] = float(hd_aux_loss.detach().item())
+            loss_dict["hd_flow_loss"] = float(flow_loss.detach().item())
+            loss_dict.update(
+                _hd_loss_balance_metrics(
+                    hd_aux_loss.detach().item(),
+                    flow_loss.detach().item(),
+                )
+            )
+            loss_dict.update(
+                _hd_ttt_parameter_range_metrics(
+                    getattr(self.model, "ttt_layers", None),
+                )
+            )
 
         if reduction == "none":
             if actions_is_pad is None:
