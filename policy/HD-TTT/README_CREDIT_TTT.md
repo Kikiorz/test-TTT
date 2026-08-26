@@ -570,6 +570,14 @@ cadence fixed:
 7. Full-history vs a named bounded-window context, with matched seen frames.
 8. Native (K=50) and native (K=1) cadence controls.
 
+The objective-family switch is explicit in the checkpoint configuration and
+launcher: `V3_ABLATION=full` (canonical, local=1/CMD=1),
+`V3_ABLATION=qh2l_only` (writer/QH2L only), or
+`V3_ABLATION=cmd_only` (reader/CMD only, local=0).  The model skips the
+disabled replay, records a corresponding `*_disabled` metric, and rejects a
+zero weight whose declared ablation does not match it.  Thus CMD-only is a
+reader ablation rather than an accidentally weakened full model.
+
 Weights such as inner learning rate, residual gate, null weight, and pair
 budget are implementation parameters.  They may affect performance, but must
 be fixed from the training split/recipe and not selected on simulator test
