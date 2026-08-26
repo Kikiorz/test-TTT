@@ -154,6 +154,13 @@ def _load_base_policy(args: argparse.Namespace):
         hd_ttt_enabled=False,
         hd_effect_weight=0.0,
         hd_attribution_protocol="legacy_raw_hinge_max",
+        # The causal teacher's interaction is defined over the observation
+        # prefix *and* the previously executed slot-0 action.  Clean-TTT
+        # checkpoints used by the canonical recipe carry this projection;
+        # make the target architecture explicit so loading such a checkpoint
+        # cannot silently drop it (which otherwise surfaces as an unexpected
+        # ``model.previous_action_proj`` key).
+        hd_v3_include_previous_action=True,
         ttt_training_stage="ttt_only",
     )
     policy = make_policy(config, ds_meta=metadata)
