@@ -1877,6 +1877,20 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     chunk_null = pair_labels["null"].index_select(0, chunk_indices)
                     chunk_student = chunk_student[..., :active_dim]
                     chunk_teacher = chunk_teacher[..., :active_dim]
+                    chunk_prefix = chunk_student.shape[:-1]
+                    # Pair labels are vectors over the leading replay axis.
+                    # Make that intent explicit before passing them to the
+                    # generic loss: when a chunk happens to contain exactly
+                    # ``chunk_size`` rows, PyTorch's bare ``[N]`` broadcast
+                    # would otherwise be ambiguous with the action-slot axis.
+                    if len(chunk_prefix) > 1 and chunk_utility.shape[0] == chunk_prefix[0]:
+                        pair_shape = (chunk_prefix[0],) + (1,) * (len(chunk_prefix) - 1)
+                        chunk_utility = chunk_utility.reshape(pair_shape)
+                        chunk_positive = chunk_positive.reshape(pair_shape)
+                        chunk_null = chunk_null.reshape(pair_shape)
+                    chunk_valid = torch.ones(
+                        chunk_prefix, dtype=torch.bool, device=chunk_student.device
+                    )
                     # The loss primitive broadcasts singleton label axes to
                     # the replay output before computing its RMS.  Mirror
                     # that broadcast for diagnostics so streamed metrics are
@@ -1894,7 +1908,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                         utility=chunk_utility,
                         positive_mask=chunk_positive,
                         null_mask=chunk_null,
-                        valid_mask=torch.ones_like(chunk_positive),
+                        valid_mask=chunk_valid,
                         null_weight=1.0,
                         positive_denominator=normalizers.get("positive"),
                         null_denominator=normalizers.get("null"),
@@ -2143,6 +2157,15 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 )
                 before_action = before_action[..., :active_dim]
                 after_action = after_action[..., :active_dim]
+                chunk_prefix = after_action.shape[:-1]
+                if len(chunk_prefix) > 1 and chunk_utility.shape[0] == chunk_prefix[0]:
+                    pair_shape = (chunk_prefix[0],) + (1,) * (len(chunk_prefix) - 1)
+                    chunk_utility = chunk_utility.reshape(pair_shape)
+                    chunk_positive = chunk_positive.reshape(pair_shape)
+                    chunk_null = chunk_null.reshape(pair_shape)
+                chunk_valid = torch.ones(
+                    chunk_prefix, dtype=torch.bool, device=after_action.device
+                )
                 chunk_teacher_full = chunk_teacher_full[..., :active_dim]
                 chunk_teacher_wrong = chunk_teacher_wrong[..., :active_dim]
                 chunk_expert = chunk_expert[..., :active_dim]
@@ -2157,7 +2180,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     utility=chunk_utility,
                     positive_mask=chunk_positive,
                     null_mask=chunk_null,
-                    valid_mask=torch.ones_like(chunk_positive, dtype=torch.bool),
+                    valid_mask=chunk_valid,
                     margin=float(getattr(self.config, "hd_v3_cmd_margin", 0.05)),
                     null_weight=float(getattr(self.config, "hd_v3_null_weight", 0.25)),
                     full_denominator=normalizers.get("full"),
