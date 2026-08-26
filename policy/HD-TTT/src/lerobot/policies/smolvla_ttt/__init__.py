@@ -21,6 +21,20 @@ from .hd_ttt import (
     compute_hindsight_attribution,
     local_kvb_loss,
 )
+from .history_teacher import (
+    HISTORY_DELETION_SCHEMA,
+    HISTORY_EVENT_SCHEMA,
+    HISTORY_TEACHER_FORMAT,
+    CausalFullHistoryTeacher,
+    CausalHistoryOutput,
+    CausalHistoryState,
+    CausalHistoryTeacher,
+    HistoryPrefixConditioner,
+    append_history_memory,
+    history_teacher_state_sha256,
+    summarize_prefix,
+    validate_history_teacher_provenance,
+)
 from .modeling_smolvla_ttt import SmolVLATTTPolicy
 from .processor_smolvla_ttt import make_smolvla_ttt_pre_post_processors
 from .sequence import (
@@ -46,6 +60,18 @@ __all__ = [
     "compute_hindsight_attribution",
     "counterfactual_grounding_loss",
     "local_kvb_loss",
+    "HISTORY_DELETION_SCHEMA",
+    "HISTORY_EVENT_SCHEMA",
+    "HISTORY_TEACHER_FORMAT",
+    "CausalFullHistoryTeacher",
+    "CausalHistoryOutput",
+    "CausalHistoryState",
+    "CausalHistoryTeacher",
+    "HistoryPrefixConditioner",
+    "append_history_memory",
+    "history_teacher_state_sha256",
+    "summarize_prefix",
+    "validate_history_teacher_provenance",
     "TailPreservingSequenceDataset",
     "make_smolvla_ttt_pre_post_processors",
     "sequence_collate_fn",
