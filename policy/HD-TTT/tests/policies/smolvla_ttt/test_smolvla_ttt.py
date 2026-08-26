@@ -1393,6 +1393,38 @@ def test_action_effect_zero_teacher_uses_finite_unit_scale() -> None:
     assert teacher_effect.grad is None
 
 
+def test_action_effect_broadcasts_frame_masks_over_event_axis() -> None:
+    """A [B,T] label mask/weight must cover every [B,T,K] event branch."""
+
+    student_true = torch.randn(2, 3, 4, 5, requires_grad=True)
+    student_wrong = torch.randn(2, 3, 4, 5, requires_grad=True)
+    teacher_effect = torch.randn(2, 3, 4, 5)
+    frame_importance = torch.tensor(
+        [[1.0, 0.5, 0.0], [0.0, 0.5, 1.0]], dtype=torch.float32
+    )
+    frame_valid = torch.tensor(
+        [[True, False, True], [True, True, False]], dtype=torch.bool
+    )
+
+    parts = action_effect_distillation_loss(
+        student_true,
+        student_wrong,
+        teacher_effect=teacher_effect,
+        importance=frame_importance,
+        valid_mask=frame_valid,
+        reduction="none",
+        return_components=True,
+    )
+
+    assert parts.total.shape == (2, 3, 4)
+    # Boolean indexing over the leading ``[B,T]`` dimensions selects complete
+    # event rows, so every branch in an invalid frame must be zero.
+    assert torch.all(parts.total[~frame_valid] == 0)
+    parts.total.sum().backward()
+    assert student_true.grad is not None and torch.isfinite(student_true.grad).all()
+    assert student_wrong.grad is not None and torch.isfinite(student_wrong.grad).all()
+
+
 def test_action_effect_target_is_scale_invariant_in_normalized_coordinates() -> None:
     """Changing action units should not change the v2 effect objective."""
 
