@@ -191,6 +191,22 @@ DEFAULT_GO_NO_GO: tuple[dict[str, Any], ...] = (
         "reason": "The local writer update must reproduce the teacher's control effect.",
     },
     {
+        "id": "local_effect_alignment_ci",
+        "aliases": (
+            "q_h2l_effect_cosine_ci95_low",
+            "q_h2l_effect_cosine_lower_ci",
+            "qh2l_teacher_effect_cosine_ci95_low",
+            "local_effect_teacher_cosine_ci95_low",
+        ),
+        "operator": ">",
+        "threshold": 0.0,
+        "required": True,
+        "reason": (
+            "The query-conditioned local effect must align with the teacher with a "
+            "positive lower confidence bound, rather than only a positive point estimate."
+        ),
+    },
+    {
         "id": "exact_gradient_alignment",
         "aliases": (
             "exact_e2e_gradient_alignment_cosine",
@@ -225,6 +241,96 @@ DEFAULT_GO_NO_GO: tuple[dict[str, Any], ...] = (
         "threshold": 0.0,
         "required": True,
         "reason": "Attribution should rank control-relevant events above random events.",
+    },
+    {
+        "id": "pairwise_effect_alignment",
+        "aliases": (
+            "pairwise_high_utility_delta_a_cosine",
+            "high_utility_action_effect_cosine",
+            "pairwise_delta_a_cosine",
+        ),
+        "operator": ">",
+        "threshold": 0.0,
+        "required": True,
+        "reason": (
+            "High-utility event/future pairs must carry a directional final-action effect; "
+            "report this separately by delay bin in the audit artifact."
+        ),
+    },
+    {
+        "id": "history_intervention_recall_excess_random",
+        "aliases": (
+            "history_intervention_recall_at_k_minus_random",
+            "history_intervention_recall_excess_random",
+            "intervention_recall_at_k_excess",
+        ),
+        "operator": ">",
+        "threshold": 0.0,
+        "required": True,
+        "reason": (
+            "Attribution should retrieve control-relevant history above a random-event "
+            "top-K reference, with K frozen before evaluation."
+        ),
+    },
+    {
+        "id": "deployment_memory_selectivity",
+        "aliases": (
+            "deployment_correct_minus_irrelevant_action_drift",
+            "correct_memory_drift_minus_irrelevant_drift",
+            "correct_vs_irrelevant_action_drift_delta",
+        ),
+        "operator": ">",
+        "threshold": 0.0,
+        "required": True,
+        "reason": (
+            "The deployed reader must respond more to a correct memory intervention "
+            "than to an irrelevant-memory control."
+        ),
+    },
+    {
+        "id": "deployment_counterfactual_sensitivity",
+        "aliases": (
+            "deployment_wrong_reset_action_drift",
+            "wrong_or_reset_memory_action_drift",
+            "deployment_counterfactual_action_drift",
+        ),
+        "operator": ">",
+        "threshold": 0.0,
+        "required": True,
+        "reason": (
+            "Replacing or resetting a control-relevant memory must measurably change "
+            "the deployed action; otherwise the writer is not causally used."
+        ),
+    },
+    {
+        "id": "deployment_wrong_selectivity",
+        "aliases": (
+            "deployment_wrong_minus_irrelevant_action_drift",
+            "wrong_memory_drift_minus_irrelevant_drift",
+            "wrong_vs_irrelevant_action_drift_delta",
+        ),
+        "operator": ">",
+        "threshold": 0.0,
+        "required": True,
+        "reason": (
+            "A wrong-memory intervention should be distinguishable from an irrelevant "
+            "memory replacement in the deployed reader."
+        ),
+    },
+    {
+        "id": "deployment_reset_selectivity",
+        "aliases": (
+            "deployment_reset_minus_irrelevant_action_drift",
+            "reset_memory_drift_minus_irrelevant_drift",
+            "reset_vs_irrelevant_action_drift_delta",
+        ),
+        "operator": ">",
+        "threshold": 0.0,
+        "required": True,
+        "reason": (
+            "Resetting a control-relevant memory should be distinguishable from an "
+            "irrelevant-memory control in the deployed reader."
+        ),
     },
     {
         "id": "finite_training",
@@ -459,7 +565,42 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "fixed_episode_seeds_across_methods": True,
         },
         "mechanism_audits": {
-            "delay_bins": ["1-16", "17-64", "65-256", "257-1024", "1025+"],
+            # Delay bins are frozen per task.  Color episodes are only a few
+            # dozen frames long, so reporting 65+ bins for that task would be
+            # a fabricated extrapolation.  Shuffle-Long is the only task in
+            # this manifest with enough frames for the longer bins.
+            "delay_bins_by_task": {
+                "color": ["1-16"],
+                "shuffle_long": ["1-16", "17-64", "65-256", "257-1024"],
+            },
+            # Union retained for consumers that expect one flat list.  The
+            # task-specific map above is authoritative for tables/plots.
+            "delay_bins": ["1-16", "17-64", "65-256", "257-1024"],
+            "pairwise_teacher_effect": {
+                "metric": "pairwise_high_utility_delta_a_cosine",
+                "group_by": ["task_id", "delay_bin"],
+                "required_bins": {
+                    "color": ["1-16"],
+                    "shuffle_long": ["1-16", "17-64", "65-256", "257-1024"],
+                },
+                "report_confidence_interval": True,
+                "target": "final_slot0_action",
+            },
+            "intervention_retrieval": {
+                "metric": "history_intervention_recall_at_k_minus_random",
+                # K is frozen in the protocol and must not be selected on test
+                # seeds.  A caller may report additional K values, but this
+                # one is the pre-registered primary retrieval point.
+                "k": 8,
+                "group_by": ["task_id"],
+                "random_reference": "uniform_eligible_events",
+            },
+            "deployment_interventions": {
+                "required_conditions": ["correct", "wrong", "reset", "irrelevant"],
+                "primary_selectivity_metric": "deployment_correct_minus_irrelevant_action_drift",
+                "counterfactual_metric": "deployment_wrong_reset_action_drift",
+                "action": "final_slot0_action",
+            },
             "required": [check["id"] for check in DEFAULT_GO_NO_GO],
             "go_no_go": list(DEFAULT_GO_NO_GO),
             "interpretation": (
@@ -1065,8 +1206,10 @@ def _flatten_numeric(value: Any, prefix: str = "") -> dict[str, float]:
             flattened.update(_flatten_numeric(child, child_prefix))
     elif isinstance(value, list):
         # Mechanism audits often store one value per delay bin/seed.  Expose
-        # the mean under the field name as a deterministic default while also
-        # retaining indexed values for an explicitly named alias.
+        # the mean under the field name as a deterministic default.  For a
+        # two-element confidence interval, retain explicit ``_low``/``_high``
+        # aliases as well; this lets a go/no-go gate require a positive lower
+        # bound instead of accepting a positive point estimate alone.
         numeric_values = [
             float(item)
             for item in value
@@ -1076,6 +1219,9 @@ def _flatten_numeric(value: Any, prefix: str = "") -> dict[str, float]:
         ]
         if numeric_values and len(numeric_values) == len(value):
             flattened[prefix] = float(np.mean(numeric_values))
+            if len(numeric_values) == 2:
+                flattened[f"{prefix}_low"] = numeric_values[0]
+                flattened[f"{prefix}_high"] = numeric_values[1]
         else:
             for index, child in enumerate(value):
                 child_prefix = f"{prefix}.{index}" if prefix else str(index)
@@ -1086,9 +1232,16 @@ def _flatten_numeric(value: Any, prefix: str = "") -> dict[str, float]:
 
 
 def _find_alias(flattened: Mapping[str, float], aliases: Sequence[str]) -> tuple[str, float] | None:
-    normalized = {key.lower().replace("-", "_"): (key, value) for key, value in flattened.items()}
+    # Dotted paths are emitted when a metric is nested in a JSON object;
+    # treating dots like underscores allows a paper-facing alias such as
+    # ``deployment.correct_action_drift`` to be declared once without making
+    # callers know the exact envelope nesting.
+    normalized = {
+        key.lower().replace("-", "_").replace(".", "_"): (key, value)
+        for key, value in flattened.items()
+    }
     for alias in aliases:
-        alias_norm = alias.lower().replace("-", "_")
+        alias_norm = alias.lower().replace("-", "_").replace(".", "_")
         if alias_norm in normalized:
             return normalized[alias_norm]
         # Accept a nested key ending in the declared metric name, but reject
@@ -1306,6 +1459,9 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
         for command in manifest["commands"]
         if command["method_id"] == "native_smolvla"
     )
+    bins = manifest["mechanism_audits"]["delay_bins_by_task"]
+    assert bins["color"] == ["1-16"]
+    assert "1025+" not in bins["shuffle_long"]
     seeds = np.arange(4, dtype=np.float64)
     paired = _paired_episode_vectors({"1000": seeds}, {"fixed": seeds[::-1]})
     assert len(paired) == 1 and next(iter(paired.values()))[0].shape == (4,)
