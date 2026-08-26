@@ -33,6 +33,11 @@ NUM_PROCESSES="${NUM_PROCESSES:-4}"
 # without copying or hand-editing this launcher.  This is an execution
 # setting, not an HD-TTT algorithm parameter.
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
+# Optional accelerate rank log fan-out for distributed bring-up.  Empty keeps
+# the normal single combined log; when set, ``--tee``/``--log_dir`` preserve
+# each rank's traceback without changing model math.
+ACCELERATE_TEE="${ACCELERATE_TEE:-}"
+ACCELERATE_LOG_DIR="${ACCELERATE_LOG_DIR:-}"
 SEQUENCE_LENGTH="${SEQUENCE_LENGTH:-64}"
 SEQUENCE_STRIDE="${SEQUENCE_STRIDE:-64}"
 MAX_WINDOWS_PER_EPISODE="${MAX_WINDOWS_PER_EPISODE:-4}"
@@ -307,6 +312,12 @@ LAUNCH=(
   --mixed_precision="${MIXED_PRECISION}"
   --dynamo_backend=no
 )
+if [[ -n "${ACCELERATE_TEE}" ]]; then
+  LAUNCH+=(--tee="${ACCELERATE_TEE}")
+fi
+if [[ -n "${ACCELERATE_LOG_DIR}" ]]; then
+  LAUNCH+=(--log_dir="${ACCELERATE_LOG_DIR}")
+fi
 if (( NUM_PROCESSES > 1 )); then
   LAUNCH+=(--multi_gpu)
 fi
