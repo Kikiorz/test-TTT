@@ -326,6 +326,27 @@ uses the episode reset sentinel.  Nonzero-offset windows must include the
 causal predecessor explicitly; silently zeroing or borrowing it would violate
 the teacher/student contract.
 
+### Batch and multi-GPU contract
+
+SmolVLA-TTT sequence windows are intentionally ragged (episode tails have
+different lengths) and each window owns an independent recurrent fast-weight
+state.  Consequently the sequence collator requires `batch_size=1` **per
+device**; padding unrelated episodes into one tensor would mix their states and
+change the causal objective.  Data parallelism remains valid: with `N` ranks,
+the effective global sequence batch is `N` (one complete trajectory per rank),
+and each rank's state is reset at the episode boundary.  The four-card launcher
+can therefore run two independent tasks on two cards each, or one task on all
+four cards; native (non-TTT) SmolVLA has no such restriction and may use an
+ordinary batch of 4--8 per card.  This is a sequence-semantic constraint, not
+a tuned optimization setting.
+
+The V3 full-flow reference replay uses activation offloading to host RAM by
+default so the second-order graph fits on 32-GB cards.  On a separately
+profiled job with sufficient device headroom, setting
+`CREDIT_TTT_REPLAY_SAVE_ON_CPU=0` removes that transfer overhead.  It leaves
+the denoising steps, paired noise, gradients, and loss exactly unchanged; the
+trade-off is higher peak GPU memory.  Unknown values retain the safe default.
+
 For the published four-task benchmark, each task is a separate training run
 with its own native initialization, normalization statistics, teacher, labels,
 and CreditTTT student checkpoint.  The manifest accepts per-task checkpoint
