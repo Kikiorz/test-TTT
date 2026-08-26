@@ -65,6 +65,8 @@ The V3 loss weights are exposed for explicitly named ablations/smoke tests
 canonical recipe keeps local=1, CMD=1, null=0.25; changing them does not
 silently alter the benchmark manifest and must be recorded in the output
 directory/experiment name.
+
+  V3_ABLATION=full|qh2l_only|cmd_only (sets the objective family and weights)
 EOF
 }
 
@@ -180,9 +182,30 @@ INTERVENTION="${INTERVENTION:-delete}"
 TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
 REGISTER_TOKENS="${REGISTER_TOKENS:-16}"
+_HD_V3_LOCAL_WEIGHT_SET="${HD_V3_LOCAL_WEIGHT+x}"
+_HD_V3_CMD_WEIGHT_SET="${HD_V3_CMD_WEIGHT+x}"
 HD_V3_LOCAL_WEIGHT="${HD_V3_LOCAL_WEIGHT:-1.0}"
 HD_V3_CMD_WEIGHT="${HD_V3_CMD_WEIGHT:-1.0}"
 HD_V3_NULL_WEIGHT="${HD_V3_NULL_WEIGHT:-0.25}"
+V3_ABLATION="${V3_ABLATION:-full}"
+case "${V3_ABLATION}" in
+  full)
+    [[ -n "${_HD_V3_LOCAL_WEIGHT_SET}" ]] || HD_V3_LOCAL_WEIGHT=1.0
+    [[ -n "${_HD_V3_CMD_WEIGHT_SET}" ]] || HD_V3_CMD_WEIGHT=1.0
+    ;;
+  qh2l_only)
+    [[ -n "${_HD_V3_LOCAL_WEIGHT_SET}" ]] || HD_V3_LOCAL_WEIGHT=1.0
+    [[ -n "${_HD_V3_CMD_WEIGHT_SET}" ]] || HD_V3_CMD_WEIGHT=0.0
+    ;;
+  cmd_only)
+    [[ -n "${_HD_V3_LOCAL_WEIGHT_SET}" ]] || HD_V3_LOCAL_WEIGHT=0.0
+    [[ -n "${_HD_V3_CMD_WEIGHT_SET}" ]] || HD_V3_CMD_WEIGHT=1.0
+    ;;
+  *)
+    echo "V3_ABLATION must be full, qh2l_only, or cmd_only; got '${V3_ABLATION}'" >&2
+    exit 2
+    ;;
+esac
 EPOCHS="${EPOCHS:-20}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 TEACHER_HIDDEN_DIM="${TEACHER_HIDDEN_DIM:-256}"
@@ -414,6 +437,7 @@ student_command() {
     --policy.hd_v3_pair_k="${PAIR_K}"
     --policy.hd_v3_local_weight="${HD_V3_LOCAL_WEIGHT}"
     --policy.hd_v3_cmd_weight="${HD_V3_CMD_WEIGHT}"
+    --policy.hd_v3_ablation="${V3_ABLATION}"
     --policy.hd_v3_cmd_margin=0.05
     --policy.hd_v3_null_weight="${HD_V3_NULL_WEIGHT}"
     --policy.hd_v3_null_threshold="${POSITIVE_THRESHOLD}"

@@ -362,6 +362,24 @@ def test_v3_conversion_preserves_explicit_second_order_from_clean_checkpoint() -
     assert target.ttt_second_order is True
 
 
+def test_v3_ablation_contract_makes_zero_weight_explicit() -> None:
+    common = dict(
+        hd_ttt_enabled=True,
+        hd_attribution_protocol="credit_ttt_v3_query_effect",
+        ttt_writer_mode="prefix_only",
+        ttt_second_order=True,
+        hd_effect_weight=0.0,
+    )
+    qh2l = SmolVLATTTConfig(**common, hd_v3_ablation="qh2l_only", hd_v3_cmd_weight=0.0)
+    assert qh2l.hd_v3_ablation == "qh2l_only"
+    cmd = SmolVLATTTConfig(**common, hd_v3_ablation="cmd_only", hd_v3_local_weight=0.0)
+    assert cmd.hd_v3_ablation == "cmd_only"
+    with pytest.raises(ValueError, match="cmd_only requires hd_v3_local_weight"):
+        SmolVLATTTConfig(**common, hd_v3_ablation="cmd_only")
+    with pytest.raises(ValueError, match="qh2l_only requires hd_v3_cmd_weight"):
+        SmolVLATTTConfig(**common, hd_v3_ablation="qh2l_only")
+
+
 def test_config_rejects_layers_without_a_reduced_expert_layer() -> None:
     with pytest.raises(ValueError, match="no expert exists"):
         SmolVLATTTConfig(num_vlm_layers=16, num_expert_layers=8, ttt_layer_indices=[13])

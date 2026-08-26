@@ -260,6 +260,7 @@ _CHECKPOINT_ARCHITECTURE_FIELDS = {
     "hd_v3_pair_k",
     "hd_v3_local_weight",
     "hd_v3_cmd_weight",
+    "hd_v3_ablation",
     "hd_v3_cmd_margin",
     "hd_v3_null_weight",
     "hd_v3_null_threshold",
@@ -317,6 +318,7 @@ def _restore_checkpoint_model_fields(
         "hd_v3_pair_k",
         "hd_v3_local_weight",
         "hd_v3_cmd_weight",
+        "hd_v3_ablation",
         "hd_v3_cmd_margin",
         "hd_v3_null_weight",
         "hd_v3_null_threshold",
@@ -3461,24 +3463,51 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 # signal is the pairwise query-conditioned effect; a tiny,
                 # fixed K/V reconstruction term keeps the recurrent update
                 # numerically anchored without becoming the method's target.
-                qh2l_loss, v3_metrics = self._v3_qh2l_loss(
-                    v3_pair_labels,
-                    trace_collector=v3_trace_collector,
-                    final_hidden_collector=v3_final_hidden_collector,
-                    trace_indices=v3_trace_indices,
-                    reference_batch=v3_reference_batch,
-                    normalizers=v3_pair_normalizers,
-                )
+                v3_local_weight = float(getattr(self.config, "hd_v3_local_weight", 1.0))
+                v3_cmd_weight = float(getattr(self.config, "hd_v3_cmd_weight", 1.0))
+                zero_v3 = self.model.action_out_proj.weight.sum() * 0.0
+                if v3_local_weight > 0.0:
+                    qh2l_loss, v3_metrics = self._v3_qh2l_loss(
+                        v3_pair_labels,
+                        trace_collector=v3_trace_collector,
+                        final_hidden_collector=v3_final_hidden_collector,
+                        trace_indices=v3_trace_indices,
+                        reference_batch=v3_reference_batch,
+                        normalizers=v3_pair_normalizers,
+                    )
+                else:
+                    # CMD-only is an explicit reader ablation.  Do not spend
+                    # the expensive writer-connected replay or expose a
+                    # misleading nonzero QH2L diagnostic when its objective
+                    # family is disabled.
+                    qh2l_loss = zero_v3
+                    v3_metrics = {
+                        "hd_v3_qh2l": 0.0,
+                        "hd_v3_pairs": 0.0,
+                        "hd_v3_pairs_skipped": 0.0,
+                        "hd_v3_qh2l_disabled": 1.0,
+                    }
                 # CMD is a reader/action objective over the same event/future
                 # pairs.  Its replay detaches the event snapshots internally,
                 # so adding it here cannot steal the writer meta-gradient that
                 # QH2L receives above.
-                cmd_loss, cmd_metrics = self._v3_cmd_loss(
-                    v3_pair_labels,
-                    trace_collector=v3_trace_collector,
-                    reference_batch=v3_reference_batch,
-                    normalizers=v3_pair_normalizers,
-                )
+                if v3_cmd_weight > 0.0:
+                    cmd_loss, cmd_metrics = self._v3_cmd_loss(
+                        v3_pair_labels,
+                        trace_collector=v3_trace_collector,
+                        reference_batch=v3_reference_batch,
+                        normalizers=v3_pair_normalizers,
+                    )
+                else:
+                    # QH2L-only retains the complete writer meta-gradient but
+                    # intentionally removes CMD's reader/action audit.
+                    cmd_loss = zero_v3
+                    cmd_metrics = {
+                        "hd_v3_cmd": 0.0,
+                        "hd_v3_cmd_pairs": 0.0,
+                        "hd_v3_cmd_pairs_skipped": 0.0,
+                        "hd_v3_cmd_disabled": 1.0,
+                    }
                 bind_loss = (
                     local_ttt_loss.sum()
                     / torch.as_tensor(
@@ -3492,8 +3521,8 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     else student_velocity.sum() * 0.0
                 )
                 hd_aux_loss = (
-                    float(getattr(self.config, "hd_v3_local_weight", 1.0)) * qh2l_loss
-                    + float(getattr(self.config, "hd_v3_cmd_weight", 1.0)) * cmd_loss
+                    v3_local_weight * qh2l_loss
+                    + v3_cmd_weight * cmd_loss
                     + 0.01 * bind_loss
                 )
                 hd_metrics = dict(v3_metrics)

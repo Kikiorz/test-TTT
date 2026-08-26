@@ -239,6 +239,11 @@ class SmolVLATTTConfig(PreTrainedConfig):
     # distinction between the writer (QH2L) and reader (CMD) explicit without
     # introducing a collection of task-specific knobs.
     hd_v3_cmd_weight: float = 1.0
+    # Explicit objective-family selector for preregistered V3 ablations.
+    # ``full`` is the canonical method; the two ablation names make a zero
+    # loss weight auditable in a checkpoint instead of looking like an
+    # accidental hyper-parameter setting.
+    hd_v3_ablation: str = "full"
     hd_v3_cmd_margin: float = 0.05
     hd_v3_null_weight: float = 0.25
     hd_v3_null_threshold: float = 0.05
@@ -400,8 +405,34 @@ class SmolVLATTTConfig(PreTrainedConfig):
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be non-negative")
-        if self.hd_attribution_protocol == "credit_ttt_v3_query_effect" and self.hd_v3_local_weight <= 0:
-            raise ValueError("CreditTTT requires hd_v3_local_weight>0")
+        if not isinstance(self.hd_v3_ablation, str):
+            raise ValueError("hd_v3_ablation must be 'full', 'qh2l_only', or 'cmd_only'")
+        ablation_aliases = {
+            "canonical": "full",
+            "qh2l": "qh2l_only",
+            "cmd": "cmd_only",
+        }
+        self.hd_v3_ablation = ablation_aliases.get(
+            self.hd_v3_ablation.strip().lower(), self.hd_v3_ablation.strip().lower()
+        )
+        if self.hd_v3_ablation not in {"full", "qh2l_only", "cmd_only"}:
+            raise ValueError("hd_v3_ablation must be 'full', 'qh2l_only', or 'cmd_only'")
+        if self.hd_attribution_protocol == "credit_ttt_v3_query_effect":
+            expected_weights = {
+                "full": (True, True),
+                "qh2l_only": (True, False),
+                "cmd_only": (False, True),
+            }[self.hd_v3_ablation]
+            if (self.hd_v3_local_weight > 0) != expected_weights[0]:
+                raise ValueError(
+                    f"CreditTTT {self.hd_v3_ablation} requires "
+                    f"hd_v3_local_weight {'>0' if expected_weights[0] else '=0'}"
+                )
+            if (self.hd_v3_cmd_weight > 0) != expected_weights[1]:
+                raise ValueError(
+                    f"CreditTTT {self.hd_v3_ablation} requires "
+                    f"hd_v3_cmd_weight {'>0' if expected_weights[1] else '=0'}"
+                )
         if self.hd_v3_null_threshold > 1:
             raise ValueError("hd_v3_null_threshold must be at most 1")
         # Artifacts use ``event_write_deletion`` as the protocol-level schema
