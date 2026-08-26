@@ -47,6 +47,19 @@ except ImportError:  # pragma: no cover - exercised only with ``-m`` invocation.
     from .evaluate_smolvla_ttt import SmolVLAMikasaPolicy
 
 
+def _set_torch_seed(seed: int | None) -> None:
+    """Optionally fix flow-noise sampling for paired baseline comparisons."""
+
+    if seed is None:
+        return
+    seed = int(seed)
+    if seed < 0:
+        raise ValueError(f"torch seed must be non-negative, got {seed}")
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 class SmolVLABaselineMikasaPolicy(SmolVLAMikasaPolicy):
     """MIKASA bridge for the standard SmolVLA action-chunk API.
 
@@ -248,6 +261,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             for episode_index in range(args.num_episodes):
                 # The runner owns its action queue; reset only clears any
                 # policy-local observation/action cache at episode boundaries.
+                episode_torch_seed = (
+                    None
+                    if args.torch_seed is None
+                    else int(args.torch_seed) + episode_index
+                )
+                _set_torch_seed(episode_torch_seed)
                 policy.reset()
                 episode, _ = benchmarking.run_episode(
                     env,
@@ -269,6 +288,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 "data_source": task.data_source,
                 "start_seed": args.start_seed,
                 "n_episodes": args.num_episodes,
+                "torch_seed": (None if args.torch_seed is None else int(args.torch_seed)),
+                "episode_torch_seeds": (
+                    None
+                    if args.torch_seed is None
+                    else [int(args.torch_seed) + i for i in range(args.num_episodes)]
+                ),
                 "successes": successes,
                 "returns": returns,
                 "sr": float(np.mean(successes)),
@@ -344,6 +369,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", dest="tasks", action="append", required=True)
     parser.add_argument("--num-episodes", type=int, default=50)
     parser.add_argument("--start-seed", type=int, default=4242424242)
+    parser.add_argument(
+        "--torch-seed",
+        type=int,
+        default=None,
+        help=(
+            "Optional base seed for per-episode SmolVLA flow-noise sampling; "
+            "episode i uses torch-seed+i. Default keeps native stochastic inference."
+        ),
+    )
     parser.add_argument("--sim-backend", choices=("cpu", "gpu"), default="gpu")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", type=Path, default=None)
