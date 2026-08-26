@@ -1983,6 +1983,20 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     smolvla_equal_length_batching = bool(
         is_smolvla_ttt and getattr(cfg.policy, "equal_length_batching", False)
     )
+    if smolvla_equal_length_batching:
+        # Accelerate's split-batch mode slices one trajectory group across
+        # ranks.  That would make the collator's ``[B,T]`` state layout and
+        # per-trajectory fast weights disagree with the sampler contract.
+        # Fail closed instead of silently changing the effective batch.
+        split_batches = getattr(accelerator, "split_batches", None)
+        if split_batches is None:
+            split_batches = getattr(
+                getattr(accelerator, "dataloader_config", None), "split_batches", False
+            )
+        if bool(split_batches):
+            raise ValueError(
+                "SmolVLA-TTT equal_length_batching requires Accelerate split_batches=false"
+            )
     if (is_pi05_ttt or is_smolvla_ttt) and cfg.batch_size != 1 and not smolvla_equal_length_batching:
         raise ValueError("Tail-preserving TTT sequences require per-device batch_size=1")
 
