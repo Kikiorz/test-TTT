@@ -60,6 +60,10 @@ Useful overrides:
   FEATURE_EPISODE_END=250, OUTPUT_ROOT=..., SEED=1000,
   EPOCHS=100 (canonical student minimum; one sequence epoch = one pass over
   the selected episode windows),
+  BATCH_SIZE=1 (per-device; set to 2 or 4 with EQUAL_LENGTH_BATCHING=1 for
+  exact-length trajectory buckets),
+  NUM_PROCESSES=4 (use all four GPUs on the reference server),
+  EQUAL_LENGTH_BATCHING=0 (opt-in; never pads time or mixes offset domains),
   NATIVE_CHECKPOINT=..., CLEAN_CHECKPOINT=...
 
 The V3 loss weights are exposed for explicitly named ablations/smoke tests
@@ -215,6 +219,8 @@ esac
 EPOCHS="${EPOCHS:-100}"
 MIN_SEQUENCE_EPOCHS="${MIN_SEQUENCE_EPOCHS:-100}"
 ALLOW_SHORT_RUN="${ALLOW_SHORT_RUN:-0}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+EQUAL_LENGTH_BATCHING="${EQUAL_LENGTH_BATCHING:-0}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 TEACHER_HIDDEN_DIM="${TEACHER_HIDDEN_DIM:-256}"
 TEACHER_LR="${TEACHER_LR:-0.001}"
@@ -265,6 +271,22 @@ require_runtime_inputs() {
     printf 'Missing runtime input(s): %s\n' "${missing[*]}" >&2
     return 2
   fi
+  if ! [[ "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BATCH_SIZE must be a positive integer; got '${BATCH_SIZE}'" >&2
+    return 2
+  fi
+  if [[ "${EQUAL_LENGTH_BATCHING}" != "0" && "${EQUAL_LENGTH_BATCHING}" != "1" ]]; then
+    echo "EQUAL_LENGTH_BATCHING must be 0 or 1; got '${EQUAL_LENGTH_BATCHING}'" >&2
+    return 2
+  fi
+  if ! [[ "${NUM_PROCESSES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_PROCESSES must be a positive integer; got '${NUM_PROCESSES}'" >&2
+    return 2
+  fi
+  if (( BATCH_SIZE > 1 && EQUAL_LENGTH_BATCHING != 1 )); then
+    echo "BATCH_SIZE>1 requires EQUAL_LENGTH_BATCHING=1 for SmolVLA-TTT" >&2
+    return 2
+  fi
   command -v "${PYTHON_BIN}" >/dev/null 2>&1 || { echo "PYTHON_BIN not found: ${PYTHON_BIN}" >&2; return 2; }
   if [[ "${STAGE}" != "labels" ]]; then
     command -v "${ACCELERATE_BIN}" >/dev/null 2>&1 || { echo "ACCELERATE_BIN not found: ${ACCELERATE_BIN}" >&2; return 2; }
@@ -276,12 +298,12 @@ resolve_full_history_window() {
   # consumed by TailPreservingSequenceDataset.  This function intentionally
   # prints only JSON so shell parsing cannot confuse a warning with a count.
   local stats
-  stats="$(${PYTHON_BIN} - "${DATASET_REPO_ID}" "${DATASET_ROOT}" "${TRAIN_EPISODES_JSON}" "${SEQUENCE_LENGTH}" "${SEQUENCE_STRIDE}" "${MAX_WINDOWS_PER_EPISODE}" "${HISTORY_WARMUP_LENGTH}" <<'PY'
+  stats="$(${PYTHON_BIN} - "${DATASET_REPO_ID}" "${DATASET_ROOT}" "${TRAIN_EPISODES_JSON}" "${SEQUENCE_LENGTH}" "${SEQUENCE_STRIDE}" "${MAX_WINDOWS_PER_EPISODE}" "${HISTORY_WARMUP_LENGTH}" "${BATCH_SIZE}" "${EQUAL_LENGTH_BATCHING}" "${NUM_PROCESSES}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-repo_id, root, selected_raw, length_raw, stride_raw, cap_raw, warmup_raw = sys.argv[1:]
+repo_id, root, selected_raw, length_raw, stride_raw, cap_raw, warmup_raw, batch_raw, equal_raw, replicas_raw = sys.argv[1:]
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 
 selected = json.loads(selected_raw)
@@ -328,6 +350,28 @@ if int(cap_raw) != 1:
     raise SystemExit("full-history contract requires max_windows_per_episode=1")
 if warmup_raw not in {"null", "None", "none", ""}:
     raise SystemExit("full-history contract requires ttt_history_warmup_length=null")
+batch_size = int(batch_raw)
+equal_length = equal_raw == "1"
+num_replicas = int(replicas_raw)
+if batch_size <= 0 or num_replicas <= 0:
+    raise SystemExit("BATCH_SIZE and NUM_PROCESSES must be positive")
+if batch_size > 1 and not equal_length:
+    raise SystemExit("BATCH_SIZE>1 requires EQUAL_LENGTH_BATCHING=1")
+# Full-history windows have offset zero.  In equal-length mode the runtime
+# sampler groups exact physical lengths (and repeats only an index from the
+# same bucket to complete a final group), then pads the *number of groups* for
+# DDP synchronization.  This mirrors EqualLengthBatchSampler.__len__.
+from collections import Counter
+if equal_length:
+    bucket_counts = Counter(chosen)
+    total_groups = sum(
+        (count + batch_size - 1) // batch_size for count in bucket_counts.values()
+    )
+else:
+    total_groups = len(chosen)
+if total_groups:
+    total_groups += (-total_groups) % num_replicas
+batches_per_rank = total_groups // num_replicas
 print(json.dumps({
     "windows": len(selected),
     "min_episode_length": min(chosen),
@@ -335,6 +379,10 @@ print(json.dumps({
     "sequence_length": sequence_length,
     "sequence_stride": sequence_stride,
     "fps": int(getattr(meta, "fps", 0) or 0),
+    "total_batches": total_groups,
+    "batches_per_rank": batches_per_rank,
+    "batch_size": batch_size,
+    "equal_length_batching": equal_length,
 }))
 PY
   )"
@@ -344,11 +392,13 @@ PY
   SEQUENCE_LENGTH="$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["sequence_length"])' "${stats}")"
   SEQUENCE_STRIDE="$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["sequence_stride"])' "${stats}")"
   DATASET_FPS="$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["fps"])' "${stats}")"
+  TOTAL_BATCHES="$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["total_batches"])' "${stats}")"
+  BATCHES_PER_RANK="$("${PYTHON_BIN}" -c 'import json,sys; print(json.loads(sys.argv[1])["batches_per_rank"])' "${stats}")"
   if [[ "${DATASET_FPS}" == "0" ]]; then
     echo "Dataset metadata did not expose a positive fps" >&2
     return 2
   fi
-  STEPS_PER_EPOCH=$(( (WINDOWS + NUM_PROCESSES - 1) / NUM_PROCESSES ))
+  STEPS_PER_EPOCH="${BATCHES_PER_RANK}"
   STEPS="${STEPS:-$((STEPS_PER_EPOCH * EPOCHS))}"
 }
 
@@ -408,6 +458,8 @@ student_command() {
   local -n out=$1
   local max_windows_arg="${MAX_WINDOWS_PER_EPISODE}"
   local warmup_arg="null"
+  local equal_length_arg="false"
+  [[ "${EQUAL_LENGTH_BATCHING}" == "1" ]] && equal_length_arg="true"
   out=(
     "${ACCELERATE_BIN}" launch
     --num_machines=1
@@ -429,6 +481,7 @@ student_command() {
     --policy.sequence_stride="${SEQUENCE_STRIDE}"
     --policy.max_windows_per_episode="${max_windows_arg}"
     --policy.ttt_history_warmup_length="${warmup_arg}"
+    --policy.equal_length_batching="${equal_length_arg}"
     --policy.tbptt_segment_length="${TBPTT_SEGMENT_LENGTH}"
     --policy.ttt_hidden_dim="${TTT_HIDDEN_DIM}"
     --policy.ttt_second_order=true
@@ -452,7 +505,7 @@ student_command() {
     --policy.hd_v3_include_previous_action=true
     --policy.hd_v3_intervention="${INTERVENTION}"
     --policy.hd_v3_effect_layer=last_selected
-    --batch_size=1
+    --batch_size="${BATCH_SIZE}"
     --num_workers="${NUM_WORKERS}"
     --prefetch_factor="${PREFETCH_FACTOR}"
     --persistent_workers=true
@@ -544,6 +597,7 @@ print_protocol() {
   echo "task=${TASK_ID} dataset=${DATASET_REPO_ID} root=${DATASET_ROOT}"
   echo "episodes: features=${FEATURE_EPISODE_START}..$((FEATURE_EPISODE_END - 1)), train=${TRAIN_EPISODES_JSON}, validation_start=${VALIDATION_EPISODE_START}"
   echo "full-history window: sequence_length=${SEQUENCE_LENGTH} sequence_stride=${SEQUENCE_STRIDE} max_windows_per_episode=${MAX_WINDOWS_PER_EPISODE} history_warmup_length=${HISTORY_WARMUP_LENGTH}"
+  echo "trajectory batch: per_device=${BATCH_SIZE} equal_length=${EQUAL_LENGTH_BATCHING} processes=${NUM_PROCESSES} (no temporal padding)"
   echo "offset contract: episode-local origin; full window offset=0; TBPTT segment offset=window_offset+segment_start; reset at episode boundary"
   echo "stages: full-history teacher -> pair labels -> QH2L student; baseline commands are evaluation-only"
   echo "outputs: features=${FEATURES_PATH} teacher=${TEACHER_CHECKPOINT} labels=${LABEL_PATH} student=${STUDENT_OUTPUT_DIR}"
@@ -601,7 +655,8 @@ if [[ "${STAGE}" == "student" || "${STAGE}" == "all" ]]; then
     if (( STEPS < minimum_steps )); then
       echo "Refusing a canonical student run with STEPS=${STEPS}; minimum is "\
            "${minimum_steps} (${MIN_SEQUENCE_EPOCHS} sequence epochs x "\
-           "${STEPS_PER_EPOCH} windows/epoch). Set ALLOW_SHORT_RUN=1 only "\
+           "${STEPS_PER_EPOCH} optimizer steps/sequence epoch). Set "\
+           "ALLOW_SHORT_RUN=1 only "\
            "for a named smoke/pilot experiment." >&2
       exit 2
     fi
@@ -617,7 +672,7 @@ else
   STEPS="unknown"
 fi
 mkdir -p "${OUTPUT_ROOT}"
-echo "Resolved full-history windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, sequence=${SEQUENCE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, total_steps=${STEPS}"
+echo "Resolved full-history windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, sequence=${SEQUENCE_LENGTH}, batch/device=${BATCH_SIZE}, processes=${NUM_PROCESSES}, steps/epoch=${STEPS_PER_EPOCH}, total_steps=${STEPS}"
 
 run_cmd() {
   local label=$1

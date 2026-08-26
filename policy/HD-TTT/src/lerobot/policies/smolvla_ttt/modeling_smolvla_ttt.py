@@ -1731,6 +1731,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         utility = pair_labels["utility"].index_select(0, indices)
         positive = pair_labels["positive"].index_select(0, indices)
         null = pair_labels["null"].index_select(0, indices)
+        # ``indices`` already filters to rows that participate in one of the
+        # two supervised strata.  Keep the corresponding mask explicitly for
+        # diagnostics below; relying on an implicit/outer ``active`` variable
+        # would raise a NameError exactly when the first valid V3 pair is
+        # encountered (the empty-pair path never reaches that metric block).
+        active = positive | null
         active_dim = self._hd_active_action_dim(student_effect, teacher_effect)
         student_effect = student_effect[..., :active_dim]
         teacher_effect = teacher_effect[..., :active_dim]

@@ -7,7 +7,9 @@ from torch.utils.data import Dataset
 from lerobot.policies.smolvla_ttt.hd_dataset import HindsightLabelDataset
 from lerobot.policies.smolvla_ttt.sequence import (
     SEQUENCE_OFFSET_KEY,
+    EqualLengthBatchSampler,
     TailPreservingSequenceDataset,
+    batched_sequence_collate_fn,
     sequence_collate_fn,
 )
 from lerobot.processor.converters import batch_to_transition, transition_to_batch
@@ -200,6 +202,53 @@ def test_sequence_collate_rejects_mixed_offsets() -> None:
     samples[0][SEQUENCE_OFFSET_KEY] = torch.tensor(1, dtype=torch.int64)
     with pytest.raises(ValueError, match="share .*sequence_offset"):
         sequence_collate_fn([samples])
+
+
+def test_batched_sequence_collate_requires_equal_t_and_preserves_shape() -> None:
+    sequences = TailPreservingSequenceDataset(_EpisodeDataset([4, 4]), sequence_length=4, sequence_stride=4)
+    batch = batched_sequence_collate_fn([sequences[0], sequences[1]], require_zero_offsets=True)
+    assert batch["_lerobot_sequence_shape"].tolist() == [2, 4]
+    assert batch[SEQUENCE_OFFSET_KEY].item() == 0
+
+    short = TailPreservingSequenceDataset(_EpisodeDataset([3]), sequence_length=4, sequence_stride=4)
+    with pytest.raises(ValueError, match="same T"):
+        batched_sequence_collate_fn([sequences[0], short[0]])
+
+    nonzero = [dict(row, **{SEQUENCE_OFFSET_KEY: torch.tensor(2)}) for row in sequences[0]]
+    nonzero_other = [dict(row, **{SEQUENCE_OFFSET_KEY: torch.tensor(2)}) for row in sequences[1]]
+    with pytest.raises(ValueError, match="require .*offset.*=0"):
+        batched_sequence_collate_fn([nonzero, nonzero_other], require_zero_offsets=True)
+
+
+def test_equal_length_batch_sampler_is_ddp_divisible_without_padding() -> None:
+    sequences = TailPreservingSequenceDataset(_EpisodeDataset([4, 4, 3, 3, 2]), sequence_length=4, sequence_stride=4)
+    sampler = EqualLengthBatchSampler(
+        sequences, batch_size=2, shuffle=False, num_replicas=2, seed=17
+    )
+    groups = list(sampler)
+    assert len(groups) == len(sampler)
+    assert len(groups) % 2 == 0
+    assert all(len({sequences.sequence_lengths[index] for index in group}) == 1 for group in groups)
+    assert set(index for group in groups for index in group) >= set(range(len(sequences)))
+
+
+def test_equal_length_batch_sampler_never_mixes_sequence_offsets() -> None:
+    # Both windows have T=4 but live at episode-local origins 0 and 4.  They
+    # must form separate repeated groups because the flattened batch carries
+    # one scalar label-coordinate offset.
+    sequences = TailPreservingSequenceDataset(
+        _EpisodeDataset([8]), sequence_length=4, sequence_stride=4
+    )
+    sampler = EqualLengthBatchSampler(
+        sequences, batch_size=2, shuffle=False, num_replicas=1, seed=19
+    )
+    groups = list(sampler)
+    assert len(groups) == 2
+    assert all(
+        len({sequences.window_sequence_offsets[index] for index in group}) == 1
+        for group in groups
+    )
+    assert set(index for group in groups for index in group) == {0, 1}
 
 
 def test_window_keyed_labels_preserve_the_exact_replay_context(tmp_path) -> None:

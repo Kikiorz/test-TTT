@@ -330,15 +330,26 @@ the teacher/student contract.
 
 SmolVLA-TTT sequence windows are intentionally ragged (episode tails have
 different lengths) and each window owns an independent recurrent fast-weight
-state.  Consequently the sequence collator requires `batch_size=1` **per
-device**; padding unrelated episodes into one tensor would mix their states and
+state.  The default collator therefore uses `batch_size=1` **per device**;
+padding unrelated episodes in time would create spurious recurrent updates and
 change the causal objective.  Data parallelism remains valid: with `N` ranks,
-the effective global sequence batch is `N` (one complete trajectory per rank),
-and each rank's state is reset at the episode boundary.  The four-card launcher
-can therefore run two independent tasks on two cards each, or one task on all
-four cards; native (non-TTT) SmolVLA has no such restriction and may use an
-ordinary batch of 4--8 per card.  This is a sequence-semantic constraint, not
-a tuned optimization setting.
+the default effective global sequence batch is `N`, and each rank's state is
+reset at the episode boundary.
+
+An opt-in throughput path supports `BATCH_SIZE>1` only with
+`EQUAL_LENGTH_BATCHING=1`.  It buckets complete trajectories by the exact pair
+`(physical length, episode-local offset)`, retains a separate fast-weight state
+for every batch element, and never inserts a temporal padding step or joins two
+episodes.  A short bucket is completed by repeating a trajectory from the same
+bucket, and complete groups are repeated only as needed to keep DDP ranks in
+lockstep; no official demonstration is dropped.  The launcher computes
+steps-per-sequence-epoch from this exact bucket arithmetic.  This mode is a
+method-neutral batching optimization, but the batch setting and any repeated
+sample count must still be recorded in the training manifest.
+
+The four-card launcher can run two independent tasks on two cards each, or one
+task on all four cards.  Native (non-TTT) SmolVLA has no recurrent-state
+restriction and may use an ordinary batch of 4--8 per card.
 
 The V3 full-flow reference replay uses activation offloading to host RAM by
 default so the second-order graph fits on 32-GB cards.  On a separately

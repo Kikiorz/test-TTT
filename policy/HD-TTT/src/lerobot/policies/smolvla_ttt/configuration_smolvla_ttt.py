@@ -127,6 +127,10 @@ class SmolVLATTTConfig(PreTrainedConfig):
     # Episode-local sequence training and truncated backpropagation through time.
     sequence_length: int = 256
     sequence_stride: int = 256
+    # Opt-in batching of trajectories that have exactly the same physical T.
+    # No temporal padding is introduced; canonical CreditTTT V3 additionally
+    # requires episode-local sequence offsets to remain zero.
+    equal_length_batching: bool = False
     tbptt_segment_length: int = 4
     # Number of preceding episode frames replayed before each sampled target
     # window.  Warm-up frames advance fast weights and are masked from action,
@@ -306,6 +310,8 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("sequence_stride must be positive")
         if self.sequence_stride > self.sequence_length:
             raise ValueError("sequence_stride cannot exceed sequence_length because that would drop frames")
+        if type(self.equal_length_batching) is not bool:
+            raise ValueError("equal_length_batching must be a boolean")
         if self.tbptt_segment_length <= 0:
             raise ValueError("tbptt_segment_length must be positive")
         if self.tbptt_segment_length > self.sequence_length:

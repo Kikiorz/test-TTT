@@ -19,6 +19,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -69,7 +70,9 @@ from lerobot.policies.smolvla_ttt.configuration_smolvla_ttt import SmolVLATTTCon
 from lerobot.policies.smolvla_ttt.hd_dataset import HindsightLabelDataset
 from lerobot.policies.smolvla_ttt.sequence import (
     SEQUENCE_OFFSET_KEY,
+    EqualLengthBatchSampler,
     TailPreservingSequenceDataset as SmolVLATTTSequenceDataset,
+    batched_sequence_collate_fn,
     sequence_collate_fn as smolvla_ttt_sequence_collate_fn,
 )
 from lerobot.rewards import make_reward_pre_post_processors
@@ -1977,7 +1980,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             raise ValueError("TTT sequence training does not support PEFT yet")
         if cfg.dataset.streaming:
             raise ValueError("TTT sequence training requires a map-style dataset; streaming is not supported")
-    if (is_pi05_ttt or is_smolvla_ttt) and cfg.batch_size != 1:
+    smolvla_equal_length_batching = bool(
+        is_smolvla_ttt and getattr(cfg.policy, "equal_length_batching", False)
+    )
+    if (is_pi05_ttt or is_smolvla_ttt) and cfg.batch_size != 1 and not smolvla_equal_length_batching:
         raise ValueError("Tail-preserving TTT sequences require per-device batch_size=1")
 
     # Determine if this is the main process (for logging and checkpointing)
@@ -2175,9 +2181,33 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             max_windows_per_episode=getattr(active_cfg, "max_windows_per_episode", None),
             history_warmup_length=getattr(active_cfg, "ttt_history_warmup_length", 0),
         )
-        shuffle = True
-        sampler = None
-        collate_fn = smolvla_ttt_sequence_collate_fn
+        if smolvla_equal_length_batching:
+            # Bucket trajectory windows by exact physical T.  The sampler
+            # balances short buckets and globally DDP-divides batch count by
+            # repeating complete trajectories within the same (T, offset)
+            # bucket; no temporal padding or cross-episode concatenation
+            # occurs.
+            shuffle = False
+            sampler = None
+            batch_sampler = EqualLengthBatchSampler(
+                dataloader_dataset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_replicas=accelerator.num_processes,
+                seed=int(cfg.seed or 0),
+            )
+            collate_fn = functools.partial(
+                batched_sequence_collate_fn,
+                require_zero_offsets=(
+                    str(getattr(active_cfg, "hd_attribution_protocol", ""))
+                    == _HD_ATTRIBUTION_PROTOCOL_V3
+                ),
+            )
+        else:
+            shuffle = True
+            sampler = None
+            batch_sampler = None
+            collate_fn = smolvla_ttt_sequence_collate_fn
     elif is_pi05_ttt:
         dataloader_dataset = TailPreservingSequenceDataset(
             dataset,
@@ -2215,18 +2245,24 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # declares language columns; otherwise stay on PyTorch's default
         # collate so non-language training runs are unaffected.
         collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
-    dataloader = torch.utils.data.DataLoader(
-        dataloader_dataset,
+    dataloader_kwargs = dict(
+        dataset=dataloader_dataset,
         num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
-        sampler=sampler,
         pin_memory=device.type == "cuda",
-        drop_last=False,
         collate_fn=collate_fn,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
     )
+    if smolvla_equal_length_batching:
+        dataloader_kwargs["batch_sampler"] = batch_sampler
+    else:
+        dataloader_kwargs.update(
+            batch_size=cfg.batch_size,
+            shuffle=shuffle and not cfg.dataset.streaming,
+            sampler=sampler,
+            drop_last=False,
+        )
+    dataloader = torch.utils.data.DataLoader(**dataloader_kwargs)
 
     # TTT policies call a custom sequence-segment method on the unwrapped policy so fast state can be
     # carried across TBPTT segments. In multi-process mode, wrapping that policy in DDP would bypass

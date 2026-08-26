@@ -17,7 +17,7 @@
 from typing import Any
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import BatchSampler, Dataset
 
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import ACTION
@@ -190,6 +190,15 @@ class TailPreservingSequenceDataset(Dataset):
         if not self.window_specs:
             raise ValueError("The dataset does not contain any non-empty episode")
 
+        # Cache physical lengths so an equal-length batch sampler can bucket
+        # windows without materializing every sample (or decoding images).
+        self.sequence_lengths = [
+            (target_start + window_length) - history_start
+            for (target_start, window_length), (history_start, _) in zip(
+                self.window_specs, self.history_specs
+            )
+        ]
+
     def __len__(self) -> int:
         return len(self.window_specs)
 
@@ -296,24 +305,37 @@ class TailPreservingSequenceDataset(Dataset):
         return samples
 
 
-def sequence_collate_fn(batch: list[list[dict[str, Any]]]) -> dict[str, Any]:
-    """Flatten one variable-length sequence to ``T`` and attach its logical shape."""
+def batched_sequence_collate_fn(
+    batch: list[list[dict[str, Any]]], *, require_zero_offsets: bool = False
+) -> dict[str, Any]:
+    """Collate one or more equal-length trajectories without temporal padding.
+
+    Each trajectory is flattened independently along time and then concatenated
+    in batch order.  ``SEQUENCE_SHAPE_KEY`` records the original ``[B, T]``
+    shape so the recurrent policy can restore per-trajectory state.  Mixed
+    lengths are rejected rather than padded; callers should use
+    :class:`EqualLengthBatchSampler` to form batches.
+    """
     if not batch:
         raise ValueError("Cannot collate an empty sequence batch")
-    if len(batch) != 1:
-        raise ValueError("smolvla_ttt tail-preserving batches require per-device batch_size=1")
 
-    sequence_length = len(batch[0])
-    if sequence_length == 0:
+    sequence_lengths = [len(sequence) for sequence in batch]
+    if any(length == 0 for length in sequence_lengths):
         raise ValueError("A sequence must contain at least one timestep")
-    if any(sample is None for sample in batch[0]):
+    if len(set(sequence_lengths)) != 1:
+        raise ValueError(
+            "Equal-length trajectory batching requires every sequence to have the same T; "
+            f"got {sequence_lengths}"
+        )
+    sequence_length = sequence_lengths[0]
+    if any(sample is None for sequence in batch for sample in sequence):
         raise ValueError("Sequence samples cannot be None because dropping a timestep corrupts TTT state")
 
     # All rows in one sampled window share one episode-local origin.  Keep a
     # backward-compatible fallback for direct callers that construct legacy
     # sequences without metadata, but reject partial/mixed metadata rather
     # than silently training against misaligned pair labels.
-    raw_offsets = [sample.get(SEQUENCE_OFFSET_KEY) for sample in batch[0]]
+    raw_offsets = [sample.get(SEQUENCE_OFFSET_KEY) for sequence in batch for sample in sequence]
     present = [value is not None for value in raw_offsets]
     if any(present) and not all(present):
         raise ValueError(
@@ -350,15 +372,144 @@ def sequence_collate_fn(batch: list[list[dict[str, Any]]]) -> dict[str, Any]:
                 f"All timesteps in a sequence must share {SEQUENCE_OFFSET_KEY!r}; "
                 f"got {offsets}"
             )
+        # A batched canonical CreditTTT V3 window is episode-local and starts
+        # at frame zero.  Rejecting non-zero origins here prevents silently
+        # applying one episode's pair labels at another episode's coordinate.
         sequence_offset = offsets[0]
+        if require_zero_offsets and sequence_offset != 0:
+            raise ValueError(
+                f"Canonical V3 equal-length batches require {SEQUENCE_OFFSET_KEY!r}=0, "
+                f"got {sequence_offset}"
+            )
     else:
         sequence_offset = 0
 
-    collated = lerobot_collate_fn(batch[0])
+    flattened_batch = [sample for sequence in batch for sample in sequence]
+    collated = lerobot_collate_fn(flattened_batch)
     if collated is None:
         raise ValueError("Sequence collation unexpectedly produced an empty batch")
-    collated[SEQUENCE_SHAPE_KEY] = torch.tensor([1, sequence_length], dtype=torch.int64)
+    collated[SEQUENCE_SHAPE_KEY] = torch.tensor(
+        [len(batch), sequence_length], dtype=torch.int64
+    )
     # Override default_collate's [T] representation with one scalar.  This
     # keeps the metadata invariant under TBPTT slicing and processor batching.
     collated[SEQUENCE_OFFSET_KEY] = torch.tensor(sequence_offset, dtype=torch.int64)
     return collated
+
+
+def sequence_collate_fn(batch: list[list[dict[str, Any]]]) -> dict[str, Any]:
+    """Legacy single-trajectory collate function.
+
+    Keep the historical API strict (``B=1``) while exposing
+    :func:`batched_sequence_collate_fn` for opt-in equal-length batching.
+    """
+    if len(batch) != 1:
+        raise ValueError("smolvla_ttt tail-preserving batches require per-device batch_size=1")
+    return batched_sequence_collate_fn(batch)
+
+
+class EqualLengthBatchSampler(BatchSampler):
+    """Group trajectory indices by exact physical length, with no padding.
+
+    Every sequence in a group has identical ``T``.  A short final group is
+    completed by repeating indices from that same length bucket (never by
+    temporal padding).  In distributed training, complete groups are repeated
+    as needed so the total batch count is divisible by the process count; this
+    keeps all ranks synchronized while preserving recurrent semantics.
+    """
+
+    def __init__(
+        self,
+        dataset: TailPreservingSequenceDataset,
+        batch_size: int,
+        *,
+        shuffle: bool = True,
+        num_replicas: int = 1,
+        drop_last: bool = False,
+        seed: int = 0,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if not hasattr(dataset, "sequence_lengths"):
+            raise TypeError("EqualLengthBatchSampler requires TailPreservingSequenceDataset")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.num_replicas = int(num_replicas)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self._epoch = 0
+
+    def _batches(self) -> list[list[int]]:
+        # The collator stores one episode-local offset for the complete
+        # flattened batch.  Bucket by ``(T, offset)`` rather than T alone so
+        # bounded windows from different episode origins can never be mixed
+        # into a batch whose pair-label coordinate system is ambiguous.
+        buckets: dict[tuple[int, int], list[int]] = {}
+        offsets = getattr(self.dataset, "window_sequence_offsets", None)
+        if offsets is None or len(offsets) != len(self.dataset.sequence_lengths):
+            raise ValueError(
+                "EqualLengthBatchSampler requires one sequence offset per trajectory window"
+            )
+        for index, (length, offset) in enumerate(
+            zip(self.dataset.sequence_lengths, offsets, strict=True)
+        ):
+            buckets.setdefault((int(length), int(offset)), []).append(index)
+        groups: list[list[int]] = []
+        generator = torch.Generator()
+        # An explicit seed makes every rank construct the same global batch
+        # order even when DataLoader workers or Accelerate initialize the
+        # process-local torch RNGs differently.
+        generator.manual_seed((self.seed + self._epoch) % (2**63 - 1))
+        self._epoch += 1
+        bucket_items = list(buckets.items())
+        if self.shuffle:
+            order = torch.randperm(len(bucket_items), generator=generator).tolist()
+            bucket_items = [bucket_items[i] for i in order]
+        for _, indices in bucket_items:
+            if self.shuffle and len(indices) > 1:
+                permutation = torch.randperm(len(indices), generator=generator).tolist()
+                indices = [indices[i] for i in permutation]
+            for start in range(0, len(indices), self.batch_size):
+                group = indices[start : start + self.batch_size]
+                if len(group) < self.batch_size:
+                    if self.drop_last:
+                        continue
+                    # Repeat only from this exact-length bucket.  This is
+                    # index-level balancing, not temporal sequence padding.
+                    group.extend(indices[i % len(indices)] for i in range(self.batch_size - len(group)))
+                groups.append(group)
+        if self.shuffle and len(groups) > 1:
+            permutation = torch.randperm(len(groups), generator=generator).tolist()
+            groups = [groups[i] for i in permutation]
+        if self.num_replicas > 1:
+            if not groups:
+                raise ValueError("No trajectory batches available for distributed training")
+            remainder = len(groups) % self.num_replicas
+            if remainder:
+                groups.extend(groups[i % len(groups)] for i in range(self.num_replicas - remainder))
+        return groups
+
+    def __iter__(self):
+        yield from self._batches()
+
+    def __len__(self) -> int:
+        # Compute using deterministic bucket arithmetic (without shuffling).
+        bucket_counts: dict[tuple[int, int], int] = {}
+        offsets = getattr(self.dataset, "window_sequence_offsets", None)
+        if offsets is None or len(offsets) != len(self.dataset.sequence_lengths):
+            raise ValueError(
+                "EqualLengthBatchSampler requires one sequence offset per trajectory window"
+            )
+        for length, offset in zip(self.dataset.sequence_lengths, offsets, strict=True):
+            key = (int(length), int(offset))
+            bucket_counts[key] = bucket_counts.get(key, 0) + 1
+        count = sum(
+            n // self.batch_size if self.drop_last else (n + self.batch_size - 1) // self.batch_size
+            for n in bucket_counts.values()
+        )
+        if self.num_replicas > 1 and count:
+            count += (-count) % self.num_replicas
+        return count

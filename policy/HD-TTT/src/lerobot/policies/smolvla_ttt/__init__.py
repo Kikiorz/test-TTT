@@ -97,7 +97,9 @@ from .sequence import (
     HD_WRITER_VALID_KEY,
     SEQUENCE_OFFSET_KEY,
     SEQUENCE_SHAPE_KEY,
+    EqualLengthBatchSampler,
     TailPreservingSequenceDataset,
+    batched_sequence_collate_fn,
     sequence_collate_fn,
 )
 from .ttt import TTTBoundedTrace, TTTFastState, TTTMLPLayer, TTTStateTransition
@@ -185,6 +187,8 @@ __all__ = [
     "validate_full_history_teacher_provenance",
     "validate_history_teacher_provenance",
     "TailPreservingSequenceDataset",
+    "EqualLengthBatchSampler",
     "make_smolvla_ttt_pre_post_processors",
+    "batched_sequence_collate_fn",
     "sequence_collate_fn",
 ]
