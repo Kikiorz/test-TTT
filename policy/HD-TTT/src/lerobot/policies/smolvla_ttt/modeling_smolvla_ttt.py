@@ -34,6 +34,7 @@ from typing import TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from torch.autograd.graph import save_on_cpu
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
@@ -4907,16 +4908,24 @@ class SmolVLATTTFlowMatching(nn.Module):
             # discarding the ten-step transformer activations between forward
             # and backward.  The token itself is not used in the calculation.
             del _checkpoint_token
-            return self.sample_actions(
-                paired_images,
-                paired_masks,
-                paired_lang_tokens,
-                paired_lang_masks,
-                paired_state_input,
-                noise=paired_noise,
-                previous_action=paired_previous,
-                _expert_layer_callback_factory=callback_factory,
-            )
+            # Keep the hook inside the closure so it is active during both
+            # the original checkpointed forward and backward-time
+            # recomputation.  Saved replay activations are moved to host RAM;
+            # no tensor is detached and the final-action gradient contract is
+            # unchanged.  This is needed because a paired ten-step VLM replay
+            # can otherwise exceed the 32-GB device alongside the main
+            # second-order sequence graph.
+            with save_on_cpu(pin_memory=False):
+                return self.sample_actions(
+                    paired_images,
+                    paired_masks,
+                    paired_lang_tokens,
+                    paired_lang_masks,
+                    paired_state_input,
+                    noise=paired_noise,
+                    previous_action=paired_previous,
+                    _expert_layer_callback_factory=callback_factory,
+                )
 
         # Full-flow replay is only introduced by the V3 auxiliary objectives.
         # In training it can otherwise retain a second ten-step VLM graph for
