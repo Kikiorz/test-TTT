@@ -205,9 +205,21 @@ def _extract_episode_features(
         )
         events = summarize_prefix(prefix, prefix_mask)
         actions = policy.prepare_action(prepared)
-    if actions.ndim < 3:
-        raise ValueError(f"Expected action chunks [T,S,D], got {tuple(actions.shape)}")
-    executed = actions[:, 0, : int(policy.config.action_feature.shape[0])].detach()
+    # The feature extractor requests ``delta_timestamps={"action": [0.0]}``.
+    # LeRobot returns a single timestamp as ``[T,D]`` in that case, whereas a
+    # native chunk request returns ``[T,S,D]``.  Both represent the executed
+    # slot-0 action here; rejecting the rank-2 form made the real MIKASA
+    # teacher stage fail before it could write a feature cache.
+    active_action_dim = int(policy.config.action_feature.shape[0])
+    if actions.ndim == 2:
+        executed = actions[:, :active_action_dim].detach()
+    elif actions.ndim >= 3:
+        executed = actions[:, 0, :active_action_dim].detach()
+    else:
+        raise ValueError(
+            "Expected action samples [T,D] or chunks [T,S,D], "
+            f"got {tuple(actions.shape)}"
+        )
     previous = torch.zeros_like(executed)
     if executed.shape[0] > 1:
         previous[1:] = executed[:-1]
