@@ -179,3 +179,131 @@ def test_canonical_builder_rejects_multi_frame_event_spans(tmp_path: Path) -> No
             tmp_path / "malformed.pt",
             pair_k=2,
         )
+
+
+@pytest.mark.parametrize("intervention", ("delete", "replace"))
+def test_batched_counterfactual_replay_matches_reference_loop(
+    tmp_path: Path, intervention: str
+) -> None:
+    """Chunked event replays preserve rows/values up to GEMM round-off.
+
+    The scalar loop is retained as the protocol reference (batch size zero).
+    A batched teacher call can choose a different BLAS reduction order, so the
+    contract is numerical equivalence rather than byte-for-byte equality for
+    floating-point action predictions.  Integer pair sampling and the random
+    seed are tested separately below.
+    """
+
+    builder, teacher, features, _checkpoint = _artifacts(tmp_path, replacement=True)
+    payload = torch.load(features, map_location="cpu", weights_only=True)
+    row = payload["episodes"][0]
+    events = row["event_tokens"]
+    previous = row["previous_executed_actions"]
+    length = int(events.shape[0])
+    starts = torch.arange(length, dtype=torch.int64)
+    ends = starts + 1
+    replacement = row["replacement_event_tokens"] if intervention == "replace" else None
+
+    reference = builder._counterfactual_teacher_replays(
+        teacher,
+        events,
+        previous,
+        starts,
+        ends,
+        intervention=intervention,
+        replacement=replacement,
+        device=torch.device("cpu"),
+        batch_size=0,
+    )
+    for chunk_size in (1, 2, 4, 64):
+        actual = builder._counterfactual_teacher_replays(
+            teacher,
+            events,
+            previous,
+            starts,
+            ends,
+            intervention=intervention,
+            replacement=replacement,
+            device=torch.device("cpu"),
+            batch_size=chunk_size,
+        )
+        assert actual.shape == reference.shape == (length, length, 3)
+        torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-6)
+
+
+def test_batched_builder_preserves_protocol_metadata_seed_and_pair_indices(
+    tmp_path: Path,
+) -> None:
+    """The execution chunk size is not part of the V3 artifact protocol."""
+
+    builder, _teacher, features, checkpoint = _artifacts(tmp_path)
+    scalar_path = tmp_path / "scalar.pt"
+    batched_path = tmp_path / "batched.pt"
+    common = dict(pair_k=3, seed=123, device="cpu")
+    builder.build_labels(
+        features,
+        checkpoint,
+        scalar_path,
+        counterfactual_batch_size=0,
+        **common,
+    )
+    builder.build_labels(
+        features,
+        checkpoint,
+        batched_path,
+        counterfactual_batch_size=2,
+        **common,
+    )
+    scalar = torch.load(scalar_path, map_location="cpu", weights_only=True)
+    batched = torch.load(batched_path, map_location="cpu", weights_only=True)
+
+    scalar_metadata = dict(scalar["metadata"])
+    batched_metadata = dict(batched["metadata"])
+    # The hash covers serialized floating-point bytes and can legitimately
+    # differ after a batched GEMM.  It is not an execution/provenance field.
+    scalar_metadata.pop("artifact_sha256", None)
+    batched_metadata.pop("artifact_sha256", None)
+    assert scalar_metadata == batched_metadata
+
+    exact_fields = (
+        "hd_v3_pair_event_index",
+        "hd_v3_pair_future_index",
+        "hd_v3_pair_event_start",
+        "hd_v3_pair_event_end",
+        "hd_v3_pair_delay",
+        "hd_v3_pair_delay_bin",
+        "hd_v3_pair_valid",
+        "hd_v3_pair_positive",
+        "hd_v3_pair_null",
+        "global_index",
+        "episode_index",
+        "frame_index",
+    )
+    for key in exact_fields:
+        torch.testing.assert_close(scalar[key], batched[key])
+    for key in (
+        "hd_v3_pair_utility",
+        "hd_v3_pair_confidence",
+        "hd_v3_pair_effect",
+        "hd_v3_pair_teacher_full_action",
+        "hd_v3_pair_teacher_counterfactual_action",
+        "hd_v3_pair_expert_action",
+        "teacher_full_action",
+        "expert_target_action",
+    ):
+        torch.testing.assert_close(scalar[key], batched[key], rtol=2e-5, atol=2e-6)
+
+
+def test_counterfactual_batch_size_resolution_is_explicit_and_execution_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    monkeypatch.setenv(builder.COUNTERFACTUAL_BATCH_ENV, "7")
+    assert builder._resolve_counterfactual_batch_size(None) == 7
+    assert builder._resolve_counterfactual_batch_size(2) == 2
+    assert builder._resolve_counterfactual_batch_size(0) == 0
+    monkeypatch.setenv(builder.COUNTERFACTUAL_BATCH_ENV, "not-an-int")
+    with pytest.raises(ValueError, match="integer >= 0"):
+        builder._resolve_counterfactual_batch_size(None)
+    with pytest.raises(ValueError, match="must be >= 0"):
+        builder._resolve_counterfactual_batch_size(-1)

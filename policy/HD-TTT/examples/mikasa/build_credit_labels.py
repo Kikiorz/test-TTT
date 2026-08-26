@@ -54,6 +54,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,12 @@ DEFAULT_DELAY_EDGES = CREDIT_TTT_DELAY_EDGES
 # tiny numerical effects into positive writer targets while the online path
 # treats those same pairs as null/invariance examples.
 DEFAULT_POSITIVE_THRESHOLD = 0.05
+# Counterfactual teacher replay is an execution-only optimisation.  The
+# canonical label schema and all sampling seeds remain unchanged when this
+# value is changed.  A value of zero is reserved for the original one-event
+# loop and is useful as a bitwise/reference implementation in audits.
+DEFAULT_COUNTERFACTUAL_BATCH_SIZE = 64
+COUNTERFACTUAL_BATCH_ENV = "CREDIT_TTT_TEACHER_REPLAY_BATCH_SIZE"
 
 
 def _load_torch(path: str | Path) -> Any:
@@ -323,6 +330,163 @@ def _episode_seed(seed: int, episode_number: int) -> int:
     return int.from_bytes(digest[:8], "big") % (2**63 - 1)
 
 
+def _resolve_counterfactual_batch_size(value: int | None) -> int:
+    """Resolve the execution-only teacher replay batch size.
+
+    The pair-label protocol does not depend on this value: it only changes
+    how many independent event interventions are evaluated in one teacher
+    call.  Keeping the legacy ``0`` escape hatch makes it possible to compare
+    the vectorized path against the historical one-event loop.  An environment
+    override is intentionally read only when the API/CLI argument is omitted,
+    so an explicit command-line value always wins.
+    """
+
+    if value is None:
+        raw = os.environ.get(COUNTERFACTUAL_BATCH_ENV)
+        if raw is None or not raw.strip():
+            return DEFAULT_COUNTERFACTUAL_BATCH_SIZE
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{COUNTERFACTUAL_BATCH_ENV} must be an integer >= 0, got {raw!r}"
+            ) from exc
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"counterfactual_batch_size must be an integer >= 0, got {value!r}"
+        ) from exc
+    if resolved < 0:
+        raise ValueError(
+            f"counterfactual_batch_size must be >= 0 (0 selects the legacy loop), got {resolved}"
+        )
+    return resolved
+
+
+def _counterfactual_teacher_replays(
+    teacher: FullHistoryActionTeacher,
+    events: Tensor,
+    previous: Tensor,
+    starts: Tensor,
+    ends: Tensor,
+    *,
+    intervention: str,
+    replacement: Tensor | None,
+    device: torch.device,
+    batch_size: int,
+) -> Tensor:
+    """Evaluate one event-write intervention per row, in deterministic order.
+
+    The historical implementation invoked the causal teacher once for every
+    event.  For an episode of length ``T`` that launches ``T`` separate
+    ``T``-step recurrences.  This helper groups consecutive interventions into
+    independent batch rows.  ``FullHistoryActionTeacher`` already accepts
+    ``[B,T,D]`` events and ``[B,T]`` masks, so the recurrence and intervention
+    semantics are unchanged; only the batch dimension is larger.  The output
+    row ``r`` is still the counterfactual for event ``r``.
+
+    ``batch_size=0`` deliberately executes the old loop and is retained for
+    regression tests/reference audits.  A positive size is an execution-only
+    memory/throughput bound; it does not alter pair sampling, delay bins, or
+    any artifact metadata.
+    """
+
+    if intervention not in {"delete", "replace"}:
+        raise ValueError(f"unsupported intervention {intervention!r}")
+    if batch_size < 0:
+        raise ValueError("batch_size must be non-negative")
+    if events.ndim != 2 or previous.ndim != 2:
+        raise ValueError("events and previous must have [T,D]/[T,A] shape")
+    length = int(events.shape[0])
+    if length <= 0:
+        raise ValueError("events must contain at least one timestep")
+    if previous.shape[0] != length:
+        raise ValueError("events and previous must have the same sequence length")
+    if starts.numel() != length or ends.numel() != length:
+        raise ValueError("event spans must contain one start/end per timestep")
+    if intervention == "replace" and replacement is None:
+        raise ValueError("intervention='replace' requires replacement event tokens")
+
+    # ``events``/``previous`` are already detached CPU feature rows when this
+    # helper is called.  Move once per episode, not once per event.
+    events_device = events.to(device=device)
+    previous_device = previous.to(device=device)
+    starts_device = starts.to(device=device, dtype=torch.long)
+    ends_device = ends.to(device=device, dtype=torch.long)
+    replacement_device = None if replacement is None else replacement.to(device=device)
+
+    # Keep the exact historical path available for bitwise comparison.  The
+    # old loop used rank-1 masks for a single episode; preserving that spelling
+    # avoids introducing a shape-dependent numerical change in the reference
+    # branch.
+    if batch_size == 0:
+        counterfactual: list[Tensor] = []
+        for start, end in zip(starts_device.tolist(), ends_device.tolist(), strict=True):
+            if intervention == "delete":
+                mask = torch.zeros(length, dtype=torch.float32, device=device)
+                mask[int(start) : int(end)] = 1.0
+                branch = teacher(events_device, previous_device, delete_mask=mask)
+            else:
+                assert replacement_device is not None
+                mask = torch.zeros(length, dtype=torch.bool, device=device)
+                mask[int(start) : int(end)] = True
+                branch = teacher(
+                    events_device,
+                    previous_device,
+                    replacement_event_tokens=replacement_device,
+                    replace_mask=mask,
+                )
+            counterfactual.append(branch.actions)
+        if not counterfactual:  # defensive; length is checked above
+            raise ValueError("episode contains no events")
+        return torch.stack(counterfactual, dim=0)
+
+    # ``batch_size`` bounds the temporary [C,T,D] event view and the teacher's
+    # [C,T,H] recurrent state.  ``expand`` avoids copying the common episode
+    # rows; every intervention still receives its own independent recurrent
+    # state inside the teacher call.
+    chunk_size = min(int(batch_size), length)
+    chunks: list[Tensor] = []
+    time_index = torch.arange(length, device=device, dtype=torch.long)
+    for chunk_start in range(0, length, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, length)
+        chunk_events = events_device.unsqueeze(0).expand(chunk_end - chunk_start, -1, -1)
+        chunk_previous = previous_device.unsqueeze(0).expand(chunk_end - chunk_start, -1, -1)
+        chunk_starts = starts_device[chunk_start:chunk_end]
+        chunk_ends = ends_device[chunk_start:chunk_end]
+        # A row-wise interval mask is equivalent to the old per-event slice,
+        # including custom multi-frame replacement/delete ablations.
+        interval_mask = (time_index[None, :] >= chunk_starts[:, None]) & (
+            time_index[None, :] < chunk_ends[:, None]
+        )
+        if intervention == "delete":
+            branch = teacher(
+                chunk_events,
+                chunk_previous,
+                delete_mask=interval_mask.to(dtype=torch.float32),
+            )
+        else:
+            assert replacement_device is not None
+            chunk_replacement = replacement_device.unsqueeze(0).expand(
+                chunk_end - chunk_start, -1, -1
+            )
+            branch = teacher(
+                chunk_events,
+                chunk_previous,
+                replacement_event_tokens=chunk_replacement,
+                replace_mask=interval_mask,
+            )
+        actions = branch.actions
+        if actions.ndim != 3 or actions.shape[0] != chunk_end - chunk_start:
+            raise ValueError(
+                "Batched teacher replay returned unexpected action shape "
+                f"{tuple(actions.shape)}"
+            )
+        chunks.append(actions)
+    return torch.cat(chunks, dim=0)
+
+
 def _teacher_replays(
     teacher: FullHistoryActionTeacher,
     events: Tensor,
@@ -334,41 +498,31 @@ def _teacher_replays(
     intervention: str,
     replacement: Tensor | None,
     device: torch.device,
+    counterfactual_batch_size: int = DEFAULT_COUNTERFACTUAL_BATCH_SIZE,
 ) -> tuple[Tensor, Tensor, PairwiseControlCredit]:
     """Run full and one event-write intervention per event."""
 
     events_device = events.to(device=device)
     previous_device = previous.to(device=device)
     target_device = target_actions.to(device=device)
+    resolved_batch_size = _resolve_counterfactual_batch_size(counterfactual_batch_size)
     with torch.no_grad():
         full_actions = teacher(events_device, previous_device).actions
-        counterfactual: list[Tensor] = []
-        for start, end in zip(starts.tolist(), ends.tolist(), strict=True):
-            if intervention == "delete":
-                mask = torch.zeros(events.shape[0], dtype=torch.float32, device=device)
-                mask[int(start) : int(end)] = 1.0
-                # ``delete_mask`` is a direct content intervention; unlike a
-                # gate target it is not fed into the full branch.
-                branch = teacher(events_device, previous_device, delete_mask=mask)
-            elif intervention == "replace":
-                if replacement is None:
-                    raise ValueError(
-                        "intervention='replace' requires replacement_event_tokens in every feature episode"
-                    )
-                mask = torch.zeros(events.shape[0], dtype=torch.bool, device=device)
-                mask[int(start) : int(end)] = True
-                branch = teacher(
-                    events_device,
-                    previous_device,
-                    replacement_event_tokens=replacement.to(device=device),
-                    replace_mask=mask,
-                )
-            else:  # pragma: no cover - parser and validator guard this
-                raise ValueError(f"unsupported intervention {intervention!r}")
-            counterfactual.append(branch.actions)
-        if not counterfactual:
-            raise ValueError("episode contains no events")
-        cf_actions = torch.stack(counterfactual, dim=0)
+        # Group independent event interventions into batched teacher calls.
+        # ``counterfactual_batch_size=0`` retains the exact historical loop
+        # for regression/audit runs; positive values only change execution
+        # parallelism and preserve event row order.
+        cf_actions = _counterfactual_teacher_replays(
+            teacher,
+            events,
+            previous,
+            starts,
+            ends,
+            intervention=intervention,
+            replacement=replacement,
+            device=device,
+            batch_size=resolved_batch_size,
+        )
         credit = compute_pairwise_control_credit(
             full_actions,
             cf_actions,
@@ -628,6 +782,7 @@ def build_labels(
     fps: int | None = None,
     positive_threshold: float = DEFAULT_POSITIVE_THRESHOLD,
     allow_custom_delay_edges: bool = False,
+    counterfactual_batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Build and save a deterministic CreditTTT V3 pair artifact.
 
@@ -639,6 +794,9 @@ def build_labels(
 
     if pair_k <= 0:
         raise ValueError("pair_k must be positive")
+    resolved_counterfactual_batch_size = _resolve_counterfactual_batch_size(
+        counterfactual_batch_size
+    )
     if not math.isfinite(float(positive_threshold)) or float(positive_threshold) < 0:
         raise ValueError("positive_threshold must be finite and non-negative")
     if intervention not in {"delete", "replace"}:
@@ -745,6 +903,11 @@ def build_labels(
     episode_slices: list[dict[str, int]] = []
     concatenation_offset = 0
     seen_global: set[int] = set()
+    LOGGER.info(
+        "counterfactual teacher replay batch size=%d (set %s=0 for the legacy reference loop)",
+        resolved_counterfactual_batch_size,
+        COUNTERFACTUAL_BATCH_ENV,
+    )
     for episode_number, row in enumerate(rows):
         events = row["event_tokens"]
         previous = row["previous_executed_actions"]
@@ -807,6 +970,7 @@ def build_labels(
             intervention=intervention,
             replacement=replacement,
             device=device_obj,
+            counterfactual_batch_size=resolved_counterfactual_batch_size,
         )
         pair_fields = _sample_frame_pairs(
             credit,
@@ -1118,6 +1282,16 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail unless the feature cache contains future q_j and action-tail h_j",
     )
+    parser.add_argument(
+        "--counterfactual-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Execution-only batch size for independent event deletion/replacement replays. "
+            f"Defaults to {DEFAULT_COUNTERFACTUAL_BATCH_SIZE} (or ${COUNTERFACTUAL_BATCH_ENV}); "
+            "use 0 for the legacy one-event reference loop."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -1143,6 +1317,7 @@ def main() -> None:
         dataset_repo_id=args.dataset_repo_id,
         fps=args.fps,
         allow_custom_delay_edges=args.allow_custom_delay_edges,
+        counterfactual_batch_size=args.counterfactual_batch_size,
     )
 
 
