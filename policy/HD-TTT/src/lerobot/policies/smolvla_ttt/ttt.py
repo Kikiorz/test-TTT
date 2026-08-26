@@ -416,21 +416,32 @@ class TTTMLPLayer(nn.Module):
 
         self._record_nonfinite(keys, values, *state.tensors())
 
-        def trajectory_loss(prediction: Tensor, target: Tensor) -> Tensor:
-            """Reduce writer-token errors without letting padding update state."""
+        def trajectory_loss(
+            prediction: Tensor,
+            target: Tensor,
+            *,
+            detach_target: bool = False,
+        ) -> Tensor:
+            """Reduce writer-token errors without letting padding update state.
+
+            The inner update and the externally returned H2L loss have
+            deliberately different target semantics.  The update objective
+            keeps the raw value projection so a second-order action-effect
+            loss can differentiate through the value target into the inner
+            update.  The optional returned local loss uses ``sg(v)`` so its
+            standalone writer objective cannot co-adapt by moving the target
+            projection.  Keeping the choice explicit avoids accidentally
+            cutting the meta-gradient while fixing the H2L target leakage.
+            """
 
             self._record_nonfinite(prediction, target)
 
-            # ``v`` is produced by the trainable value projection.  The local
-            # K/V objective is a deployable *writer* target, so it must use a
-            # stop-gradient copy of ``v`` (the same ``sg(v)`` convention used
-            # by ``local_kvb_loss`` below).  Without this detach, returning
-            # ``per_trajectory_loss`` for H2L would let the outer optimizer
-            # move ``v_proj``/the target representation together with the
-            # fast map, turning the intended reconstruction into a trivial
-            # co-adaptation path and making the implementation differ from
-            # the documented objective.
-            per_token = F.mse_loss(prediction, target.detach(), reduction="none").mean(dim=-1)
+            # ``v`` is produced by the trainable value projection.  Only the
+            # caller that exposes a local H2L loss asks for the documented
+            # stop-gradient target; the inner-update loss intentionally keeps
+            # the raw target for the v2 writer meta-gradient.
+            target_for_loss = target.detach() if detach_target else target
+            per_token = F.mse_loss(prediction, target_for_loss, reduction="none").mean(dim=-1)
             if writer_mask is None:
                 return per_token.mean(dim=1)
             denominator = writer_mask.sum(dim=1).clamp_min(1.0)
@@ -504,7 +515,15 @@ class TTTMLPLayer(nn.Module):
             return (next_state, per_trajectory_loss) if return_loss else next_state
 
         prediction = self._fast_mlp(keys, state)
+        # Keep the raw target for the actual inner update.  When v2 effect
+        # replay requests ``create_graph=True``, this preserves the
+        # value-projection -> inner-gradient -> updated-state meta-gradient.
         per_trajectory_loss = trajectory_loss(prediction, values)
+        local_trajectory_loss = (
+            trajectory_loss(prediction, values, detach_target=True)
+            if return_loss
+            else None
+        )
         gradients = torch.autograd.grad(
             per_trajectory_loss.sum(),
             state.tensors(),
@@ -542,7 +561,7 @@ class TTTMLPLayer(nn.Module):
                 for weight, updated in zip(state.tensors(), updated_tensors, strict=True)
             )
         next_state = TTTFastState(*updated_tensors, position=state.position)
-        return (next_state, per_trajectory_loss) if return_loss else next_state
+        return (next_state, local_trajectory_loss) if return_loss else next_state
 
     def _apply_rope(self, inputs: Tensor, positions: Tensor) -> Tensor:
         rotary_dim = self.dim - self.dim % 2

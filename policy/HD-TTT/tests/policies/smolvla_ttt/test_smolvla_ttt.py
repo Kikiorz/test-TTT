@@ -1416,7 +1416,7 @@ def test_action_effect_target_is_scale_invariant_in_normalized_coordinates() -> 
 
 
 def test_action_effect_backpropagates_through_differentiable_ttt_writer() -> None:
-    """The v2 term must reach K/V/inner-update parameters, not only the head."""
+    """The v2 meta-gradient keeps the raw value target in the inner update."""
 
     torch.manual_seed(31)
     layer = TTTMLPLayer(
@@ -1451,6 +1451,10 @@ def test_action_effect_backpropagates_through_differentiable_ttt_writer() -> Non
 
     assert torch.isfinite(loss)
     assert layer.k_proj.weight.grad is not None
+    # Unlike the separately returned H2L local loss, the differentiable inner
+    # update intentionally retains the raw value target.  The action-effect
+    # objective must therefore reach ``v_proj`` through the second-order
+    # state update as well as reaching the key/learning-rate parameters.
     assert layer.v_proj.weight.grad is not None
     assert layer.log_inner_lr_multiplier.grad is not None
     assert any(
