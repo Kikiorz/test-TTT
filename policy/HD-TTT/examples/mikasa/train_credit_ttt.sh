@@ -10,7 +10,7 @@
 # The stages are deliberately separated:
 #
 #   teacher  -> full-history causal action teacher + prefix feature cache
-#   labels   -> event/future pair labels (hindsight content intervention)
+#   labels   -> event/future pair labels (hindsight event-write deletion)
 #   student  -> SmolVLA-TTT QH2L student, initialized from the base checkpoint
 #   baselines -> print the official Native-SmolVLA/Clean-TTT/CreditTTT eval commands
 #   all      -> teacher, labels, and student in that order
@@ -140,6 +140,10 @@ TBPTT_SEGMENT_LENGTH="${TBPTT_SEGMENT_LENGTH:-32}"
 PAIR_K="${PAIR_K:-5}"
 EVENT_BLOCK_SIZE="${EVENT_BLOCK_SIZE:-1}"
 POSITIVE_THRESHOLD="${POSITIVE_THRESHOLD:-0.05}"
+# Event-write deletion is the preregistered CreditTTT intervention: it exactly
+# matches the student's traced W_i^- -> W_i^+ effect.  Content replacement is
+# retained only as an explicitly named offline ablation and is rejected by the
+# canonical student provenance validator.
 INTERVENTION="${INTERVENTION:-delete}"
 TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
@@ -418,6 +422,7 @@ baseline_commands() {
     --num-episodes "${EVAL_EPISODES}" --start-seed "${EVAL_START_SEED}"
     --torch-seed "${EVAL_TORCH_SEED}" --sim-backend "${SIM_BACKEND}"
     --device cuda --no-hd-ttt-enabled --no-hd-learned-write-gate
+    --hd-v3-include-previous-action
     --output "${clean_output}"
   )
   local credit_cmd=(
@@ -440,7 +445,7 @@ baseline_commands() {
   print_cmd "${manifest_cmd[@]}"
   echo "# Native-SmolVLA (canonical native action chunk K=50):"
   print_cmd "${native_cmd[@]}"
-  echo "# Clean-TTT (K=1, HD explicitly disabled):"
+  echo "# Clean-TTT (K=1, HD explicitly disabled, previous-action schema matched):"
   print_cmd "${clean_cmd[@]}"
   echo "# CreditTTT (K=1, canonical V3 identity emitted by evaluator):"
   print_cmd "${credit_cmd[@]}"
@@ -457,7 +462,7 @@ baseline_commands() {
 print_protocol() {
   echo "CreditTTT V3 protocol: creditttt_qh2l_v3"
   echo "canonical identity: format=credit_ttt_v3 version=3 pair_schema=event_future_control_pair_v3"
-  echo "target=final_slot0_action intervention=content_replacement state=causal_fast_weights causal=true"
+  echo "target=final_slot0_action intervention=event_write_deletion state=causal_fast_weights causal=true"
   echo "task=${TASK_ID} dataset=${DATASET_REPO_ID} root=${DATASET_ROOT}"
   echo "episodes: features=${FEATURE_EPISODE_START}..$((FEATURE_EPISODE_END - 1)), train=${TRAIN_EPISODES_JSON}, validation_start=${VALIDATION_EPISODE_START}"
   echo "full-history window: sequence_length=${SEQUENCE_LENGTH} sequence_stride=${SEQUENCE_STRIDE} max_windows_per_episode=${MAX_WINDOWS_PER_EPISODE} history_warmup_length=${HISTORY_WARMUP_LENGTH}"

@@ -68,6 +68,7 @@ from lerobot.policies.pi05_ttt.sequence import (
 from lerobot.policies.smolvla_ttt.configuration_smolvla_ttt import SmolVLATTTConfig
 from lerobot.policies.smolvla_ttt.hd_dataset import HindsightLabelDataset
 from lerobot.policies.smolvla_ttt.sequence import (
+    SEQUENCE_OFFSET_KEY,
     TailPreservingSequenceDataset as SmolVLATTTSequenceDataset,
     sequence_collate_fn as smolvla_ttt_sequence_collate_fn,
 )
@@ -93,6 +94,7 @@ from .lerobot_eval import eval_policy_all
 _HD_GROUNDING_EVENT_POLICY = "min_future_horizon_mean_else_total_credit"
 _HD_ATTRIBUTION_PROTOCOL_LEGACY = "legacy_raw_hinge_max"
 _HD_ATTRIBUTION_PROTOCOL_V2 = "v2_relative_antithetic_robust"
+_HD_ATTRIBUTION_PROTOCOL_V3 = "credit_ttt_v3_query_effect"
 
 
 def _normalize_hd_attribution_protocol(value: Any, *, default: str) -> str:
@@ -517,6 +519,7 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
     if artifact_attribution_protocol not in {
         _HD_ATTRIBUTION_PROTOCOL_LEGACY,
         _HD_ATTRIBUTION_PROTOCOL_V2,
+        _HD_ATTRIBUTION_PROTOCOL_V3,
     }:
         raise ValueError(
             "HD labels have unsupported attribution_protocol="
@@ -532,6 +535,263 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             f"{artifact_attribution_protocol!r}, policy.hd_attribution_protocol="
             f"{expected_attribution_protocol!r}"
         )
+    if artifact_attribution_protocol == _HD_ATTRIBUTION_PROTOCOL_V3:
+        # CreditTTT labels come from the independent explicit action teacher,
+        # not from the legacy clean SmolVLA replay.  Validate their compact
+        # pair schema here and return before the v1/v2 provenance checks below
+        # (which intentionally require velocity/replay fields that V3 does
+        # not contain).
+        required_v3_metadata = {
+            "format",
+            "protocol",
+            "version",
+            "pair_schema",
+            "dataset_repo_id",
+            "fps",
+            "event_dim",
+            "action_dim",
+            "pair_k",
+            "event_block_size",
+            "delay_edges",
+            "intervention",
+            "intervention_scope",
+            "intervention_type",
+            "protocol_variant",
+            "canonical_delay_edges",
+            "target_mode",
+            # Immutable protocol identity/provenance.  These fields make a
+            # direct-action teacher impossible to misreported as an
+            # antithetic-flow teacher and make causal state semantics explicit.
+            "state",
+            "causal",
+            "denoise_steps",
+            "antithetic_noise",
+            "includes_previous_executed_action",
+            "teacher_adapter",
+            "flow_target_available",
+            "teacher_checkpoint_sha256",
+            "feature_artifact_sha256",
+            # Full-history is a data/sequence contract, not merely a README
+            # convention.  Keep its structural fields in the artifact so a
+            # bounded-window run cannot be relabelled as the canonical method.
+            "history_mode",
+            "min_sequence_length",
+            "sequence_stride_policy",
+            "max_windows_per_episode",
+            "ttt_history_warmup_length",
+            "sequence_offset_policy",
+        }
+        missing_v3 = sorted(required_v3_metadata - set(metadata))
+        if missing_v3:
+            raise ValueError(
+                "CreditTTT V3 label artifact is missing required provenance fields: "
+                f"{missing_v3}"
+            )
+        if metadata.get("format") != "credit_ttt_v3" or metadata.get("protocol") != "creditttt_qh2l_v3":
+            raise ValueError("CreditTTT V3 label format/protocol declaration is invalid")
+        if type(metadata.get("version")) is not int or metadata.get("version") != 3 or metadata.get("pair_schema") != "event_future_control_pair_v3":
+            raise ValueError("CreditTTT V3 pair schema/version mismatch")
+        if type(metadata.get("event_block_size")) is not int or metadata.get("event_block_size") != 1:
+            raise ValueError(
+                "CreditTTT V3 canonical training requires event_block_size=1; "
+                "multi-frame event blocks need a dedicated block-state replay"
+            )
+        try:
+            delay_edges = tuple(int(edge) for edge in metadata["delay_edges"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("CreditTTT V3 delay_edges must be an integer sequence") from error
+        if delay_edges != (1, 17, 65, 257, 1025, 2**31 - 1):
+            raise ValueError(
+                "CreditTTT V3 delay_edges do not match the frozen publication bins "
+                "(1-16, 17-64, 65-256, 257-1024, 1025+)"
+            )
+        denoise_steps = metadata.get("denoise_steps")
+        if type(denoise_steps) is not int or denoise_steps <= 0:
+            raise ValueError("CreditTTT V3 denoise_steps must be a positive integer")
+        if str(metadata.get("dataset_repo_id")) != str(getattr(cfg.dataset, "repo_id", None)):
+            raise ValueError(
+                "CreditTTT V3 label dataset mismatch: artifact was generated for "
+                f"{metadata.get('dataset_repo_id')!r}, training dataset is "
+                f"{getattr(cfg.dataset, 'repo_id', None)!r}"
+            )
+        dataset_fps = getattr(getattr(dataset, "meta", None), "fps", None)
+        try:
+            if int(metadata["fps"]) != int(dataset_fps):
+                raise ValueError(
+                    f"CreditTTT V3 fps mismatch: artifact={metadata['fps']!r}, dataset={dataset_fps!r}"
+                )
+        except (TypeError, ValueError) as error:
+            raise ValueError("CreditTTT V3 artifact/dataset fps is malformed or mismatched") from error
+        expected_k = int(getattr(policy_cfg, "hd_v3_pair_k", metadata["pair_k"]))
+        if int(metadata["pair_k"]) != expected_k:
+            raise ValueError(
+                f"CreditTTT V3 pair_k mismatch: artifact={metadata['pair_k']}, policy={expected_k}"
+            )
+        expected_dim = int(getattr(policy_cfg, "max_action_dim", metadata["action_dim"]))
+        if int(metadata["action_dim"]) > expected_dim:
+            raise ValueError("CreditTTT V3 action_dim exceeds policy.max_action_dim")
+        required_v3_labels = {
+            "hd_v3_pair_event_index",
+            "hd_v3_pair_future_index",
+            "hd_v3_pair_utility",
+            "hd_v3_pair_effect",
+            "hd_v3_pair_valid",
+            "hd_v3_pair_positive",
+            "hd_v3_pair_null",
+            "hd_v3_pair_delay",
+            "hd_v3_pair_delay_bin",
+            "hd_v3_pair_event_end",
+        }
+        missing_labels = sorted(required_v3_labels - set(labeled_dataset.label_keys))
+        if missing_labels:
+            raise ValueError(
+                "CreditTTT V3 label artifact is missing pair columns: " f"{missing_labels}"
+            )
+        if metadata.get("state") != "causal_fast_weights" or metadata.get("causal") is not True:
+            raise ValueError(
+                "CreditTTT V3 requires causal_fast_weights state with causal=true"
+            )
+        if metadata.get("intervention") != "event_write_deletion":
+            raise ValueError(
+                "CreditTTT V3 intervention identity must be event_write_deletion; "
+                "use intervention_type for explicitly named ablations"
+            )
+        if metadata.get("intervention_scope") != (
+            "event_write_only_previous_executed_action_held_fixed"
+        ):
+            raise ValueError(
+                "CreditTTT V3 canonical training requires intervention_scope="
+                "'event_write_only_previous_executed_action_held_fixed'; "
+                "a whole-interaction or content-replacement intervention is a "
+                "separate ablation"
+            )
+        # The student effect is defined by the traced state transition
+        # ``W_i^- -> W_i^+``.  A donor-content replacement would require a
+        # second donor-state trace, which is intentionally not part of the
+        # canonical implementation.  Rejecting it here prevents an artifact
+        # with a superficially valid protocol header from training against a
+        # mismatched counterfactual.
+        if metadata.get("intervention_type") != "delete":
+            raise ValueError(
+                "CreditTTT V3 canonical training requires intervention_type='delete'; "
+                "content replacement is an offline ablation and needs a donor-state replay backend"
+            )
+        if metadata.get("canonical_delay_edges") is not True:
+            raise ValueError(
+                "CreditTTT V3 canonical training requires canonical_delay_edges=true; "
+                "custom delay schedules are separate ablations"
+            )
+        if metadata.get("protocol_variant") != "canonical_event_write_deletion":
+            raise ValueError(
+                "CreditTTT V3 artifact is not the canonical event-write-deletion variant; "
+                "use a separately named ablation output"
+            )
+        if metadata.get("history_mode") != "full_episode_replay":
+            raise ValueError(
+                "CreditTTT V3 canonical training requires history_mode='full_episode_replay'"
+            )
+        try:
+            min_sequence_length = int(metadata["min_sequence_length"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "CreditTTT V3 min_sequence_length must be a positive integer"
+            ) from error
+        if min_sequence_length <= 0:
+            raise ValueError("CreditTTT V3 min_sequence_length must be positive")
+        if metadata.get("sequence_stride_policy") != "equal_sequence_length":
+            raise ValueError(
+                "CreditTTT V3 canonical training requires sequence_stride_policy="
+                "'equal_sequence_length'"
+            )
+        if type(metadata.get("max_windows_per_episode")) is not int or metadata.get(
+            "max_windows_per_episode"
+        ) != 1:
+            raise ValueError(
+                "CreditTTT V3 canonical training requires max_windows_per_episode=1"
+            )
+        if metadata.get("ttt_history_warmup_length") not in {None, 0}:
+            raise ValueError(
+                "CreditTTT V3 canonical training requires no history warm-up"
+            )
+        if metadata.get("sequence_offset_policy") != "episode_local_zero":
+            raise ValueError(
+                "CreditTTT V3 canonical training requires episode-local zero offsets"
+            )
+        if type(metadata.get("antithetic_noise")) is not bool:
+            raise ValueError("CreditTTT V3 antithetic_noise must be a boolean")
+        if type(metadata.get("includes_previous_executed_action")) is not bool:
+            raise ValueError(
+                "CreditTTT V3 includes_previous_executed_action must be a boolean"
+            )
+        if metadata.get("includes_previous_executed_action") is not True:
+            raise ValueError(
+                "CreditTTT V3 canonical labels must include the preceding executed action; "
+                "omit it only in a separately named ablation"
+            )
+        if not isinstance(metadata.get("teacher_adapter"), str) or not metadata.get("teacher_adapter"):
+            raise ValueError("CreditTTT V3 teacher_adapter must be a non-empty string")
+        if type(metadata.get("flow_target_available")) is not bool:
+            raise ValueError("CreditTTT V3 flow_target_available must be a boolean")
+        if metadata.get("teacher_adapter") == "causal_action_head" and metadata.get("antithetic_noise"):
+            raise ValueError(
+                "CreditTTT direct causal_action_head artifacts cannot claim antithetic_noise=true"
+            )
+        if metadata.get("flow_target_available") and not metadata.get("antithetic_noise"):
+            raise ValueError(
+                "CreditTTT flow_target_available requires antithetic_noise=true"
+            )
+        if metadata.get("target_mode") != "normalized_executed_slot0_action":
+            raise ValueError(
+                "CreditTTT V3 target_mode must be normalized_executed_slot0_action; "
+                "velocity labels cannot be mixed into QH2L"
+            )
+        # CMD is part of the canonical method, not an optional label column.
+        # A QH2L-only run may set cmd weight to zero as an explicit ablation;
+        # otherwise fail closed when the teacher action triplet is absent.
+        if float(getattr(policy_cfg, "hd_v3_cmd_weight", 1.0)) > 0:
+            required_cmd_labels = {
+                "hd_v3_pair_teacher_full_action",
+                "hd_v3_pair_teacher_counterfactual_action",
+                "hd_v3_pair_expert_action",
+            }
+            missing_cmd = sorted(required_cmd_labels - set(labeled_dataset.label_keys))
+            if missing_cmd:
+                raise ValueError(
+                    "CreditTTT V3 CMD is enabled but label artifact is missing action columns: "
+                    f"{missing_cmd}"
+                )
+        # The current public V3 student path requires one complete episode
+        # sequence for its sparse event/query trace.  A future query-replay
+        # backend may relax this, but silently training truncated local pairs
+        # would invalidate the delay claim.
+        if getattr(policy_cfg, "ttt_history_warmup_length", 0) not in {None, 0}:
+            raise ValueError(
+                "CreditTTT V3 frame labels require ttt_history_warmup_length=None or 0"
+            )
+        if int(getattr(policy_cfg, "sequence_length", 0)) < min_sequence_length:
+            raise ValueError(
+                "CreditTTT V3 sequence_length is shorter than the longest episode used "
+                f"to build labels ({getattr(policy_cfg, 'sequence_length', None)} < "
+                f"{min_sequence_length})"
+            )
+        if int(getattr(policy_cfg, "sequence_stride", 0)) != int(
+            getattr(policy_cfg, "sequence_length", 0)
+        ):
+            raise ValueError(
+                "CreditTTT V3 canonical training requires sequence_stride == sequence_length"
+            )
+        if getattr(policy_cfg, "max_windows_per_episode", None) != 1:
+            raise ValueError(
+                "CreditTTT V3 canonical training requires max_windows_per_episode=1"
+            )
+        labeled_dataset.hd_attribution_protocol = _HD_ATTRIBUTION_PROTOCOL_V3
+        logging.info(
+            "CreditTTT V3 label contract: pair_k=%s, delay_edges=%s, teacher=%s",
+            metadata["pair_k"],
+            metadata["delay_edges"],
+            metadata["teacher_checkpoint_sha256"],
+        )
+        return labeled_dataset
     # A few early artifacts serialized the optional writer field as JSON null;
     # normalize it exactly like checkpoint configs before comparing protocol
     # strings.  Never turn null into the literal string ``"None"``.
@@ -939,6 +1199,41 @@ def _slice_flattened_sequence_batch(
     return select(batch)
 
 
+def _sequence_offset_from_batch(batch: Mapping[str, Any] | dict[str, Any]) -> int:
+    """Read the episode-local origin preserved by the SmolVLA-TTT collator.
+
+    ``sequence_collate_fn`` emits one scalar, but accepting an older repeated
+    ``[T]`` representation keeps checkpoints/data-loader workers compatible.
+    A malformed or mixed origin is rejected because falling back to zero would
+    silently misalign event/future CreditTTT labels.
+    """
+
+    value = batch.get(SEQUENCE_OFFSET_KEY)
+    if value is None:
+        return 0
+    try:
+        tensor = value.detach() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    except Exception as exc:
+        raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} must be an integer scalar") from exc
+    if tensor.numel() == 0:
+        raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} cannot be empty")
+    flattened = tensor.reshape(-1)
+    if tensor.is_floating_point():
+        if not bool(torch.isfinite(flattened).all().item()):
+            raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} must be finite")
+        if not bool((flattened == flattened.round()).all().item()):
+            raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} must contain integral values")
+    if not bool((flattened == flattened[0]).all().item()):
+        raise ValueError(
+            f"All sequence rows must share {SEQUENCE_OFFSET_KEY!r}; "
+            f"got {flattened.detach().cpu().tolist()}"
+        )
+    offset = int(flattened[0].item())
+    if offset < 0:
+        raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} must be non-negative, got {offset}")
+    return offset
+
+
 def _compute_hd_effect_normalization_floor(
     batch: dict[str, Any],
     sequence_shape: tuple[int, int],
@@ -1110,6 +1405,10 @@ def update_policy_tbptt(
     optimizer.zero_grad()
     unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
     batch_size, sequence_length = sequence_shape
+    # The sampler's origin is episode-local and may be non-zero when a window
+    # contains only a bounded warm-up prefix.  TBPTT segment offsets are
+    # relative to that window, so retain the physical origin before slicing.
+    window_sequence_offset = _sequence_offset_from_batch(batch)
     fast_states = None
     policy_config = getattr(unwrapped_policy, "config", None)
     finite_guard_enabled = _ttt_finite_guard_enabled(policy_config)
@@ -1122,8 +1421,11 @@ def update_policy_tbptt(
     use_global_hd_normalization = bool(
         getattr(policy_config, "hd_ttt_enabled", False)
         and str(getattr(policy_config, "hd_attribution_protocol", ""))
-        in {"v2", "v2_relative_antithetic_robust"}
-        and batch.get("hd_teacher_effect") is not None
+        in {"v2", "v2_relative_antithetic_robust", _HD_ATTRIBUTION_PROTOCOL_V3}
+        and (
+            batch.get("hd_teacher_effect") is not None
+            or batch.get("hd_v3_pair_effect") is not None
+        )
     )
     # Imported lazily so ordinary/non-SmolVLA training does not pull the
     # heavyweight SmolVLA model module merely for a logging helper.
@@ -1182,6 +1484,17 @@ def update_policy_tbptt(
     hd_normalization_denominator = (
         float(batch_size * sequence_length) if use_global_hd_normalization else None
     )
+    # ``SEQUENCE_SHAPE_KEY`` is consumed (popped) by the outer training loop
+    # before preprocessing.  CreditTTT replay nevertheless needs the complete
+    # reference-window shape to gather future observations and to compute
+    # episode-level pair denominators.  Keep a shallow metadata-enriched view;
+    # tensors remain shared and no second copy of the sequence is allocated.
+    v3_reference_batch = None
+    if str(getattr(policy_config, "hd_attribution_protocol", "")) == _HD_ATTRIBUTION_PROTOCOL_V3:
+        v3_reference_batch = dict(batch)
+        v3_reference_batch[SEQUENCE_SHAPE_KEY] = torch.tensor(
+            [batch_size, sequence_length], dtype=torch.int64, device=accelerator.device
+        )
     # Estimate the robust action-effect floor from the complete physical
     # window, before TBPTT slicing.  Reusing this detached scalar in every
     # segment keeps action-effect normalization invariant to segment length while
@@ -1241,6 +1554,15 @@ def update_policy_tbptt(
                     segment_kwargs["flow_loss_weight"] = segment_loss_weights[segment_index]
                     segment_kwargs["hd_normalization_denominator"] = hd_normalization_denominator
                     segment_kwargs["effect_normalization_floor"] = effect_normalization_floor
+                if _HD_ATTRIBUTION_PROTOCOL_V3 == str(
+                    getattr(policy_config, "hd_attribution_protocol", "")
+                ):
+                    # Pair indices are episode-local.  The model uses this
+                    # offset to map them into the current TBPTT segment; the
+                    # complete batch remains available for a future
+                    # cross-segment query replay implementation.
+                    segment_kwargs["sequence_offset"] = window_sequence_offset + segment_start
+                    segment_kwargs["v3_reference_batch"] = v3_reference_batch
                 segment_loss, segment_output, fast_states = unwrapped_policy.forward_sequence_segment(
                     segment_batch,
                     **segment_kwargs,
@@ -1313,6 +1635,27 @@ def update_policy_tbptt(
                         "hd_gate",
                         "hd_auxiliary_loss",
                         "hd_flow_loss",
+                        # CreditTTT primitives return sequence-level losses
+                        # and pair counts normalized by the complete window.
+                        # Aggregate these as numerators, never as a mean of
+                        # TBPTT-segment means (which would depend on the
+                        # arbitrary truncation length).
+                        "hd_v3_qh2l",
+                        "hd_v3_qh2l_positive",
+                        "hd_v3_qh2l_null",
+                        "hd_v3_cmd",
+                        "hd_v3_cmd_full",
+                        "hd_v3_cmd_effect",
+                        "hd_v3_cmd_rank",
+                        "hd_v3_cmd_null",
+                        "hd_v3_pairs",
+                        "hd_v3_positive_pairs",
+                        "hd_v3_null_pairs",
+                        "hd_v3_pairs_skipped",
+                        "hd_v3_cmd_pairs",
+                        "hd_v3_cmd_pairs_skipped",
+                        "hd_v3_cross_segment_pairs",
+                        "hd_v3_cmd_cross_segment_pairs",
                     }
                     metric_weight = (
                         1.0 if use_global_hd_normalization and additive_metric else segment_weight
@@ -1821,6 +2164,25 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             "hd_gate_pred_mean",
             "hd_gate_target_mean",
             "hd_gate_observed_fraction",
+            "hd_v3_qh2l",
+            "hd_v3_qh2l_positive",
+            "hd_v3_qh2l_null",
+            "hd_v3_cmd",
+            "hd_v3_cmd_full",
+            "hd_v3_cmd_effect",
+            "hd_v3_cmd_rank",
+            "hd_v3_cmd_null",
+            "hd_v3_pairs",
+            "hd_v3_positive_pairs",
+            "hd_v3_null_pairs",
+            "hd_v3_pairs_skipped",
+            "hd_v3_cmd_pairs",
+            "hd_v3_cmd_pairs_skipped",
+            "hd_v3_cross_segment_pairs",
+            "hd_v3_cmd_cross_segment_pairs",
+            "hd_v3_cmd_disabled",
+            "hd_v3_cmd_missing_targets",
+            "hd_v3_cmd_no_reference",
         ):
             train_metrics[metric_name] = AverageMeter(metric_name, ":.3f")
         # These diagnostics are deliberately separate from the optimized
@@ -1852,6 +2214,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             "hd_ttt_inner_lr_max",
             "hd_ttt_effective_gate_min",
             "hd_ttt_effective_gate_max",
+            "hd_v3_delay_mean",
+            "hd_v3_teacher_effect_rms",
+            "hd_v3_student_effect_rms",
+            "hd_v3_kvb_anchor",
         ):
             train_metrics[metric_name] = AverageMeter(metric_name, ":.5f")
     if is_smolvla_ttt and getattr(cfg.policy, "ttt_stable_inner_update", False):
@@ -1932,6 +2298,25 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "hd_gate_pred_mean",
                 "hd_gate_target_mean",
                 "hd_gate_observed_fraction",
+                "hd_v3_qh2l",
+                "hd_v3_qh2l_positive",
+                "hd_v3_qh2l_null",
+                "hd_v3_cmd",
+                "hd_v3_cmd_full",
+                "hd_v3_cmd_effect",
+                "hd_v3_cmd_rank",
+                "hd_v3_cmd_null",
+                "hd_v3_pairs",
+                "hd_v3_positive_pairs",
+                "hd_v3_null_pairs",
+                "hd_v3_pairs_skipped",
+                "hd_v3_cmd_pairs",
+                "hd_v3_cmd_pairs_skipped",
+                "hd_v3_cross_segment_pairs",
+                "hd_v3_cmd_cross_segment_pairs",
+                "hd_v3_cmd_disabled",
+                "hd_v3_cmd_missing_targets",
+                "hd_v3_cmd_no_reference",
                 "hd_gate_pred_std",
                 "hd_gate_target_std",
                 "hd_gate_corr",
@@ -1956,6 +2341,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "hd_ttt_inner_lr_max",
                 "hd_ttt_effective_gate_min",
                 "hd_ttt_effective_gate_max",
+                "hd_v3_delay_mean",
+                "hd_v3_teacher_effect_rms",
+                "hd_v3_student_effect_rms",
+                "hd_v3_kvb_anchor",
             ):
                 if metric_name in output_dict:
                     setattr(train_tracker, metric_name, output_dict[metric_name])

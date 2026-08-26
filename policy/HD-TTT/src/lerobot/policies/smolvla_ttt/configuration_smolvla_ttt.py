@@ -21,6 +21,20 @@ from lerobot.utils.constants import OBS_IMAGES
 from ..rtc.configuration_rtc import RTCConfig
 
 
+# CreditTTT stores one protocol-level intervention identity in artifacts while
+# allowing the implementation to choose the concrete branch used for the
+# counterfactual replay.  Keep the aliases here (rather than duplicating
+# string literals across model/trainer code) so a config loaded from an older
+# manifest has one unambiguous runtime representation.
+_CREDIT_TTT_PROTOCOL = "credit_ttt_v3_query_effect"
+_CREDIT_TTT_INTERVENTION_ALIASES = {
+    "delete": "delete",
+    "content_deletion": "delete",
+    "replace": "replace",
+    "content_replacement": "replace",
+}
+
+
 @PreTrainedConfig.register_subclass("smolvla_ttt")
 @dataclass
 class SmolVLATTTConfig(PreTrainedConfig):
@@ -209,6 +223,43 @@ class SmolVLATTTConfig(PreTrainedConfig):
     hd_write_gate_init: float = 0.95
     hd_learned_write_gate: bool = False
 
+    # ------------------------------------------------------------------
+    # CreditTTT (the paper method)
+    # ------------------------------------------------------------------
+    # ``hd_attribution_protocol`` remains the single protocol discriminator
+    # for backwards-compatible checkpoint loading.  The value
+    # ``credit_ttt_v3_query_effect`` opts into the final method: pairwise
+    # full-history control credit supervises a query-conditioned local
+    # fast-weight effect.  All fields below are inert for the legacy/v2
+    # protocols, so an ordinary SmolVLA/TTT checkpoint is unchanged.
+    hd_v3_pair_k: int = 5
+    hd_v3_local_weight: float = 1.0
+    # CMD is a reader/action audit loss evaluated on the same final-flow
+    # replay used by QH2L.  Keeping one fixed default weight makes the
+    # distinction between the writer (QH2L) and reader (CMD) explicit without
+    # introducing a collection of task-specific knobs.
+    hd_v3_cmd_weight: float = 1.0
+    hd_v3_cmd_margin: float = 0.05
+    hd_v3_null_weight: float = 0.25
+    hd_v3_null_threshold: float = 0.05
+    # The previous *executed* slot-0 action is part of the formal CreditTTT
+    # interaction token.  It is enabled by default for the V3 protocol and is
+    # ``None`` means protocol default (enabled for CreditTTT, disabled for
+    # legacy/clean).  An explicit boolean is retained for architecture-matched
+    # clean-TTT controls: the baseline can use the same interaction projection
+    # while removing only the hindsight objective.  This avoids conflating an
+    # input-schema difference with the contribution of the training loss.
+    hd_v3_include_previous_action: bool | None = None
+    # The publication protocol deletes the event write (which is exactly the
+    # student's before/after state intervention).  ``replace`` is accepted as
+    # a separately named offline ablation only and is rejected by the V3
+    # training contract unless a donor-state replay backend is added.
+    hd_v3_intervention: str = "delete"
+    # The local effect is computed at the final selected TTT layer and passed
+    # through the existing action output projection.  This is a fixed
+    # structural choice, not a task-specific tuning knob.
+    hd_v3_effect_layer: str = "last_selected"
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -319,18 +370,101 @@ class SmolVLATTTConfig(PreTrainedConfig):
             self.hd_attribution_protocol = "legacy_raw_hinge_max"
         elif self.hd_attribution_protocol == "v2":
             self.hd_attribution_protocol = "v2_relative_antithetic_robust"
+        elif self.hd_attribution_protocol in {"v3", "credit_ttt_v3"}:
+            self.hd_attribution_protocol = "credit_ttt_v3_query_effect"
         if self.hd_attribution_protocol not in {
             "legacy_raw_hinge_max",
             "v2_relative_antithetic_robust",
+            "credit_ttt_v3_query_effect",
         }:
             raise ValueError(
-                "hd_attribution_protocol must be 'legacy_raw_hinge_max' or "
-                "'v2_relative_antithetic_robust'"
+                "hd_attribution_protocol must be 'legacy_raw_hinge_max', "
+                "'v2_relative_antithetic_robust', or 'credit_ttt_v3_query_effect'"
             )
-        if self.hd_effect_weight > 0 and self.hd_attribution_protocol != "v2_relative_antithetic_robust":
+        if self.hd_effect_weight > 0 and self.hd_attribution_protocol not in {
+            "v2_relative_antithetic_robust",
+            "credit_ttt_v3_query_effect",
+        }:
             raise ValueError(
-                "hd_effect_weight>0 requires hd_attribution_protocol='v2_relative_antithetic_robust'"
+                "hd_effect_weight>0 requires hd_attribution_protocol to select a v2 or "
+                "CreditTTT attribution protocol"
             )
+        if self.hd_v3_pair_k <= 0:
+            raise ValueError("hd_v3_pair_k must be positive")
+        for name in (
+            "hd_v3_local_weight",
+            "hd_v3_cmd_weight",
+            "hd_v3_cmd_margin",
+            "hd_v3_null_weight",
+            "hd_v3_null_threshold",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.hd_attribution_protocol == "credit_ttt_v3_query_effect" and self.hd_v3_local_weight <= 0:
+            raise ValueError("CreditTTT requires hd_v3_local_weight>0")
+        if self.hd_v3_null_threshold > 1:
+            raise ValueError("hd_v3_null_threshold must be at most 1")
+        # Artifacts use ``event_write_deletion`` as the protocol-level schema
+        # identity.  Command lines may still use ``delete`` or ``replace`` to
+        # select a concrete offline branch; canonical V3 training accepts only
+        # ``delete`` because the student trace compares write-before/write-
+        # after states.  ``replace`` is retained for a separately named
+        # intervention ablation.
+        if not isinstance(self.hd_v3_intervention, str):
+            raise ValueError(
+                "hd_v3_intervention must be one of delete/replace/content_deletion/content_replacement"
+            )
+        intervention = _CREDIT_TTT_INTERVENTION_ALIASES.get(
+            self.hd_v3_intervention.strip().lower()
+        )
+        if intervention is None:
+            raise ValueError(
+                "hd_v3_intervention must be one of delete/replace/content_deletion/content_replacement"
+            )
+        self.hd_v3_intervention = intervention
+        if self.hd_v3_effect_layer != "last_selected":
+            raise ValueError("hd_v3_effect_layer currently supports only 'last_selected'")
+        if self.hd_attribution_protocol == _CREDIT_TTT_PROTOCOL:
+            # The V3 objective is the pairwise query-conditioned effect.  A
+            # positive ``hd_effect_weight`` would additionally activate the
+            # legacy compact v2 true/wrong replay, silently changing the
+            # method under study and making a baseline comparison invalid.
+            if self.hd_effect_weight != 0:
+                raise ValueError(
+                    "CreditTTT requires hd_effect_weight=0; the legacy v2 action-effect "
+                    "objective must not be mixed into the V3 protocol"
+                )
+            if not self.hd_ttt_enabled:
+                raise ValueError(
+                    "CreditTTT requires hd_ttt_enabled=True"
+                )
+            if self.ttt_writer_mode != "prefix_only":
+                raise ValueError(
+                    "CreditTTT requires ttt_writer_mode='prefix_only' so writes are observation-causal"
+                )
+            if not self.ttt_second_order:
+                raise ValueError(
+                    "CreditTTT query-effect distillation requires ttt_second_order=True"
+                )
+            # ``ttt_layer_indices`` need not be sorted.  The effect layer is
+            # the numerically last selected layer, not the last user-provided
+            # list element; using ``[-1]`` could silently select an
+            # intermediate layer and apply the wrong action tail.
+            resolved_v3_layers = self.resolved_ttt_layer_indices
+            if not resolved_v3_layers:
+                raise ValueError("CreditTTT requires at least one selected TTT layer")
+            if max(resolved_v3_layers) != self.num_vlm_layers - 1:
+                raise ValueError(
+                    "CreditTTT requires the final VLM/action-expert layer to be selected "
+                    "so the local effect can use the shared action tail"
+                )
+        # Resolve the protocol default only after aliases above have been
+        # canonicalized.  Explicit values are meaningful for a fair,
+        # architecture-matched Clean-TTT baseline and must not be overwritten.
+        if self.hd_v3_include_previous_action is None:
+            self.hd_v3_include_previous_action = self.hd_attribution_protocol == _CREDIT_TTT_PROTOCOL
+        if type(self.hd_v3_include_previous_action) is not bool:
+            raise ValueError("hd_v3_include_previous_action must be a boolean or null")
         if self.hd_phase_mode not in {"random", "deployment"}:
             raise ValueError("hd_phase_mode must be 'random' or 'deployment'")
         if self.compile_model:
@@ -378,6 +512,15 @@ class SmolVLATTTConfig(PreTrainedConfig):
     @property
     def trains_gate(self) -> bool:
         return self.ttt_training_stage == "action_head"
+
+    @property
+    def credit_ttt_enabled(self) -> bool:
+        """Whether the final CreditTTT query-effect objective is active."""
+
+        return bool(
+            self.hd_ttt_enabled
+            and self.hd_attribution_protocol == "credit_ttt_v3_query_effect"
+        )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

@@ -27,6 +27,7 @@ import logging
 import math
 import os
 from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import fields
 from pathlib import Path
 from typing import TypedDict, Unpack
@@ -51,11 +52,56 @@ from .hd_ttt import (
     counterfactual_grounding_loss,
     local_kvb_loss,
 )
-from .sequence import HD_ACTION_SLOT_VALID_KEY, HD_WRITER_VALID_KEY, SEQUENCE_SHAPE_KEY
+from .credit_ttt_v3 import (
+    causal_memory_deployment_loss,
+    query_conditioned_local_effect_loss,
+)
+from .sequence import (
+    HD_ACTION_SLOT_VALID_KEY,
+    HD_WRITER_VALID_KEY,
+    SEQUENCE_OFFSET_KEY,
+    SEQUENCE_SHAPE_KEY,
+)
 from .smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
-from .ttt import TTTFastState, TTTMLPLayer
+from .ttt import TTTBoundedTrace, TTTFastState, TTTMLPLayer, TTTStateTransition
 
 TTTFastStates = dict[int, TTTFastState]
+
+
+def _coerce_sequence_offset(value: object | None) -> int:
+    """Normalize a sequence origin carried through the policy batch.
+
+    The dataloader emits a scalar ``int64`` tensor, while a few callers use a
+    Python integer or an older collator that leaves one repeated value per
+    timestep.  Accept all of those representations, but reject an empty,
+    non-integral, negative, or internally inconsistent value: silently
+    defaulting a malformed origin to zero would train CreditTTT against the
+    wrong episode-local pair coordinates.
+    """
+
+    if value is None:
+        return 0
+    try:
+        tensor = value.detach() if isinstance(value, Tensor) else torch.as_tensor(value)
+    except Exception as exc:
+        raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} must be an integer scalar") from exc
+    if tensor.numel() == 0:
+        raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} cannot be empty")
+    flattened = tensor.reshape(-1)
+    if tensor.is_floating_point():
+        if not bool(torch.isfinite(flattened).all().item()):
+            raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} must be finite")
+        if not bool((flattened == flattened.round()).all().item()):
+            raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} must contain integral values")
+    first = int(flattened[0].item())
+    if not bool((flattened == flattened[0]).all().item()):
+        raise ValueError(
+            f"All sequence rows must share {SEQUENCE_OFFSET_KEY!r}; "
+            f"got {flattened.detach().cpu().tolist()}"
+        )
+    if first < 0:
+        raise ValueError(f"{SEQUENCE_OFFSET_KEY!r} must be non-negative, got {first}")
+    return first
 
 
 def _hd_loss_balance_metrics(auxiliary_loss: float, flow_loss: float) -> dict[str, float]:
@@ -208,6 +254,15 @@ _CHECKPOINT_ARCHITECTURE_FIELDS = {
     "ttt_layer_indices",
     "ttt_writer_mode",
     "ttt_num_register_tokens",
+    "hd_v3_include_previous_action",
+    "hd_v3_pair_k",
+    "hd_v3_local_weight",
+    "hd_v3_cmd_weight",
+    "hd_v3_cmd_margin",
+    "hd_v3_null_weight",
+    "hd_v3_null_threshold",
+    "hd_v3_intervention",
+    "hd_v3_effect_layer",
     "hd_ttt_enabled",
     "hd_hca_weight",
     "hd_h2l_weight",
@@ -257,6 +312,15 @@ def _restore_checkpoint_model_fields(
         "hd_write_gate_weight",
         "hd_write_gate_init",
         "hd_learned_write_gate",
+        "hd_v3_pair_k",
+        "hd_v3_local_weight",
+        "hd_v3_cmd_weight",
+        "hd_v3_cmd_margin",
+        "hd_v3_null_weight",
+        "hd_v3_null_threshold",
+        "hd_v3_include_previous_action",
+        "hd_v3_intervention",
+        "hd_v3_effect_layer",
     }
     requested_hd = {
         name: getattr(config, name)
@@ -378,6 +442,15 @@ def _validate_checkpoint_keys(
         for key in missing_keys
         if key.startswith("model.prefix_writer_proj.") and source_writer_mode != "prefix_only"
     ]
+    # CreditTTT optionally appends the previous executed action to the
+    # observation-only writer.  This projection is a deliberately isolated
+    # structural extension and may be initialized when converting a clean
+    # checkpoint.  The key is narrow enough that allowing it here cannot hide
+    # an unrelated incompatibility; a source checkpoint that already carries
+    # the extension is still checked by the normal strict path.
+    allowed_previous_action_missing = [
+        key for key in missing_keys if key.startswith("model.previous_action_proj.")
+    ]
     # Older SmolVLA-TTT checkpoints predate the optional HD gate head.  They
     # remain loadable when the caller explicitly enables that extension, while
     # a checkpoint that declares the head is still checked strictly.
@@ -393,6 +466,7 @@ def _validate_checkpoint_keys(
         set(allowed_base_missing)
         | set(allowed_prefix_missing)
         | set(allowed_gate_extension)
+        | set(allowed_previous_action_missing)
     )
     disallowed_missing = [key for key in missing_keys if key not in allowed_missing]
     # A short-lived prefix-gate prototype constructed both the old
@@ -420,7 +494,11 @@ def _validate_checkpoint_keys(
     # For a TTT source (or an explicitly strict load), only known optional
     # extensions may be absent.  For a non-strict base conversion the TTT
     # families above are the sole intentionally missing keys.
-    required_allowed = set(allowed_prefix_missing) | set(allowed_gate_extension)
+    required_allowed = (
+        set(allowed_prefix_missing)
+        | set(allowed_gate_extension)
+        | set(allowed_previous_action_missing)
+    )
     if disallowed_unexpected or disallowed_missing or (
         require_exact_checkpoint and any(key not in required_allowed for key in missing_keys)
     ):
@@ -748,6 +826,62 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
         self._ttt_fast_states: TTTFastStates = {}
+        # During teacher-forced sequence training, the action immediately
+        # preceding a TBPTT segment is part of the causal writer input.  Keep
+        # a detached carry at the policy boundary so segment ``s+1`` receives
+        # slot-0 from segment ``s`` without extending the fast-weight state
+        # schema (and without changing legacy checkpoints).
+        self._v3_previous_action_carry: Tensor | None = None
+        # CreditTTT may condition the *write* on the action that was actually
+        # executed at the preceding physical step.  Keep this state at the
+        # policy boundary (rather than in the fast weights) so reset semantics
+        # are explicit and a benchmark can verify that episodes never share
+        # an action history.
+        self._last_executed_action: Tensor | None = None
+
+    @staticmethod
+    def _coerce_previous_action_at_start(
+        value: Tensor | None,
+        *,
+        batch_size: int,
+        action_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor | None:
+        """Normalize one causal predecessor action per sequence trajectory.
+
+        ``previous_action_at_start`` is intentionally an explicit boundary
+        argument rather than another fast-weight tensor.  Accept a compact
+        ``[D]`` vector for a single trajectory and ``[B,D]`` for a batched
+        sequence; pad/truncate only the feature axis, matching the ordinary
+        SmolVLA action adapter.  Returning a detached tensor prevents a
+        teacher-forced predecessor from creating a cross-segment autograd
+        edge while preserving its numerical value for the next segment.
+        """
+
+        if value is None:
+            return None
+        tensor = value if isinstance(value, Tensor) else torch.as_tensor(value)
+        if tensor.ndim == 1:
+            if batch_size != 1:
+                raise ValueError(
+                    "previous_action_at_start must have shape [B,D] when batch_size>1; "
+                    f"got {tuple(tensor.shape)} for B={batch_size}"
+                )
+            tensor = tensor.unsqueeze(0)
+        elif tensor.ndim == 3 and tensor.shape[1] == 1:
+            tensor = tensor[:, 0]
+        if tensor.ndim != 2 or tensor.shape[0] != batch_size:
+            raise ValueError(
+                "previous_action_at_start must have shape [B,D] (or [D] for B=1); "
+                f"got {tuple(tensor.shape)} for B={batch_size}"
+            )
+        tensor = tensor.to(device=device, dtype=dtype)
+        if tensor.shape[-1] < action_dim:
+            tensor = F.pad(tensor, (0, action_dim - tensor.shape[-1]))
+        elif tensor.shape[-1] > action_dim:
+            tensor = tensor[..., :action_dim]
+        return tensor.detach()
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -793,6 +927,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             state,
             fast_states=self._ttt_fast_states,
             noise=noise,
+            previous_action=self._last_executed_action,
             **kwargs,
         )
 
@@ -800,8 +935,25 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
+        # Keep the predecessor in the policy's normalized/action-model
+        # coordinates.  ``_pi_aloha_encode_actions`` below is an external
+        # runtime adapter (used only for the ALOHA convention); feeding its
+        # post-adapter values back into the CreditTTT writer would make the
+        # causal token depend on the selected deployment adapter rather than
+        # on the action representation used during training.
+        normalized_executed_action = actions[:, :1].detach()
+
         if self.config.adapt_to_pi_aloha:
             actions = self._pi_aloha_encode_actions(actions)
+
+        if bool(getattr(self.config, "hd_v3_include_previous_action", False)):
+            # n_action_steps is fixed to one for recurrent TTT, so the first
+            # returned slot is exactly the action sent to the environment.
+            # Store a detached normalized copy for the next observation.  The
+            # postprocessor/adapter owns any physical-unit conversion after
+            # this method, hence the writer sees the same normalized action
+            # coordinates used during training.
+            self._last_executed_action = normalized_executed_action
 
         return actions
 
@@ -915,6 +1067,815 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         if active_dim <= 0:
             raise ValueError("HD action comparison requires a positive feature dimension")
         return active_dim
+
+    def _prepare_v3_pair_labels(
+        self,
+        batch: dict[str, Tensor],
+        sequence_shape: tuple[int, int],
+        *,
+        sequence_offset: int | None = None,
+        allow_cross_segment: bool = False,
+    ) -> dict[str, Tensor] | None:
+        """Normalize the event-centric CreditTTT pair columns.
+
+        V3 labels are attached to the *event* row, not collapsed into a
+        single per-frame importance score.  Each row contains a fixed K list
+        of future queries and their detached teacher effects.  Indices are
+        episode-local; ``sequence_offset`` maps them into the current TBPTT
+        segment.  Pairs whose event/query is outside the segment are retained
+        in the artifact but skipped by the local trace path by default.  When
+        ``allow_cross_segment`` is true (only with a complete reference
+        window), rows whose event is in this segment are retained even when
+        their future query is in another segment and are routed to the
+        fixed-context full-flow replay adapter.
+        """
+
+        event_field = batch.get("hd_v3_pair_event_index")
+        future_field = batch.get("hd_v3_pair_future_index")
+        utility_field = batch.get("hd_v3_pair_utility")
+        effect_field = batch.get("hd_v3_pair_effect")
+        if any(value is None for value in (event_field, future_field, utility_field, effect_field)):
+            return None
+        event_index = self._reshape_hd_field(
+            event_field, sequence_shape, name="hd_v3_pair_event_index"
+        ).to(dtype=torch.long)
+        future_index = self._reshape_hd_field(
+            future_field, sequence_shape, name="hd_v3_pair_future_index"
+        ).to(dtype=torch.long)
+        utility = self._reshape_hd_field(
+            utility_field, sequence_shape, name="hd_v3_pair_utility"
+        ).float()
+        teacher_effect = self._reshape_hd_field(
+            effect_field, sequence_shape, name="hd_v3_pair_effect"
+        ).float()
+        if event_index.ndim != 3 or future_index.shape != event_index.shape or utility.shape != event_index.shape:
+            raise ValueError(
+                "CreditTTT pair index/utility fields must have shape [B,T,K]; got "
+                f"event={tuple(event_index.shape)}, future={tuple(future_index.shape)}, "
+                f"utility={tuple(utility.shape)}"
+            )
+        if teacher_effect.ndim != 4 or teacher_effect.shape[:3] != event_index.shape:
+            raise ValueError(
+                "hd_v3_pair_effect must have shape [B,T,K,D] aligned with pair indices; got "
+                f"{tuple(teacher_effect.shape)}"
+            )
+        valid_field = batch.get("hd_v3_pair_valid")
+        positive_field = batch.get("hd_v3_pair_positive")
+        null_field = batch.get("hd_v3_pair_null")
+        delay_field = batch.get("hd_v3_pair_delay")
+        delay_bin_field = batch.get("hd_v3_pair_delay_bin")
+        event_end_field = batch.get("hd_v3_pair_event_end")
+        valid = (
+            self._reshape_hd_field(valid_field, sequence_shape, name="hd_v3_pair_valid").bool()
+            if valid_field is not None
+            else torch.ones_like(event_index, dtype=torch.bool)
+        )
+        positive = (
+            self._reshape_hd_field(positive_field, sequence_shape, name="hd_v3_pair_positive").bool()
+            if positive_field is not None
+            else utility > float(getattr(self.config, "hd_v3_null_threshold", 0.05))
+        )
+        null = (
+            self._reshape_hd_field(null_field, sequence_shape, name="hd_v3_pair_null").bool()
+            if null_field is not None
+            else ~positive
+        )
+        if bool((positive & null & valid).any().item()):
+            raise ValueError("CreditTTT positive/null pair masks overlap")
+        delay = (
+            self._reshape_hd_field(delay_field, sequence_shape, name="hd_v3_pair_delay").long()
+            if delay_field is not None
+            else future_index - event_index
+        )
+        delay_bin = (
+            self._reshape_hd_field(delay_bin_field, sequence_shape, name="hd_v3_pair_delay_bin").long()
+            if delay_bin_field is not None
+            else torch.zeros_like(delay)
+        )
+        event_end = (
+            self._reshape_hd_field(
+                event_end_field, sequence_shape, name="hd_v3_pair_event_end"
+            ).long()
+            if event_end_field is not None
+            else event_index + 1
+        )
+        if event_end.shape != event_index.shape:
+            raise ValueError(
+                "hd_v3_pair_event_end must have shape [B,T,K] aligned with pair indices; "
+                f"got {tuple(event_end.shape)}"
+            )
+        offset = 0 if sequence_offset is None else int(sequence_offset)
+        # Keep episode-local coordinates alongside the segment-local aliases.
+        # Cross-segment replay uses the former to gather the future frame from
+        # the complete reference window; same-segment tracing uses the latter.
+        global_event = event_index
+        global_future = future_index
+        local_event = global_event - offset
+        local_future = global_future - offset
+        batch_size, sequence_length = sequence_shape
+        row_batch = torch.arange(batch_size, device=event_index.device)[:, None, None].expand_as(event_index)
+        if allow_cross_segment:
+            # Reference-window bounds are checked by the replay helper, where
+            # its complete shape/offset is available.  Here we only require a
+            # valid current event and a strictly later episode-local query.
+            in_segment = (
+                (local_event >= 0)
+                & (local_event < sequence_length)
+                & (global_future >= 0)
+                & (global_future >= event_end)
+            )
+        else:
+            in_segment = (
+                (local_event >= 0)
+                & (local_event < sequence_length)
+                & (local_future >= 0)
+                & (local_future < sequence_length)
+                & (global_future >= event_end)
+            )
+        finite = torch.isfinite(utility) & torch.isfinite(teacher_effect).all(dim=-1)
+        valid = valid & in_segment & finite
+
+        # CMD (the reader-side part of CreditTTT) is optional in the public
+        # pair artifact.  When present, keep the three action targets aligned
+        # with the event/future columns instead of treating them as generic
+        # per-frame labels.  The builder serializes ``[T,K,D]`` fields, while
+        # a few early K=1 artifacts omitted the singleton pair axis; accepting
+        # that spelling here keeps those artifacts readable without changing
+        # the canonical schema.
+        pair_action_fields = {
+            "teacher_full_action": "hd_v3_pair_teacher_full_action",
+            "teacher_wrong_action": "hd_v3_pair_teacher_counterfactual_action",
+            "expert_action": "hd_v3_pair_expert_action",
+        }
+        pair_action_values: dict[str, Tensor] = {}
+        for output_name, field_name in pair_action_fields.items():
+            value = batch.get(field_name)
+            if value is None:
+                continue
+            aligned = self._reshape_hd_field(value, sequence_shape, name=field_name)
+            if aligned is None:
+                continue
+            aligned = aligned.float()
+            if aligned.ndim == 3 and event_index.shape[-1] == 1:
+                aligned = aligned.unsqueeze(2)
+            if aligned.ndim != 4 or aligned.shape[:3] != event_index.shape:
+                raise ValueError(
+                    f"{field_name} must have shape [B,T,K,D] aligned with pair indices; "
+                    f"got {tuple(aligned.shape)}"
+                )
+            pair_action_values[output_name] = aligned.reshape(
+                -1, aligned.shape[-1]
+            )
+        flat = {
+            "event_index": local_event.reshape(-1),
+            "future_index": local_future.reshape(-1),
+            "event_index_global": global_event.reshape(-1),
+            "future_index_global": global_future.reshape(-1),
+            "batch_index": row_batch.reshape(-1),
+            "utility": utility.reshape(-1),
+            "teacher_effect": teacher_effect.reshape(-1, teacher_effect.shape[-1]),
+            "positive": (positive & ~null).reshape(-1),
+            "null": (null & ~positive).reshape(-1),
+            "valid": valid.reshape(-1),
+            "delay": delay.reshape(-1),
+            "delay_bin": delay_bin.reshape(-1),
+            "event_end": event_end.reshape(-1),
+            "cross_segment": (
+                (local_future < 0) | (local_future >= sequence_length)
+            ).reshape(-1),
+            "total_rows": torch.tensor(event_index.numel(), device=event_index.device),
+        }
+        flat.update(pair_action_values)
+        return flat
+
+    @staticmethod
+    def _v3_pair_normalizers(
+        pair_labels: Mapping[str, Tensor] | None,
+    ) -> dict[str, Tensor] | None:
+        """Compute detached complete-window denominators for CreditTTT strata.
+
+        QH2L and CMD are defined over the sampled event--future population of
+        one episode/window, not over whichever subset happens to fall inside a
+        TBPTT segment.  The trainer therefore evaluates this helper once on
+        the complete reference window and passes the resulting scalars to each
+        segment.  Keeping the calculation in the model makes the weighting
+        rule identical for direct one-window calls and segmented training,
+        while detached denominators guarantee that labels cannot become a
+        hidden gradient path.
+
+        ``positive`` follows the primitive's bounded utility weighting and
+        ``null`` is an unweighted invariance stratum.  ``full`` counts every
+        valid pair used by CMD's teacher-action distillation.  A denominator
+        may be zero for a degenerate window; the loss primitive handles that
+        case with a connected zero.
+        """
+
+        if pair_labels is None:
+            return None
+        required = ("valid", "positive", "null", "utility")
+        if any(name not in pair_labels for name in required):
+            raise ValueError(
+                "CreditTTT pair labels must contain valid/positive/null/utility "
+                "fields before global normalization"
+            )
+        valid = pair_labels["valid"].bool()
+        positive = pair_labels["positive"].bool() & valid
+        null = pair_labels["null"].bool() & valid & ~positive
+        utility = pair_labels["utility"].detach().float()
+        finite_utility = torch.isfinite(utility)
+        positive = positive & finite_utility
+        null = null & finite_utility
+        positive_weight = utility.clamp_min(0).clamp_max(1) * positive.to(dtype=utility.dtype)
+        return {
+            "full": valid.to(dtype=utility.dtype).sum().detach(),
+            "positive": positive_weight.sum().detach(),
+            "null": null.to(dtype=utility.dtype).sum().detach(),
+        }
+
+    @staticmethod
+    def _v3_reference_sequence_shape(
+        reference_batch: Mapping[str, object],
+    ) -> tuple[int, int]:
+        """Read the complete ``[B,T]`` shape carried by a reference window."""
+
+        raw = reference_batch.get(SEQUENCE_SHAPE_KEY)
+        if raw is None:
+            raise ValueError(
+                "Cross-segment CreditTTT replay requires the complete reference "
+                f"batch to contain {SEQUENCE_SHAPE_KEY!r}"
+            )
+        tensor = raw.detach() if isinstance(raw, Tensor) else torch.as_tensor(raw)
+        values = tensor.reshape(-1)
+        if values.numel() != 2:
+            raise ValueError(
+                f"{SEQUENCE_SHAPE_KEY!r} must contain [batch,time], got "
+                f"shape {tuple(tensor.shape)}"
+            )
+        batch_size, sequence_length = (int(values[0].item()), int(values[1].item()))
+        if batch_size <= 0 or sequence_length <= 0:
+            raise ValueError("CreditTTT reference sequence dimensions must be positive")
+        return batch_size, sequence_length
+
+    @staticmethod
+    def _v3_gather_reference_rows(
+        value: object,
+        batch_indices: Tensor,
+        time_indices: Tensor,
+        reference_shape: tuple[int, int],
+        *,
+        name: str,
+    ) -> Tensor:
+        """Gather arbitrary episode rows from a flattened or grouped field."""
+
+        if not isinstance(value, Tensor) or value.ndim == 0:
+            raise ValueError(f"CreditTTT reference field {name!r} must be a tensor with rows")
+        reference_batch, reference_length = reference_shape
+        batch_indices = batch_indices.to(device=value.device, dtype=torch.long)
+        time_indices = time_indices.to(device=value.device, dtype=torch.long)
+        if batch_indices.shape != time_indices.shape or batch_indices.ndim != 1:
+            raise ValueError("reference batch/time indices must be aligned one-dimensional tensors")
+        if bool((batch_indices < 0).any().item()) or bool(
+            (batch_indices >= reference_batch).any().item()
+        ):
+            raise ValueError("CreditTTT reference batch index is out of range")
+        if bool((time_indices < 0).any().item()) or bool(
+            (time_indices >= reference_length).any().item()
+        ):
+            raise ValueError("CreditTTT future query lies outside the complete reference window")
+        flat_rows = reference_batch * reference_length
+        if value.shape[0] == flat_rows:
+            index = batch_indices * reference_length + time_indices
+            return value.index_select(0, index)
+        if value.ndim >= 2 and value.shape[:2] == reference_shape:
+            return value[batch_indices, time_indices]
+        if reference_batch == 1 and value.shape[0] == reference_length:
+            return value.index_select(0, time_indices)
+        raise ValueError(
+            f"CreditTTT reference field {name!r} must start with flattened "
+            f"B*T={flat_rows} or grouped {reference_shape}, got {tuple(value.shape)}"
+        )
+
+    @staticmethod
+    def _v3_stack_fast_states(
+        states: Sequence[TTTFastState],
+    ) -> TTTFastState:
+        """Stack one traced trajectory state per local event pair."""
+
+        if not states:
+            raise ValueError("Cannot stack an empty CreditTTT fast-state list")
+        positions = [state.position for state in states]
+        if any(position is None for position in positions):
+            stacked_position = None
+        else:
+            stacked_position = torch.cat(
+                [position for position in positions if position is not None], dim=0
+            )
+        return TTTFastState(
+            *(torch.cat([state.tensors()[index] for state in states], dim=0) for index in range(4)),
+            position=stacked_position,
+        )
+
+    def _v3_reference_student_effects(
+        self,
+        *,
+        reference_batch: Mapping[str, object],
+        trace_collector: dict[int, TTTBoundedTrace],
+        event_indices: Tensor,
+        event_indices_global: Tensor,
+        future_indices_global: Tensor,
+        batch_indices: Tensor,
+        detach_states: bool = False,
+        return_actions: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """Replay final slot-0 actions for arbitrary event/future pairs.
+
+        The reference batch supplies the true future observation.  Only the
+        final selected TTT layer is varied between ``W_i^-`` and ``W_i^+``;
+        all other action-expert computation is shared fixed context.  The two
+        branches use identical deterministic noise and execute the complete
+        configured denoising loop.  This moves long-delay supervision back to
+        event ``i`` without retaining an autograd graph through intervening
+        physical timesteps. ``detach_states`` is used by CMD to cut the event
+        writer graph while retaining gradients through the query/action
+        reader. ``return_actions`` exposes the two slot-0 branches for CMD;
+        the historical default remains the action difference for QH2L.
+        """
+
+        if not trace_collector:
+            raise ValueError("Cross-segment QH2L requires a traced event transition")
+        if not (
+            event_indices.ndim
+            == event_indices_global.ndim
+            == future_indices_global.ndim
+            == batch_indices.ndim
+            == 1
+        ):
+            raise ValueError("CreditTTT pair indices must be one-dimensional")
+        pair_count = int(event_indices.numel())
+        if pair_count == 0:
+            empty = self.model.action_out_proj.weight.new_zeros(
+                (0, self.config.max_action_dim), dtype=torch.float32
+            )
+            return (empty, empty.clone()) if return_actions else empty
+        if not (
+            event_indices_global.numel()
+            == future_indices_global.numel()
+            == batch_indices.numel()
+            == pair_count
+        ):
+            raise ValueError("CreditTTT cross-segment pair fields are misaligned")
+
+        reference_shape = self._v3_reference_sequence_shape(reference_batch)
+        reference_offset = _coerce_sequence_offset(reference_batch.get(SEQUENCE_OFFSET_KEY))
+        future_local = future_indices_global.to(dtype=torch.long) - int(reference_offset)
+        if bool((future_local < 0).any().item()) or bool(
+            (future_local >= reference_shape[1]).any().item()
+        ):
+            raise ValueError(
+                "CreditTTT future query is outside v3_reference_batch; use a complete "
+                "same-episode reference window (no truncated warm-up window)"
+            )
+
+        final_layer_index = max(int(key) for key in trace_collector)
+        final_trace = trace_collector[final_layer_index]
+        before_slices: list[TTTFastState] = []
+        after_slices: list[TTTFastState] = []
+        for event_index, batch_index in zip(
+            event_indices.detach().to(device="cpu").tolist(),
+            batch_indices.detach().to(device="cpu").tolist(),
+            strict=True,
+        ):
+            transition = final_trace.for_timestep(int(event_index))
+            if transition is None:
+                raise ValueError(
+                    f"CreditTTT event {event_index} was not retained in the bounded trace; "
+                    f"captured={final_trace.indices}"
+                )
+            before_slice = self.model._state_batch_slice(
+                transition.state_before, int(batch_index)
+            )
+            after_slice = self.model._state_batch_slice(
+                transition.state_after, int(batch_index)
+            )
+            if detach_states:
+                # CMD is a read-only intervention: no gradient may flow from
+                # its action loss through the event's inner writer update.
+                # Keep the replay itself differentiable so the query/action
+                # reader and shared action tail are still trained.
+                before_slice = before_slice.clone(detach=True, requires_grad=False)
+                after_slice = after_slice.clone(detach=True, requires_grad=False)
+            before_slices.append(before_slice)
+            after_slices.append(after_slice)
+        before_state = self._v3_stack_fast_states(before_slices)
+        after_state = self._v3_stack_fast_states(after_slices)
+
+        # Gather exactly the future observation rows.  Labels and expert
+        # actions are intentionally not passed to the flow replay.
+        frame_batch: dict[str, Tensor] = {}
+        required_fields = (
+            *tuple(self.config.image_features),
+            OBS_STATE,
+            OBS_LANGUAGE_TOKENS,
+            OBS_LANGUAGE_ATTENTION_MASK,
+        )
+        for key in required_fields:
+            if key not in reference_batch:
+                raise KeyError(f"CreditTTT reference batch is missing required field {key!r}")
+            frame_batch[key] = self._v3_gather_reference_rows(
+                reference_batch[key],
+                batch_indices,
+                future_local,
+                reference_shape,
+                name=key,
+            )
+            padding_key = f"{key}_padding_mask"
+            if padding_key in reference_batch:
+                frame_batch[padding_key] = self._v3_gather_reference_rows(
+                    reference_batch[padding_key],
+                    batch_indices,
+                    future_local,
+                    reference_shape,
+                    name=padding_key,
+                )
+
+        images, image_masks = self.prepare_images(frame_batch)
+        state = self.prepare_state(frame_batch)
+        if bool(getattr(self.config, "adapt_to_pi_aloha", False)):
+            state = self._pi_aloha_decode_state(state.clone())
+        language_tokens = frame_batch[OBS_LANGUAGE_TOKENS]
+        language_masks = frame_batch[OBS_LANGUAGE_ATTENTION_MASK]
+
+        # The interaction writer is disabled during the fixed-context read,
+        # but passing the real previous executed action keeps the reference
+        # prefix API identical to deployment and avoids a hidden reset
+        # convention if that input later participates in the read context.
+        previous_local = future_local - 1
+        if bool((previous_local < 0).any().item()):
+            raise ValueError(
+                "CreditTTT reference window does not include the executed action "
+                "immediately preceding a future query"
+            )
+        if ACTION not in reference_batch:
+            raise KeyError("CreditTTT reference batch is missing the action field")
+        previous_raw = self._v3_gather_reference_rows(
+            reference_batch[ACTION],
+            batch_indices,
+            previous_local,
+            reference_shape,
+            name=ACTION,
+        )
+        previous_actions = pad_vector(previous_raw, self.config.max_action_dim)
+        if bool(getattr(self.config, "adapt_to_pi_aloha", False)):
+            previous_actions = self._pi_aloha_encode_actions_inv(previous_actions.clone())
+        if previous_actions.ndim == 2:
+            # A few lightweight/reference datasets store one action vector
+            # per frame instead of an explicit chunk axis.  Treat that vector
+            # as the physically executed slot 0; do not reinterpret its
+            # feature axis as a horizon.
+            previous_actions = previous_actions[:, None, :]
+        if previous_actions.ndim < 3 or previous_actions.shape[1] <= 0:
+            raise ValueError(
+                "CreditTTT reference actions must contain an executed slot-0 action chunk"
+            )
+        previous_slot0 = previous_actions[:, 0]
+
+        # Prefer an explicitly phase-matched per-frame noise artifact when it
+        # exists.  Otherwise use a pair-indexed local CPU generator so the
+        # replay is deterministic, does not perturb the training RNG, and the
+        # before/after branches always receive exactly the same sample.
+        reference_noise = reference_batch.get("hd_noise")
+        if reference_noise is not None:
+            noise = self._v3_gather_reference_rows(
+                reference_noise,
+                batch_indices,
+                future_local,
+                reference_shape,
+                name="hd_noise",
+            ).to(device=state.device, dtype=torch.float32)
+            if noise.ndim == 2:
+                noise = noise[:, None, :].expand(-1, self.config.chunk_size, -1)
+            if noise.ndim != 3 or noise.shape[1] != self.config.chunk_size:
+                raise ValueError(
+                    "CreditTTT hd_noise must have [pair,chunk,action] shape for full-flow replay"
+                )
+            if noise.shape[-1] < self.config.max_action_dim:
+                noise = F.pad(noise, (0, self.config.max_action_dim - noise.shape[-1]))
+            elif noise.shape[-1] > self.config.max_action_dim:
+                noise = noise[..., : self.config.max_action_dim]
+        else:
+            rows: list[Tensor] = []
+            for event_global, future_global, batch_index in zip(
+                event_indices_global.detach().to(device="cpu").tolist(),
+                future_indices_global.detach().to(device="cpu").tolist(),
+                batch_indices.detach().to(device="cpu").tolist(),
+                strict=True,
+            ):
+                seed = (
+                    1_000_003
+                    + int(event_global) * 1_315_423_911
+                    + int(future_global) * 2_654_435_761
+                    + int(batch_index) * 97_531
+                ) % (2**63 - 1)
+                generator = torch.Generator(device="cpu").manual_seed(seed)
+                rows.append(
+                    torch.randn(
+                        self.config.chunk_size,
+                        self.config.max_action_dim,
+                        generator=generator,
+                        dtype=torch.float32,
+                    )
+                )
+            noise = torch.stack(rows, dim=0).to(device=state.device)
+
+        before_action, after_action = self.model.v3_fixed_context_full_flow_replay(
+            images,
+            image_masks,
+            language_tokens,
+            language_masks,
+            state,
+            noise=noise,
+            previous_action=previous_slot0,
+            before_state=before_state,
+            after_state=after_state,
+            query_positions=future_indices_global,
+            final_layer_index=final_layer_index,
+        )
+        if return_actions:
+            return before_action, after_action
+        return after_action - before_action
+
+    def _v3_qh2l_loss(
+        self,
+        pair_labels: dict[str, Tensor] | None,
+        *,
+        trace_collector: dict[int, TTTBoundedTrace],
+        final_hidden_collector: dict[int, Tensor],
+        trace_indices: Sequence[int],
+        reference_batch: Mapping[str, object] | None = None,
+        normalizers: Mapping[str, Tensor | float] | None = None,
+    ) -> tuple[Tensor, dict[str, float]]:
+        """Compute the CreditTTT query-conditioned local effect objective.
+
+        With a complete ``reference_batch`` the student effect is evaluated
+        by :meth:`_v3_reference_student_effects`: event states are taken from
+        the current segment, while future observations are gathered from the
+        complete episode window and replayed through the configured denoising
+        flow.  The legacy bounded-trace path remains available when no
+        reference batch is supplied (and is used by focused unit tests).
+        """
+
+        if pair_labels is None:
+            zero = self.model.action_out_proj.weight.sum() * 0.0
+            return zero, {
+                "hd_v3_qh2l": 0.0,
+                "hd_v3_pairs": 0.0,
+                "hd_v3_pairs_skipped": 0.0,
+            }
+        valid = pair_labels["valid"]
+        total_rows = int(pair_labels["total_rows"].item())
+        valid_count = int(valid.sum().item())
+        skipped = max(total_rows - valid_count, 0)
+        if valid_count == 0:
+            zero = self.model.action_out_proj.weight.sum() * 0.0
+            return zero, {
+                "hd_v3_qh2l": 0.0,
+                "hd_v3_pairs": 0.0,
+                "hd_v3_pairs_skipped": float(skipped),
+            }
+        indices = valid.nonzero(as_tuple=False).flatten()
+        selected_event = pair_labels["event_index"].index_select(0, indices)
+        selected_batch = pair_labels["batch_index"].index_select(0, indices)
+        if reference_batch is not None:
+            if "event_index_global" not in pair_labels or "future_index_global" not in pair_labels:
+                raise ValueError(
+                    "Cross-segment CreditTTT replay requires global event/future indices; "
+                    "regenerate labels with the V3 pair schema"
+                )
+            student_effect = self._v3_reference_student_effects(
+                reference_batch=reference_batch,
+                trace_collector=trace_collector,
+                event_indices=selected_event,
+                event_indices_global=pair_labels["event_index_global"].index_select(0, indices),
+                future_indices_global=pair_labels["future_index_global"].index_select(0, indices),
+                batch_indices=selected_batch,
+            )
+            replay_cross_count = int(pair_labels.get("cross_segment", torch.zeros_like(valid))[indices].sum().item())
+        else:
+            student_effect = self.model.v3_local_effects_from_trace(
+                trace_collector,
+                final_hidden_collector,
+                trace_indices,
+                selected_event,
+                pair_labels["future_index"].index_select(0, indices),
+                selected_batch,
+            )
+            replay_cross_count = 0
+        teacher_effect = pair_labels["teacher_effect"].index_select(0, indices)
+        utility = pair_labels["utility"].index_select(0, indices)
+        positive = pair_labels["positive"].index_select(0, indices)
+        null = pair_labels["null"].index_select(0, indices)
+        # A pair may be marked neither positive nor null by a custom artifact;
+        # such rows are intentionally ignored instead of inventing a target.
+        active = positive | null
+        student_effect = student_effect[active]
+        teacher_effect = teacher_effect[active]
+        utility = utility[active]
+        positive = positive[active]
+        null = null[active]
+        if student_effect.numel() == 0:
+            zero = self.model.action_out_proj.weight.sum() * 0.0
+            return zero, {
+                "hd_v3_qh2l": 0.0,
+                "hd_v3_pairs": 0.0,
+                "hd_v3_pairs_skipped": float(skipped),
+            }
+        active_dim = self._hd_active_action_dim(student_effect, teacher_effect)
+        student_effect = student_effect[..., :active_dim]
+        teacher_effect = teacher_effect[..., :active_dim]
+        breakdown = query_conditioned_local_effect_loss(
+            torch.zeros_like(student_effect),
+            student_effect,
+            teacher_effect,
+            utility=utility,
+            positive_mask=positive,
+            null_mask=null,
+            valid_mask=torch.ones_like(positive),
+            # Per-row null sampling weights are intentionally uniform; the
+            # protocol coefficient is applied once via ``null_loss_weight``
+            # after complete-window normalization.
+            null_weight=1.0,
+            positive_denominator=(None if normalizers is None else normalizers.get("positive")),
+            null_denominator=(None if normalizers is None else normalizers.get("null")),
+            null_loss_weight=float(getattr(self.config, "hd_v3_null_weight", 0.25)),
+            relative=True,
+            return_components=True,
+        )
+        metrics = {
+            "hd_v3_qh2l": float(breakdown.total.detach().item()),
+            "hd_v3_qh2l_positive": float(breakdown.positive.detach().item()),
+            "hd_v3_qh2l_null": float(breakdown.null.detach().item()),
+            "hd_v3_pairs": float(student_effect.shape[0]),
+            "hd_v3_positive_pairs": float(positive.sum().item()),
+            "hd_v3_null_pairs": float(null.sum().item()),
+            "hd_v3_pairs_skipped": float(skipped),
+            "hd_v3_cross_segment_pairs": float(replay_cross_count),
+            "hd_v3_delay_mean": float(
+                pair_labels["delay"].index_select(0, indices)[active].float().mean().item()
+            ),
+            "hd_v3_teacher_effect_rms": float(teacher_effect.detach().square().mean().sqrt().item()),
+            "hd_v3_student_effect_rms": float(student_effect.detach().square().mean().sqrt().item()),
+        }
+        return breakdown.total, metrics
+
+    def _v3_cmd_loss(
+        self,
+        pair_labels: dict[str, Tensor] | None,
+        *,
+        trace_collector: dict[int, TTTBoundedTrace],
+        reference_batch: Mapping[str, object] | None = None,
+        normalizers: Mapping[str, Tensor | float] | None = None,
+    ) -> tuple[Tensor, dict[str, float]]:
+        """Apply the reader-side Causal Memory Deployment (CMD) objective.
+
+        QH2L and CMD deliberately use the same event snapshots but have
+        different gradient contracts.  QH2L calls
+        :meth:`_v3_reference_student_effects` with its writer-connected
+        states; CMD requests the paired full-flow actions with detached event
+        states, so its gradients train only the query/action reader and the
+        shared action tail.  This separation is what makes the intervention
+        a reader diagnostic rather than a second, hidden writer loss.
+
+        Older pair artifacts do not contain the three action columns required
+        by CMD.  In that case (or when a caller intentionally exercises the
+        bounded-trace unit-test path without a reference window) the method is
+        an explicit no-op and reports zero coverage instead of silently
+        substituting a velocity target.
+        """
+
+        zero = self.model.action_out_proj.weight.sum() * 0.0
+        metrics: dict[str, float] = {
+            "hd_v3_cmd": 0.0,
+            "hd_v3_cmd_pairs": 0.0,
+            "hd_v3_cmd_pairs_skipped": 0.0,
+        }
+        if pair_labels is None:
+            return zero, metrics
+        cmd_weight = float(getattr(self.config, "hd_v3_cmd_weight", 0.0))
+        if cmd_weight <= 0.0:
+            metrics["hd_v3_cmd_disabled"] = 1.0
+            return zero, metrics
+        required = ("teacher_full_action", "teacher_wrong_action", "expert_action")
+        if any(name not in pair_labels for name in required):
+            # The canonical builder emits these fields, but retaining a
+            # backward-compatible no-op is useful for QH2L-only ablations.
+            metrics["hd_v3_cmd_missing_targets"] = 1.0
+            return zero, metrics
+        if reference_batch is None:
+            # Full-flow reader actions cannot be reconstructed from the old
+            # local trace alone.  Refuse to call a velocity/probe fallback:
+            # this keeps the CMD target semantics auditable.
+            metrics["hd_v3_cmd_no_reference"] = 1.0
+            return zero, metrics
+
+        valid = pair_labels["valid"].bool()
+        target_full = pair_labels["teacher_full_action"]
+        target_wrong = pair_labels["teacher_wrong_action"]
+        target_expert = pair_labels["expert_action"]
+        finite_targets = (
+            torch.isfinite(target_full).all(dim=-1)
+            & torch.isfinite(target_wrong).all(dim=-1)
+            & torch.isfinite(target_expert).all(dim=-1)
+        )
+        selected_mask = valid & finite_targets
+        indices = selected_mask.nonzero(as_tuple=False).flatten()
+        metrics["hd_v3_cmd_pairs_skipped"] = float(
+            max(int(valid.sum().item()) - int(indices.numel()), 0)
+        )
+        if indices.numel() == 0:
+            return zero, metrics
+
+        selected_event = pair_labels["event_index"].index_select(0, indices)
+        selected_batch = pair_labels["batch_index"].index_select(0, indices)
+        selected_event_global = pair_labels["event_index_global"].index_select(0, indices)
+        selected_future_global = pair_labels["future_index_global"].index_select(0, indices)
+
+        # ``detach_states=True`` is the key CMD contract.  The replay remains
+        # differentiable with respect to model parameters used after the
+        # memory read, but no gradient can travel through event i's writer.
+        before_action, after_action = self._v3_reference_student_effects(
+            reference_batch=reference_batch,
+            trace_collector=trace_collector,
+            event_indices=selected_event,
+            event_indices_global=selected_event_global,
+            future_indices_global=selected_future_global,
+            batch_indices=selected_batch,
+            detach_states=True,
+            return_actions=True,
+        )
+        if not isinstance(before_action, Tensor) or not isinstance(after_action, Tensor):
+            raise RuntimeError("CreditTTT CMD replay did not return paired action tensors")
+
+        teacher_full = target_full.index_select(0, indices).to(
+            device=after_action.device, dtype=after_action.dtype
+        )
+        teacher_wrong = target_wrong.index_select(0, indices).to(
+            device=after_action.device, dtype=after_action.dtype
+        )
+        expert = target_expert.index_select(0, indices).to(
+            device=after_action.device, dtype=after_action.dtype
+        )
+        teacher_effect = pair_labels["teacher_effect"].index_select(0, indices).to(
+            device=after_action.device, dtype=after_action.dtype
+        )
+        utility = pair_labels["utility"].index_select(0, indices).to(
+            device=after_action.device, dtype=after_action.dtype
+        )
+        positive = pair_labels["positive"].index_select(0, indices).to(device=after_action.device)
+        null = pair_labels["null"].index_select(0, indices).to(device=after_action.device)
+
+        active_dim = self._hd_active_action_dim(after_action, teacher_full)
+        before_action = before_action[..., :active_dim]
+        after_action = after_action[..., :active_dim]
+        teacher_full = teacher_full[..., :active_dim]
+        teacher_wrong = teacher_wrong[..., :active_dim]
+        expert = expert[..., :active_dim]
+        teacher_effect = teacher_effect[..., :active_dim]
+
+        breakdown = causal_memory_deployment_loss(
+            after_action,
+            before_action,
+            teacher_full_action=teacher_full,
+            teacher_wrong_action=teacher_wrong,
+            teacher_effect=teacher_effect,
+            expert_action=expert,
+            utility=utility,
+            positive_mask=positive,
+            null_mask=null,
+            valid_mask=torch.ones_like(positive, dtype=torch.bool),
+            margin=float(getattr(self.config, "hd_v3_cmd_margin", 0.05)),
+            null_weight=float(getattr(self.config, "hd_v3_null_weight", 0.25)),
+            full_denominator=(None if normalizers is None else normalizers.get("full")),
+            positive_denominator=(None if normalizers is None else normalizers.get("positive")),
+            null_denominator=(None if normalizers is None else normalizers.get("null")),
+            return_components=True,
+        )
+        metrics.update(
+            {
+                "hd_v3_cmd": float(breakdown.total.detach().item()),
+                "hd_v3_cmd_full": float(breakdown.full.detach().item()),
+                "hd_v3_cmd_effect": float(breakdown.effect.detach().item()),
+                "hd_v3_cmd_rank": float(breakdown.rank.detach().item()),
+                "hd_v3_cmd_null": float(breakdown.null.detach().item()),
+                "hd_v3_cmd_pairs": float(indices.numel()),
+                "hd_v3_cmd_cross_segment_pairs": float(
+                    pair_labels.get("cross_segment", torch.zeros_like(valid))
+                    .index_select(0, indices)
+                    .sum()
+                    .item()
+                ),
+            }
+        )
+        return breakdown.total, metrics
 
     @staticmethod
     def _hd_align_velocity_field(value: Tensor, target: Tensor, *, name: str) -> Tensor:
@@ -1936,6 +2897,9 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         flow_loss_weight: float | Tensor | None = None,
         hd_normalization_denominator: float | Tensor | None = None,
         effect_normalization_floor: float | Tensor | None = None,
+        sequence_offset: int = 0,
+        v3_reference_batch: dict[str, Tensor] | None = None,
+        previous_action_at_start: Tensor | None = None,
     ) -> tuple[Tensor, dict, TTTFastStates]:
         """Train one contiguous TBPTT segment and return its numerical fast state.
 
@@ -1955,8 +2919,24 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         does not depend on where TBPTT is split.  Keeping these factors
         separate makes the objective independent of the chosen TBPTT segment
         length; omitted values preserve the historical local-mean behavior.
+        ``sequence_offset`` identifies the first physical frame of this
+        segment inside the episode-local V3 label coordinate system.  When it
+        is omitted, the value carried by ``SEQUENCE_OFFSET_KEY`` is used.  The
+        optional ``v3_reference_batch`` is reserved for the cross-segment
+        pair replay path; the current bounded trace path uses pairs whose
+        event and future query both occur in the active segment.
+        ``previous_action_at_start`` optionally supplies the executed slot-0
+        action immediately preceding this segment.  When omitted, the policy
+        carries it from the preceding segment; a ``None``/empty fast-state
+        mapping is the explicit new-sequence marker and resets it to zero.
+        The carry is detached, so it does not extend the TBPTT graph or the
+        serialized fast-weight state.
         """
         batch_size, sequence_length = sequence_shape
+        if sequence_offset is None:
+            sequence_offset = _coerce_sequence_offset(batch.get(SEQUENCE_OFFSET_KEY))
+        else:
+            sequence_offset = _coerce_sequence_offset(sequence_offset)
         expected_flat_batch = batch_size * sequence_length
         if batch[ACTION].shape[0] != expected_flat_batch:
             raise ValueError(
@@ -1985,12 +2965,49 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         actions = self.prepare_action(batch)
+        previous_actions = None
+        previous_slot0 = None
+        if bool(getattr(self.config, "hd_v3_include_previous_action", False)):
+            # Each dataset row contains the action chunk beginning at the
+            # current physical frame.  Shift slot-0 by one frame to obtain the
+            # action that was actually executed immediately before the
+            # current observation.  At a TBPTT boundary, row zero receives an
+            # explicit predecessor or the detached carry from the preceding
+            # segment.  A fresh sequence uses the deployment reset value zero.
+            action_sequence = actions.reshape(batch_size, sequence_length, *actions.shape[1:])
+            previous_slot0 = action_sequence[:, :, 0, :]
+            previous_actions = torch.zeros_like(previous_slot0)
+            sequence_starts = fast_states is None or len(fast_states) == 0
+            boundary_previous = self._coerce_previous_action_at_start(
+                previous_action_at_start,
+                batch_size=batch_size,
+                action_dim=previous_slot0.shape[-1],
+                device=previous_slot0.device,
+                dtype=previous_slot0.dtype,
+            )
+            if boundary_previous is None and not sequence_starts:
+                boundary_previous = self._coerce_previous_action_at_start(
+                    getattr(self, "_v3_previous_action_carry", None),
+                    batch_size=batch_size,
+                    action_dim=previous_slot0.shape[-1],
+                    device=previous_slot0.device,
+                    dtype=previous_slot0.dtype,
+                )
+            if boundary_previous is not None:
+                previous_actions[:, 0, :] = boundary_previous
+            if sequence_length > 1:
+                previous_actions[:, 1:] = previous_slot0[:, :-1]
         # ``hd_ttt_enabled`` is an architecture/deployment switch, while
         # ``hd_labels_present`` only indicates that this training batch carries
         # hindsight teacher fields.  Keeping them separate is essential:
         # an HD checkpoint must use its learned local gate at deployment even
         # though no offline labels are available then.
         hd_enabled = bool(getattr(self.config, "hd_ttt_enabled", False))
+        credit_v3 = bool(
+            hd_enabled
+            and getattr(self.config, "hd_attribution_protocol", "")
+            == "credit_ttt_v3_query_effect"
+        )
         # Keep compatibility with older artifacts that only contain projected
         # local K/V or counterfactual columns; phase/teacher fields are checked
         # independently below when they are actually consumed.
@@ -2001,6 +3018,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # the historical compute/loss path.
         effect_labels_present = bool(
             hd_enabled
+            and not credit_v3
             and float(getattr(self.config, "hd_effect_weight", 0.0)) > 0.0
             and batch.get("hd_teacher_effect") is not None
             and (
@@ -2014,6 +3032,70 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 "the writer-connected effect gradient is a meta-gradient through the inner update. "
                 "Set hd_effect_weight=0 for a first-order/no-effect ablation."
             )
+        # V3 keeps pairwise event/future labels in their native form.  Build
+        # the sparse trace request before the main flow pass so the selected
+        # state transitions stay connected to the writer's higher-order graph.
+        v3_pair_labels = (
+            self._prepare_v3_pair_labels(
+                batch,
+                sequence_shape,
+                sequence_offset=sequence_offset,
+                allow_cross_segment=v3_reference_batch is not None,
+            )
+            if credit_v3
+            else None
+        )
+        v3_pair_normalizers: dict[str, Tensor] | None = None
+        if v3_pair_labels is not None:
+            # Compute denominators from the complete episode/window whenever
+            # the trainer supplied one.  Segment-local labels are still used
+            # for the actual replay, but their numerators now add up to one
+            # invariant objective regardless of TBPTT partitioning.
+            normalization_labels = v3_pair_labels
+            if v3_reference_batch is not None:
+                reference_shape = self._v3_reference_sequence_shape(v3_reference_batch)
+                reference_offset = _coerce_sequence_offset(
+                    v3_reference_batch.get(SEQUENCE_OFFSET_KEY)
+                )
+                normalization_labels = self._prepare_v3_pair_labels(
+                    v3_reference_batch,
+                    reference_shape,
+                    sequence_offset=reference_offset,
+                    allow_cross_segment=True,
+                )
+            v3_pair_normalizers = self._v3_pair_normalizers(normalization_labels)
+        v3_trace_indices: tuple[int, ...] = ()
+        v3_trace_layer_indices: tuple[int, ...] | None = None
+        v3_trace_collector: dict[int, TTTBoundedTrace] = {}
+        v3_final_hidden_collector: dict[int, Tensor] = {}
+        if v3_pair_labels is not None:
+            valid_rows = v3_pair_labels["valid"]
+            if bool(valid_rows.any().item()):
+                selected = valid_rows.nonzero(as_tuple=False).flatten()
+                selected_events = v3_pair_labels["event_index"].index_select(0, selected)
+                selected_futures = v3_pair_labels["future_index"].index_select(0, selected)
+                # Every supervised event is in the active segment.  A future
+                # row is traced only when it is local; cross-segment futures
+                # are gathered from ``v3_reference_batch`` and replayed by a
+                # separate full-flow adapter.
+                local_future_mask = (
+                    (selected_futures >= 0) & (selected_futures < sequence_length)
+                )
+                selected_values = torch.cat(
+                    (selected_events, selected_futures[local_future_mask])
+                )
+                v3_trace_indices = tuple(
+                    sorted(set(int(value) for value in selected_values.detach().cpu().tolist()))
+                )
+                # QH2L reads the shared action tail at the final selected TTT
+                # layer.  Keep only that layer's before/after states in the
+                # production trace; tracing earlier layers would duplicate
+                # the largest tensors without changing the V3 objective.
+                model_ttt_layers = getattr(self.model, "ttt_layers", None)
+                if model_ttt_layers:
+                    v3_trace_layer_indices = (
+                        max(int(key) for key in model_ttt_layers.keys()),
+                    )
         # A hindsight collector may store the exact flow phase/noise used by
         # its causal teacher.  Reusing them makes HCA distillation phase
         # matched; ordinary TTT batches continue to sample fresh values.
@@ -2107,7 +3189,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         if grounding_states is not None:
             grounding_states.setdefault("true", None)
             grounding_states.setdefault("wrong", None)
-            if effect_labels_present:
+            if effect_labels_present and not credit_v3:
                 grounding_states.setdefault("effect_true", None)
                 grounding_states.setdefault("effect_wrong", None)
         if hd_enabled:
@@ -2139,10 +3221,17 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 sequence_shape=sequence_shape,
                 fast_states=fast_states,
                 write_gate=writer_gate_override,
+                previous_actions=previous_actions,
                 return_velocity=True,
                 return_local_loss=hd_labels_present,
                 use_learned_write_gate=learned_write_gate,
                 return_write_gate=learned_write_gate,
+                trace_indices=v3_trace_indices if credit_v3 else None,
+                trace_collector=v3_trace_collector if credit_v3 else None,
+                final_query_hidden_collector=(
+                    v3_final_hidden_collector if credit_v3 else None
+                ),
+                trace_layer_indices=v3_trace_layer_indices if credit_v3 else None,
             )
             if hd_labels_present and learned_write_gate:
                 student_velocity, fast_states, local_ttt_loss, predicted_write_gate = forward_result
@@ -2236,6 +3325,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     fast_states=effect_wrong_initial,
                     create_graph=True,
                     write_gate=effect_gate,
+                    previous_actions=previous_actions,
                     detach_writer=False,
                     return_velocity=True,
                     use_learned_write_gate=False,
@@ -2260,6 +3350,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             # clearly isolated ablation.
             has_grounding_labels = (
                 not effect_labels_present
+                and not credit_v3
                 and float(getattr(self.config, "hd_grounding_weight", 1.0)) > 0.0
                 and wrong_gate is not None
                 and batch.get("hd_teacher_true_velocity") is not None
@@ -2301,6 +3392,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     # reader/action path, not compare a gated student branch
                     # against an all-write teacher target.
                     write_gate=None,
+                    previous_actions=previous_actions,
                     detach_writer=True,
                     return_velocity=True,
                     use_learned_write_gate=False,
@@ -2336,6 +3428,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     fast_states=wrong_initial_states,
                     create_graph=False,
                     write_gate=wrong_gate,
+                    previous_actions=previous_actions,
                     detach_writer=True,
                     return_velocity=True,
                     # ``wrong_gate`` is the explicit offline intervention;
@@ -2348,19 +3441,64 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                         layer_index: state.detach(requires_grad=False)
                         for layer_index, state in wrong_branch_next_states.items()
                     }
-            hd_aux_loss, hd_metrics = self._hd_auxiliary_losses(
-                batch,
-                sequence_shape,
-                student_velocity=student_velocity,
-                wrong_student_velocity=wrong_student_velocity,
-                grounding_student_velocity=grounding_student_velocity,
-                effect_student_true=effect_student_true,
-                effect_student_wrong=effect_student_wrong,
-                local_ttt_loss=local_ttt_loss,
-                predicted_write_gate=predicted_write_gate,
-                normalization_denominator=hd_normalization_denominator,
-                effect_normalization_floor=effect_normalization_floor,
-            )
+            if credit_v3:
+                # CreditTTT deliberately does not route through the legacy
+                # per-frame HCA/weighted-KVB objective.  Its only hindsight
+                # signal is the pairwise query-conditioned effect; a tiny,
+                # fixed K/V reconstruction term keeps the recurrent update
+                # numerically anchored without becoming the method's target.
+                qh2l_loss, v3_metrics = self._v3_qh2l_loss(
+                    v3_pair_labels,
+                    trace_collector=v3_trace_collector,
+                    final_hidden_collector=v3_final_hidden_collector,
+                    trace_indices=v3_trace_indices,
+                    reference_batch=v3_reference_batch,
+                    normalizers=v3_pair_normalizers,
+                )
+                # CMD is a reader/action objective over the same event/future
+                # pairs.  Its replay detaches the event snapshots internally,
+                # so adding it here cannot steal the writer meta-gradient that
+                # QH2L receives above.
+                cmd_loss, cmd_metrics = self._v3_cmd_loss(
+                    v3_pair_labels,
+                    trace_collector=v3_trace_collector,
+                    reference_batch=v3_reference_batch,
+                    normalizers=v3_pair_normalizers,
+                )
+                bind_loss = (
+                    local_ttt_loss.sum()
+                    / torch.as_tensor(
+                        hd_normalization_denominator,
+                        device=local_ttt_loss.device,
+                        dtype=local_ttt_loss.dtype,
+                    ).clamp_min(1.0)
+                    if local_ttt_loss is not None and hd_normalization_denominator is not None
+                    else local_ttt_loss.mean()
+                    if local_ttt_loss is not None
+                    else student_velocity.sum() * 0.0
+                )
+                hd_aux_loss = (
+                    float(getattr(self.config, "hd_v3_local_weight", 1.0)) * qh2l_loss
+                    + float(getattr(self.config, "hd_v3_cmd_weight", 1.0)) * cmd_loss
+                    + 0.01 * bind_loss
+                )
+                hd_metrics = dict(v3_metrics)
+                hd_metrics.update(cmd_metrics)
+                hd_metrics["hd_v3_kvb_anchor"] = float(bind_loss.detach().item())
+            else:
+                hd_aux_loss, hd_metrics = self._hd_auxiliary_losses(
+                    batch,
+                    sequence_shape,
+                    student_velocity=student_velocity,
+                    wrong_student_velocity=wrong_student_velocity,
+                    grounding_student_velocity=grounding_student_velocity,
+                    effect_student_true=effect_student_true,
+                    effect_student_wrong=effect_student_wrong,
+                    local_ttt_loss=local_ttt_loss,
+                    predicted_write_gate=predicted_write_gate,
+                    normalization_denominator=hd_normalization_denominator,
+                    effect_normalization_floor=effect_normalization_floor,
+                )
         else:
             losses, fast_states = self.model.forward_with_state(
                 images,
@@ -2373,9 +3511,19 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 time,
                 sequence_shape=sequence_shape,
                 fast_states=fast_states,
+                previous_actions=previous_actions,
             )
             hd_aux_loss = losses.new_zeros(())
             hd_metrics = {}
+
+        if previous_slot0 is not None:
+            # Carry only a numerical teacher-forced predecessor into the next
+            # TBPTT segment.  The writer update itself remains differentiable
+            # inside this segment, while truncation at the segment boundary is
+            # explicit and matches the detached fast-state carry in the
+            # trainer.  A subsequent call with ``fast_states=None`` ignores
+            # this value and starts a new sequence from the zero convention.
+            self._v3_previous_action_carry = previous_slot0[:, -1, :].detach()
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         actions_is_pad = batch.get("action_is_pad")
@@ -2468,12 +3616,17 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 "use TailPreservingSequenceDataset and sequence_collate_fn"
             )
         sequence_shape = tuple(int(value) for value in batch[SEQUENCE_SHAPE_KEY])
+        # Pair labels are indexed in episode-local coordinates.  The sequence
+        # sampler carries the origin through the generic preprocessor; use it
+        # for the unsliced forward path as well as the explicit TBPTT trainer.
+        sequence_offset = _coerce_sequence_offset(batch.get(SEQUENCE_OFFSET_KEY))
         loss, loss_dict, _ = self.forward_sequence_segment(
             batch,
             sequence_shape=sequence_shape,
             reduction=reduction,
             noise=noise,
             time=time,
+            sequence_offset=sequence_offset,
         )
         return loss, loss_dict
 
@@ -2671,6 +3824,19 @@ class SmolVLATTTFlowMatching(nn.Module):
             nn.init.xavier_uniform_(self.prefix_writer_proj.weight)
         else:
             self.prefix_writer_proj = None
+        # CreditTTT's writer may consume the previously executed slot-0 action
+        # as one additional causal interaction token.  Keep this projection
+        # absent for all legacy/clean checkpoints so their parameter schema and
+        # numerical path remain unchanged.
+        if bool(getattr(config, "hd_v3_include_previous_action", False)):
+            self.previous_action_proj: nn.Linear | None = nn.Linear(
+                self.config.max_action_dim,
+                self.vlm_with_expert.expert_hidden_size,
+                bias=False,
+            )
+            nn.init.xavier_uniform_(self.previous_action_proj.weight)
+        else:
+            self.previous_action_proj = None
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
 
@@ -2766,6 +3932,8 @@ class SmolVLATTTFlowMatching(nn.Module):
             and self.prefix_writer_proj is not None
         ):
             self.prefix_writer_proj.requires_grad_(True)
+        if self.previous_action_proj is not None:
+            self.previous_action_proj.requires_grad_(True)
         for layer in self.ttt_layers.values():
             layer.gate.requires_grad_(self.config.trains_gate)
 
@@ -2816,6 +3984,8 @@ class SmolVLATTTFlowMatching(nn.Module):
             self.prefix_writer_proj.train(
                 mode and getattr(self.config, "ttt_writer_mode", "suffix") == "prefix_only"
             )
+        if self.previous_action_proj is not None:
+            self.previous_action_proj.train(mode)
         self.ttt_layers.train(mode)
         return self
 
@@ -2832,6 +4002,10 @@ class SmolVLATTTFlowMatching(nn.Module):
         local_loss_accumulator: list[Tensor] | None = None,
         use_learned_write_gate: bool = False,
         write_gate_accumulator: list[Tensor] | None = None,
+        trace_indices: int | Tensor | tuple[int, ...] | list[int] | None = None,
+        trace_collector: dict[int, TTTBoundedTrace] | None = None,
+        final_query_hidden_collector: dict[int, Tensor] | None = None,
+        trace_layer_indices: int | Tensor | Sequence[int] | None = None,
     ):
         """Build an expert callback, optionally collecting H2L writer losses.
 
@@ -2839,10 +4013,70 @@ class SmolVLATTTFlowMatching(nn.Module):
         keeps its original output/state API.  When enabled, each selected TTT
         layer appends a ``[B,T]`` raw inner K/V loss to
         ``local_loss_accumulator``; :meth:`forward_with_state` averages these
-        layer-wise losses before returning them.
+        layer-wise losses before returning them.  ``trace_layer_indices`` is an
+        optional memory guard for bounded V3 traces: when supplied, only the
+        listed TTT layers receive the sparse state snapshots.  The default
+        ``None`` keeps the diagnostic behavior of tracing every selected layer.
         """
         batch_size, sequence_length = sequence_shape
         writer_mode = getattr(getattr(self, "config", None), "ttt_writer_mode", "suffix")
+        selected_trace_indices: tuple[int, ...] = ()
+        if trace_indices is not None:
+            if isinstance(trace_indices, Tensor):
+                if trace_indices.ndim == 0:
+                    raw_indices = [int(trace_indices.detach().item())]
+                elif trace_indices.ndim == 1:
+                    raw_indices = [
+                        int(value) for value in trace_indices.detach().to(device="cpu").tolist()
+                    ]
+                else:
+                    raise ValueError("trace_indices tensor must be scalar or one-dimensional")
+            elif isinstance(trace_indices, int):
+                raw_indices = [trace_indices]
+            else:
+                raw_indices = [int(value) for value in trace_indices]
+            if any(index < 0 or index >= sequence_length for index in raw_indices):
+                raise ValueError(
+                    f"trace_indices must lie in [0, {sequence_length}), got {raw_indices}"
+                )
+            selected_trace_indices = tuple(sorted(set(raw_indices)))
+
+        # A fast-weight state is considerably larger than the query hidden
+        # itself.  V3's local effect is defined at ``effect_layer`` (the
+        # final selected TTT layer), so its production path requests a
+        # single trace layer and avoids duplicating full states for every
+        # selected layer.  ``None`` intentionally retains the generic
+        # callback behavior (trace every selected layer) for diagnostics and
+        # backwards-compatible callers.
+        selected_trace_layers: frozenset[int] | None
+        if trace_layer_indices is None:
+            selected_trace_layers = None
+        elif isinstance(trace_layer_indices, int):
+            selected_trace_layers = frozenset((trace_layer_indices,))
+        elif isinstance(trace_layer_indices, Tensor):
+            if trace_layer_indices.ndim == 0:
+                layer_values = [int(trace_layer_indices.detach().item())]
+            elif trace_layer_indices.ndim == 1:
+                layer_values = [
+                    int(value)
+                    for value in trace_layer_indices.detach().to(device="cpu").tolist()
+                ]
+            else:
+                raise ValueError("trace_layer_indices tensor must be scalar or one-dimensional")
+            selected_trace_layers = frozenset(layer_values)
+        else:
+            try:
+                selected_trace_layers = frozenset(int(index) for index in trace_layer_indices)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("trace_layer_indices must be an integer or a sequence of integers") from exc
+        if selected_trace_layers is not None:
+            known_layers = {int(key) for key in self.ttt_layers.keys()}
+            unknown_layers = selected_trace_layers - known_layers
+            if unknown_layers:
+                raise ValueError(
+                    "trace_layer_indices contain unselected/nonexistent TTT layers: "
+                    f"{sorted(unknown_layers)}; available={sorted(known_layers)}"
+                )
 
         # The learned gate is deliberately shared by all selected layers.  A
         # closure-local cache ensures the first selected layer computes one
@@ -2851,6 +4085,9 @@ class SmolVLATTTFlowMatching(nn.Module):
         gate_context: Tensor | None = None
         writer_inputs: Tensor | None = None
         writer_mask: Tensor | None = None
+        final_ttt_layer_index = (
+            max(int(key) for key in self.ttt_layers.keys()) if self.ttt_layers else None
+        )
 
         def set_gate_context(context: Tensor) -> None:
             nonlocal gate_context
@@ -2878,6 +4115,82 @@ class SmolVLATTTFlowMatching(nn.Module):
             else:
                 writer_mask = None
             writer_inputs = inputs
+
+        def set_trace_context(
+            indices: int | Tensor | tuple[int, ...] | list[int] | None,
+            collector: dict[int, TTTBoundedTrace] | None = None,
+            final_collector: dict[int, Tensor] | None = None,
+            trace_layer_indices: int | Tensor | Sequence[int] | None = None,
+        ) -> None:
+            """Set sparse trace sinks/filter after callback construction.
+
+            The first three arguments intentionally mirror the original
+            setter.  ``trace_layer_indices`` is optional so an older caller
+            can continue to pass only ``(indices, collector, final_collector)``.
+            """
+
+            nonlocal selected_trace_indices, trace_collector, final_query_hidden_collector, selected_trace_layers
+            if indices is None:
+                return
+            if isinstance(indices, Tensor):
+                if indices.ndim == 0:
+                    raw = [int(indices.detach().item())]
+                elif indices.ndim == 1:
+                    raw = [int(value) for value in indices.detach().to(device="cpu").tolist()]
+                else:
+                    raise ValueError("trace_indices tensor must be scalar or one-dimensional")
+            elif isinstance(indices, int):
+                raw = [indices]
+            else:
+                raw = [int(value) for value in indices]
+            if any(index < 0 or index >= sequence_length for index in raw):
+                raise ValueError(
+                    f"trace_indices must lie in [0, {sequence_length}), got {raw}"
+                )
+            selected_trace_indices = tuple(sorted(set(raw)))
+            if collector is not None:
+                trace_collector = collector
+            if final_collector is not None:
+                final_query_hidden_collector = final_collector
+            if trace_layer_indices is not None:
+                if isinstance(trace_layer_indices, int):
+                    selected_trace_layers = frozenset((trace_layer_indices,))
+                elif isinstance(trace_layer_indices, Tensor):
+                    if trace_layer_indices.ndim == 0:
+                        layer_values = [int(trace_layer_indices.detach().item())]
+                    elif trace_layer_indices.ndim == 1:
+                        layer_values = [
+                            int(value)
+                            for value in trace_layer_indices.detach().to(device="cpu").tolist()
+                        ]
+                    else:
+                        raise ValueError(
+                            "trace_layer_indices tensor must be scalar or one-dimensional"
+                        )
+                    selected_trace_layers = frozenset(layer_values)
+                else:
+                    try:
+                        selected_trace_layers = frozenset(
+                            int(index) for index in trace_layer_indices
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            "trace_layer_indices must be an integer or a sequence of integers"
+                        ) from exc
+                known_layers = {int(key) for key in self.ttt_layers.keys()}
+                unknown_layers = selected_trace_layers - known_layers
+                if unknown_layers:
+                    raise ValueError(
+                        "trace_layer_indices contain unselected/nonexistent TTT layers: "
+                        f"{sorted(unknown_layers)}; available={sorted(known_layers)}"
+                    )
+            # Keep the introspection attributes in sync when a caller injects
+            # a collector after factory creation (the closure itself already
+            # sees the updated nonlocal values).
+            apply_ttt.trace_indices = selected_trace_indices
+            apply_ttt.trace_collector = trace_collector
+            apply_ttt.final_query_hidden_collector = final_query_hidden_collector
+            apply_ttt.trace_layer_indices = selected_trace_layers
 
         def apply_ttt(layer_index: int, hidden_states: Tensor) -> Tensor:
             nonlocal predicted_write_gate
@@ -2929,6 +4242,11 @@ class SmolVLATTTFlowMatching(nn.Module):
                 raise RuntimeError(
                     "ttt_writer_mode='prefix_only' requires set_writer_inputs() before the expert callback"
                 )
+            capture_layer_trace = (
+                bool(selected_trace_indices)
+                and (selected_trace_layers is None or layer_index in selected_trace_layers)
+            )
+            layer_trace: list[TTTStateTransition] = []
             layer_output = self.ttt_layers[layer_key](
                 sequence,
                 fast_states.get(layer_index),
@@ -2956,6 +4274,8 @@ class SmolVLATTTFlowMatching(nn.Module):
                 write_gate=layer_write_gate,
                 detach_writer=detach_writer,
                 return_local_loss=return_local_loss,
+                trace_indices=selected_trace_indices if capture_layer_trace else None,
+                trace_sink=layer_trace if capture_layer_trace else None,
             )
             if return_local_loss:
                 sequence, next_state, local_loss = layer_output
@@ -2964,6 +4284,18 @@ class SmolVLATTTFlowMatching(nn.Module):
             else:
                 sequence, next_state = layer_output
             fast_states[layer_index] = next_state
+            if trace_collector is not None and capture_layer_trace:
+                trace_collector[layer_index] = TTTBoundedTrace(tuple(layer_trace))
+            if (
+                final_query_hidden_collector is not None
+                and selected_trace_indices
+                and final_ttt_layer_index == layer_index
+            ):
+                # ``sequence`` is the post-TTT expert stream.  Selecting only
+                # requested physical rows keeps this diagnostic bounded while
+                # preserving gradients for local effect matching.
+                index = torch.as_tensor(selected_trace_indices, device=sequence.device, dtype=torch.long)
+                final_query_hidden_collector[layer_index] = sequence.index_select(1, index).clone()
             return sequence.reshape_as(hidden_states)
 
         # ``FlowMatching.forward``/``sample_actions`` install the current
@@ -2972,6 +4304,14 @@ class SmolVLATTTFlowMatching(nn.Module):
         # existing two-argument callback API used by the sibling model/tests.
         apply_ttt.set_gate_context = set_gate_context
         apply_ttt.set_writer_inputs = set_writer_inputs
+        apply_ttt.set_trace_context = set_trace_context
+        # Expose read-only diagnostics to callers that cannot conveniently
+        # thread extra return values through the VLM forward API.  Existing
+        # two-argument callback behavior is unchanged.
+        apply_ttt.trace_collector = trace_collector
+        apply_ttt.final_query_hidden_collector = final_query_hidden_collector
+        apply_ttt.trace_indices = selected_trace_indices
+        apply_ttt.trace_layer_indices = selected_trace_layers
         return apply_ttt
 
     def sample_noise(self, shape, device):
@@ -3124,7 +4464,10 @@ class SmolVLATTTFlowMatching(nn.Module):
         return writer * prefix_pad_masks.to(device=writer.device, dtype=writer.dtype).unsqueeze(-1)
 
     def _prefix_writer_inputs_with_registers(
-        self, prefix_embs: Tensor, prefix_pad_masks: Tensor
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        previous_actions: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Add static register anchors to the observation-only writer stream.
 
@@ -3140,6 +4483,44 @@ class SmolVLATTTFlowMatching(nn.Module):
         """
 
         writer = self._make_prefix_writer_inputs(prefix_embs, prefix_pad_masks)
+        previous_projection = getattr(self, "previous_action_proj", None)
+        if previous_projection is not None:
+            if previous_actions is None:
+                # A missing predecessor occurs only at an API boundary (for
+                # example a direct unit call).  Use the deployment reset
+                # convention rather than silently borrowing the current/noisy
+                # action.
+                previous_actions = torch.zeros(
+                    prefix_embs.shape[0],
+                    self.config.max_action_dim,
+                    device=prefix_embs.device,
+                    dtype=prefix_embs.dtype,
+                )
+            if previous_actions.ndim == 3 and previous_actions.shape[1] == 1:
+                previous_actions = previous_actions[:, 0]
+            if previous_actions.ndim != 2 or previous_actions.shape[0] != prefix_embs.shape[0]:
+                raise ValueError(
+                    "previous_actions must have shape [B,D] or [B,1,D] matching prefix batch; "
+                    f"got {tuple(previous_actions.shape)}"
+                )
+            if previous_actions.shape[-1] < self.config.max_action_dim:
+                previous_actions = F.pad(
+                    previous_actions,
+                    (0, self.config.max_action_dim - previous_actions.shape[-1]),
+                )
+            elif previous_actions.shape[-1] > self.config.max_action_dim:
+                previous_actions = previous_actions[..., : self.config.max_action_dim]
+            previous_token = previous_projection(
+                previous_actions.to(dtype=previous_projection.weight.dtype)
+            )[:, None, :]
+            previous_mask = torch.ones(
+                writer.shape[0],
+                1,
+                dtype=prefix_pad_masks.dtype,
+                device=prefix_pad_masks.device,
+            )
+            writer = torch.cat([writer, previous_token.to(dtype=writer.dtype)], dim=1)
+            prefix_pad_masks = torch.cat([prefix_pad_masks, previous_mask], dim=1)
         register_tokens = getattr(self, "register_tokens", None)
         if register_tokens is None:
             return writer, prefix_pad_masks
@@ -3263,6 +4644,423 @@ class SmolVLATTTFlowMatching(nn.Module):
             )
         return suffix_output[:, action_start:action_end]
 
+    def _expert_layer_for_vlm_index(self, layer_index: int):
+        """Return the action-expert layer aligned with a VLM layer index.
+
+        The joint VLM/expert wrapper may sparsify the expert stream when
+        ``num_expert_layers < num_vlm_layers``.  Keeping this mapping in one
+        place prevents the V3 local readout from accidentally applying the
+        tail of a neighbouring layer.
+        """
+
+        layer_index = int(layer_index)
+        num_vlm = int(self.vlm_with_expert.num_vlm_layers)
+        num_expert = int(self.vlm_with_expert.num_expert_layers)
+        if num_expert <= 0 or num_vlm % num_expert != 0:
+            expert_index = layer_index
+        else:
+            stride = num_vlm // num_expert
+            if layer_index % stride != 0:
+                raise ValueError(
+                    f"VLM layer {layer_index} has no aligned action-expert layer (stride={stride})"
+                )
+            expert_index = layer_index // stride
+        if not 0 <= expert_index < len(self.vlm_with_expert.lm_expert.layers):
+            raise ValueError(f"Action-expert layer index {expert_index} is out of range")
+        return self.vlm_with_expert.lm_expert.layers[expert_index]
+
+    def _action_from_expert_callback_hidden(
+        self,
+        callback_hidden: Tensor,
+        layer_index: int,
+    ) -> Tensor:
+        """Run the *shared* action tail after a post-attention TTT read.
+
+        ``SmolVLMWithExpertTTTModel`` invokes the TTT callback immediately
+        after the attention residual and before the expert post-attention MLP.
+        V3 local effects therefore have to traverse that exact tail, rather
+        than a newly trained probe.  The returned tensor keeps the final
+        action projection and has shape ``[..., max_action_dim]``.
+        """
+
+        if callback_hidden.ndim < 2 or callback_hidden.shape[-1] != self.vlm_with_expert.expert_hidden_size:
+            raise ValueError(
+                "callback_hidden must end in the expert hidden dimension; got "
+                f"{tuple(callback_hidden.shape)}"
+            )
+        layer = self._expert_layer_for_vlm_index(layer_index)
+        residual = callback_hidden
+        # The expert layers operate on their native parameter dtype.  Keep the
+        # residual in that dtype and upcast only at the final action head, as
+        # the ordinary flow path does.
+        normalized = layer.post_attention_layernorm(residual)
+        tail = layer.mlp(normalized) + residual
+        tail = self.vlm_with_expert.lm_expert.norm(tail)
+        return self.action_out_proj(tail.to(dtype=self.action_out_proj.weight.dtype)).to(dtype=torch.float32)
+
+    @staticmethod
+    def _state_batch_slice(state: TTTFastState, batch_index: int) -> TTTFastState:
+        """Select one trajectory from a traced fast-weight state."""
+
+        index = slice(int(batch_index), int(batch_index) + 1)
+        return TTTFastState(
+            *(tensor[index] for tensor in state.tensors()),
+            position=None if state.position is None else state.position[index],
+        )
+
+    @staticmethod
+    def _stack_fixed_flow_states(
+        before_state: TTTFastState,
+        after_state: TTTFastState,
+        query_positions: Tensor,
+    ) -> tuple[TTTFastState, TTTFastState]:
+        """Pair event states and align both branches to the same query phase."""
+
+        if before_state.batch_size != after_state.batch_size:
+            raise ValueError("CreditTTT before/after states must share a batch size")
+        batch_size = before_state.batch_size
+        if query_positions.ndim != 1 or query_positions.shape[0] != batch_size:
+            raise ValueError(
+                "CreditTTT query_positions must have one episode-local index per replay row"
+            )
+        positions = query_positions.to(
+            device=before_state.w1.device,
+            dtype=torch.long,
+        )
+        if bool((positions < 0).any().item()):
+            raise ValueError("CreditTTT query_positions must be non-negative")
+        # TTTMLPLayer uses ``state.position`` as the rotary phase for a
+        # read-only call.  Event state snapshots naturally carry i/i-1; using
+        # the future query coordinate for both branches prevents an otherwise
+        # spurious position shift from being counted as a memory effect.
+        before = TTTFastState(
+            *before_state.tensors(),
+            position=positions,
+        )
+        after = TTTFastState(
+            *after_state.tensors(),
+            position=positions,
+        )
+        return before, after
+
+    def v3_fixed_context_full_flow_replay(
+        self,
+        images: list[Tensor],
+        img_masks: list[Tensor],
+        lang_tokens: Tensor,
+        lang_masks: Tensor,
+        state: Tensor,
+        *,
+        noise: Tensor,
+        previous_action: Tensor | None,
+        before_state: TTTFastState,
+        after_state: TTTFastState,
+        query_positions: Tensor,
+        final_layer_index: int | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Run paired full denoising reads for a fixed future context.
+
+        ``before_state`` and ``after_state`` are the final-layer fast weights
+        immediately before/after one event write.  The callback is read-only
+        for every denoising step, so the event update is applied exactly once
+        and both branches share the same prefix, noise, timestep schedule,
+        and action tail.  Earlier TTT layers are intentionally bypassed in
+        this *fixed-context* adapter: their hidden context is held constant,
+        while the final selected layer is the variable being distilled.  The
+        ordinary sequence replay remains responsible for training those other
+        layers.  Returning slot-0 actions keeps the target identical to the
+        deployed receding-horizon controller.
+        """
+
+        if not isinstance(noise, Tensor) or noise.ndim != 3:
+            raise ValueError(
+                "CreditTTT full-flow replay noise must have [pairs,chunk,action] shape"
+            )
+        pair_count = int(noise.shape[0])
+        if pair_count <= 0:
+            empty = noise.new_zeros((0, self.config.max_action_dim), dtype=torch.float32)
+            return empty, empty.clone()
+        if noise.shape[1] != self.config.chunk_size:
+            raise ValueError(
+                f"CreditTTT replay noise chunk={noise.shape[1]} does not match config.chunk_size="
+                f"{self.config.chunk_size}"
+            )
+        if noise.shape[2] != self.config.max_action_dim:
+            raise ValueError(
+                "CreditTTT replay noise feature width must equal config.max_action_dim"
+            )
+        if before_state.batch_size != pair_count or after_state.batch_size != pair_count:
+            raise ValueError(
+                "CreditTTT replay state batch must match the number of event/future pairs"
+            )
+        if state.ndim != 2 or state.shape[0] != pair_count:
+            raise ValueError("CreditTTT replay observation state must have [pairs,state_dim] shape")
+        if len(images) == 0 or any(image.shape[0] != pair_count for image in images):
+            raise ValueError("CreditTTT replay images must have one row per pair")
+        if any(mask.shape[0] != pair_count for mask in img_masks):
+            raise ValueError("CreditTTT replay image masks must have one row per pair")
+        if lang_tokens.shape[0] != pair_count or lang_masks.shape[0] != pair_count:
+            raise ValueError("CreditTTT replay language tensors must have one row per pair")
+        if final_layer_index is None:
+            if not self.ttt_layers:
+                raise ValueError("CreditTTT replay requires at least one selected TTT layer")
+            final_layer_index = max(int(key) for key in self.ttt_layers.keys())
+        final_layer_index = int(final_layer_index)
+        layer_key = str(final_layer_index)
+        if layer_key not in self.ttt_layers:
+            raise ValueError(
+                f"CreditTTT replay final layer {final_layer_index} is not a selected TTT layer"
+            )
+
+        before_state, after_state = self._stack_fixed_flow_states(
+            before_state,
+            after_state,
+            query_positions,
+        )
+        # Use one read-only callback over a concatenated before/after batch.
+        # The same noise row is duplicated, so both branches follow exactly
+        # the same 10-step (or configured) flow trajectory in one batched call.
+        paired_images = [torch.cat((image, image), dim=0) for image in images]
+        paired_masks = [torch.cat((mask, mask), dim=0) for mask in img_masks]
+        paired_lang_tokens = torch.cat((lang_tokens, lang_tokens), dim=0)
+        paired_lang_masks = torch.cat((lang_masks, lang_masks), dim=0)
+        paired_state_input = torch.cat((state, state), dim=0)
+        paired_noise = torch.cat((noise, noise), dim=0)
+        if previous_action is None:
+            paired_previous = None
+        else:
+            if previous_action.ndim != 2 or previous_action.shape[0] != pair_count:
+                raise ValueError(
+                    "CreditTTT replay previous_action must have [pairs,action] shape"
+                )
+            paired_previous = torch.cat((previous_action, previous_action), dim=0)
+
+        # Align the read-only callback's state batch with the concatenated
+        # before/after rows.  Earlier selected TTT layers are bypassed so their
+        # hidden context is identical in both branches; this is the explicit
+        # fixed-context approximation described in the method/metrics.
+        paired_final_state = TTTFastState(
+            *(
+                torch.cat((before_tensor, after_tensor), dim=0)
+                for before_tensor, after_tensor in zip(
+                    before_state.tensors(), after_state.tensors(), strict=True
+                )
+            ),
+            position=torch.cat((before_state.position, after_state.position), dim=0)
+            if before_state.position is not None and after_state.position is not None
+            else None,
+        )
+        final_layer = self.ttt_layers[layer_key]
+
+        def callback_factory(_update_requested: bool):
+            # ``sample_actions`` asks for a callback per denoising step and
+            # passes ``step == 0``.  Ignore that flag deliberately: this
+            # replay has already received the event's before/after state and
+            # must remain read-only at *all* denoising steps.
+            def callback(layer_index: int, hidden_states: Tensor) -> Tensor:
+                if int(layer_index) != final_layer_index:
+                    return hidden_states
+                if hidden_states.shape[0] != 2 * pair_count:
+                    raise ValueError(
+                        "CreditTTT replay callback batch does not match paired fast state"
+                    )
+                sequence = hidden_states.reshape(
+                    2 * pair_count,
+                    1,
+                    hidden_states.shape[1],
+                    hidden_states.shape[2],
+                )
+                sequence, _ = final_layer(
+                    sequence,
+                    state=paired_final_state,
+                    update=False,
+                    create_graph=False,
+                )
+                return sequence.reshape_as(hidden_states)
+
+            # Prefix-only mode's setup path expects these setters even though
+            # this callback never performs a write.  No-op setters make the
+            # read-only contract explicit and avoid accidentally constructing
+            # a writer from the current noisy action.
+            callback.set_gate_context = lambda _context: None
+            callback.set_writer_inputs = lambda _inputs, _mask=None: None
+            return callback
+
+        paired_actions = self.sample_actions(
+            paired_images,
+            paired_masks,
+            paired_lang_tokens,
+            paired_lang_masks,
+            paired_state_input,
+            noise=paired_noise,
+            previous_action=paired_previous,
+            _expert_layer_callback_factory=callback_factory,
+        )
+        if paired_actions.ndim != 3 or paired_actions.shape[0] != 2 * pair_count:
+            raise ValueError(
+                "CreditTTT replay must return paired action chunks with shape [2*pairs,chunk,D]"
+            )
+        return paired_actions[:pair_count, 0].float(), paired_actions[pair_count:, 0].float()
+
+    def v3_local_effects_from_trace(
+        self,
+        trace_collector: dict[int, TTTBoundedTrace],
+        final_hidden_collector: dict[int, Tensor],
+        trace_indices: Sequence[int],
+        event_indices: Tensor,
+        future_indices: Tensor,
+        batch_indices: Tensor | None = None,
+    ) -> Tensor:
+        """Evaluate query-conditioned local action effects for event pairs.
+
+        For a pair ``(i,j)`` this computes
+
+        ``A(h_j, f(q_j, W_i^+)) - A(h_j, f(q_j, W_i^-))``
+
+        with the same action tail ``A`` used by the policy.  ``W_i^-`` and
+        ``W_i^+`` are the traced state immediately before/after event ``i``;
+        the future query/base hidden are detached observations, so the loss
+        does not replay the intervening ``i+1,\\ldots,j`` computation graph.
+        The state snapshots intentionally retain the causal prefix graph up to
+        ``i`` (the ordinary TBPTT boundary still controls that prefix), while
+        the event writer/update path remains graph-connected.  Thus long-range
+        credit is local with respect to the event--future gap without silently
+        cutting gradients through the event write itself.
+        """
+
+        if event_indices.ndim != 1 or future_indices.ndim != 1:
+            raise ValueError("event_indices and future_indices must be one-dimensional")
+        if event_indices.numel() != future_indices.numel():
+            raise ValueError("event_indices and future_indices must have equal length")
+        if batch_indices is None:
+            batch_indices = torch.zeros_like(event_indices)
+        if batch_indices.ndim != 1 or batch_indices.numel() != event_indices.numel():
+            raise ValueError("batch_indices must align with event/future indices")
+        if not trace_collector:
+            raise ValueError("V3 local effects require a non-empty trace collector")
+        final_layer_index = max(int(key) for key in trace_collector)
+        # The local action tail is defined at the final selected TTT layer.
+        # Refuse a partially populated/incorrect collector instead of silently
+        # training against an intermediate representation (which can happen if
+        # a caller supplies a diagnostic layer filter unrelated to the V3
+        # effect layer).  The generic callback API still permits tracing any
+        # layer; this guard applies only when interpreting a trace as a V3
+        # action effect.
+        known_ttt_layers = {
+            int(key) for key in getattr(self, "ttt_layers", {}).keys()
+        }
+        if not known_ttt_layers:
+            raise ValueError("V3 local effects require at least one selected TTT layer")
+        expected_final_layer = max(known_ttt_layers)
+        if final_layer_index != expected_final_layer:
+            raise ValueError(
+                "V3 local effects must use the final selected TTT layer; "
+                f"trace={final_layer_index}, expected={expected_final_layer}"
+            )
+        final_trace = trace_collector[final_layer_index]
+        final_hidden = final_hidden_collector.get(final_layer_index)
+        if final_hidden is None:
+            raise ValueError("V3 local effects require final-layer callback hidden states")
+        if final_hidden.ndim != 4:
+            raise ValueError(
+                "final-layer callback hidden states must have shape [B,S,N,D]; "
+                f"got {tuple(final_hidden.shape)}"
+            )
+        ordered_indices = tuple(int(index) for index in trace_indices)
+        position_map = {index: position for position, index in enumerate(ordered_indices)}
+        action_token = int(self.config.ttt_num_register_tokens)
+        ttt_layer = self.ttt_layers[str(final_layer_index)]
+        batch_size = int(final_hidden.shape[0])
+        if event_indices.numel():
+            if bool((batch_indices < 0).any().item()) or bool(
+                (batch_indices >= batch_size).any().item()
+            ):
+                raise ValueError(
+                    f"batch_indices must lie in [0, {batch_size}), got "
+                    f"{batch_indices.detach().cpu().tolist()}"
+                )
+            if bool((event_indices < 0).any().item()) or bool(
+                (future_indices < 0).any().item()
+            ):
+                raise ValueError("event_indices and future_indices must be non-negative")
+        effects: list[Tensor] = []
+        for event_index, future_index, batch_index in zip(
+            event_indices.detach().to(device="cpu").tolist(),
+            future_indices.detach().to(device="cpu").tolist(),
+            batch_indices.detach().to(device="cpu").tolist(),
+            strict=True,
+        ):
+            event_transition = final_trace.for_timestep(int(event_index))
+            future_transition = final_trace.for_timestep(int(future_index))
+            if event_transition is None or future_transition is None:
+                raise ValueError(
+                    f"V3 trace is missing pair ({event_index},{future_index}); "
+                    f"captured={final_trace.indices}"
+                )
+            if future_transition.query_hidden is None:
+                raise ValueError("V3 trace did not capture future query projections")
+            future_column = position_map.get(int(future_index))
+            if future_column is None:
+                raise ValueError(f"Future trace index {future_index} is not in trace_indices")
+            if action_token >= future_transition.query_hidden.shape[1]:
+                raise ValueError(
+                    f"Action token {action_token} is outside traced suffix token axis "
+                    f"{future_transition.query_hidden.shape[1]}"
+                )
+            query = future_transition.query_hidden[int(batch_index), action_token].detach()
+            query = query.reshape(1, 1, -1)
+            before_state = self._state_batch_slice(event_transition.state_before, int(batch_index))
+            after_state = self._state_batch_slice(event_transition.state_after, int(batch_index))
+            read_before = ttt_layer._fast_mlp(query, before_state)
+            read_after = ttt_layer._fast_mlp(query, after_state)
+            residual = future_transition.residual_hidden
+            if residual is not None:
+                # ``residual_hidden`` is the stream immediately before the
+                # future TTT read.  Using it here reconstructs the local
+                # counterfactual ``h_j + f_{W_i}(q_j)`` and, importantly,
+                # does not smuggle the actual intervening state ``W_j`` into
+                # both branches.  The detached fallback below keeps traces
+                # serialized by an older implementation readable.
+                base_hidden = residual[int(batch_index), action_token].detach().reshape(1, -1)
+            else:
+                # Older bounded traces did not retain ``residual_hidden`` but
+                # did retain the post-read callback stream and the read
+                # itself.  Recover the exact pre-read stream algebraically
+                # instead of using the post-read collector as ``h_j`` (which
+                # would count the actual future state ``W_j`` in both local
+                # branches and bias the effect).  If neither quantity is
+                # available, fail loudly rather than silently changing the V3
+                # intervention semantics.
+                if future_transition.read_hidden is None:
+                    raise ValueError(
+                        "V3 trace needs residual_hidden or read_hidden to reconstruct "
+                        "the future pre-read residual"
+                    )
+                post_read = final_hidden[
+                    int(batch_index), future_column, action_token
+                ].detach().reshape(1, -1)
+                future_read = future_transition.read_hidden[
+                    int(batch_index), action_token
+                ].detach().reshape(1, -1)
+                # ``gate`` is formed immediately below; use the same
+                # effective channel to invert the callback's residual add.
+                base_hidden = post_read - ttt_layer.effective_gate.to(
+                    dtype=post_read.dtype, device=post_read.device
+                ).reshape(1, -1) * future_read.to(dtype=post_read.dtype)
+            gate = ttt_layer.effective_gate.to(dtype=read_after.dtype).reshape(1, 1, -1)
+            local_before = base_hidden + gate[0] * read_before[:, 0]
+            local_after = base_hidden + gate[0] * read_after[:, 0]
+            action_before = self._action_from_expert_callback_hidden(
+                local_before, final_layer_index
+            )
+            action_after = self._action_from_expert_callback_hidden(
+                local_after, final_layer_index
+            )
+            effects.append((action_after - action_before).reshape(-1))
+        if not effects:
+            return final_hidden.new_zeros((0, self.config.max_action_dim), dtype=torch.float32)
+        return torch.stack(effects, dim=0)
+
     def forward(
         self,
         images,
@@ -3275,6 +5073,7 @@ class SmolVLATTTFlowMatching(nn.Module):
         time=None,
         *,
         expert_layer_callback=None,
+        previous_actions: Tensor | None = None,
         return_velocity: bool = False,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
@@ -3314,8 +5113,24 @@ class SmolVLATTTFlowMatching(nn.Module):
                 set_writer_inputs = getattr(expert_layer_callback, "set_writer_inputs", None)
                 if set_writer_inputs is None:
                     raise RuntimeError("prefix_only writer requires a callback writer-input setter")
+                flattened_previous_actions = previous_actions
+                if flattened_previous_actions is not None:
+                    if flattened_previous_actions.ndim == 3:
+                        flattened_previous_actions = flattened_previous_actions.reshape(
+                            -1, flattened_previous_actions.shape[-1]
+                        )
+                    elif flattened_previous_actions.ndim != 2:
+                        raise ValueError(
+                            "previous_actions must have shape [B,T,D] or [B*T,D], got "
+                            f"{tuple(flattened_previous_actions.shape)}"
+                        )
+                    if flattened_previous_actions.shape[0] != prefix_embs.shape[0]:
+                        raise ValueError(
+                            "previous_actions flattened batch must match prefix embeddings: "
+                            f"got {flattened_previous_actions.shape[0]} vs {prefix_embs.shape[0]}"
+                        )
                 writer_inputs, writer_mask = self._prefix_writer_inputs_with_registers(
-                    prefix_embs, prefix_pad_masks
+                    prefix_embs, prefix_pad_masks, flattened_previous_actions
                 )
                 set_writer_inputs(writer_inputs, writer_mask)
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
@@ -3367,6 +5182,11 @@ class SmolVLATTTFlowMatching(nn.Module):
         return_local_loss: bool = False,
         use_learned_write_gate: bool = False,
         return_write_gate: bool = False,
+        previous_actions: Tensor | None = None,
+        trace_indices: int | Tensor | tuple[int, ...] | list[int] | None = None,
+        trace_collector: dict[int, TTTBoundedTrace] | None = None,
+        final_query_hidden_collector: dict[int, Tensor] | None = None,
+        trace_layer_indices: int | Tensor | Sequence[int] | None = None,
     ) -> (
         tuple[Tensor, TTTFastStates]
         | tuple[Tensor, TTTFastStates, Tensor]
@@ -3396,6 +5216,10 @@ class SmolVLATTTFlowMatching(nn.Module):
             local_loss_accumulator=local_loss_parts,
             use_learned_write_gate=use_learned_write_gate,
             write_gate_accumulator=write_gate_parts,
+            trace_indices=trace_indices,
+            trace_collector=trace_collector,
+            final_query_hidden_collector=final_query_hidden_collector,
+            trace_layer_indices=trace_layer_indices,
         )
         losses = self.forward(
             images,
@@ -3407,6 +5231,7 @@ class SmolVLATTTFlowMatching(nn.Module):
             noise,
             time,
             expert_layer_callback=callback,
+            previous_actions=previous_actions,
             return_velocity=return_velocity,
         )
         local_loss = None
@@ -3438,6 +5263,11 @@ class SmolVLATTTFlowMatching(nn.Module):
         state,
         noise=None,
         _expert_layer_callback_factory=None,
+        previous_action: Tensor | None = None,
+        trace_indices: int | Tensor | tuple[int, ...] | list[int] | None = None,
+        trace_collector: dict[int, TTTBoundedTrace] | None = None,
+        final_query_hidden_collector: dict[int, Tensor] | None = None,
+        trace_layer_indices: int | Tensor | Sequence[int] | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -3487,6 +5317,25 @@ class SmolVLATTTFlowMatching(nn.Module):
                 else None
             )
             if expert_layer_callback is not None:
+                if step == 0 and trace_indices is not None:
+                    set_trace_context = getattr(expert_layer_callback, "set_trace_context", None)
+                    if set_trace_context is not None:
+                        if trace_layer_indices is None:
+                            # Preserve compatibility with callbacks created
+                            # by older policy adapters that expose the
+                            # original three-argument setter.
+                            set_trace_context(
+                                trace_indices,
+                                trace_collector,
+                                final_query_hidden_collector,
+                            )
+                        else:
+                            set_trace_context(
+                                trace_indices,
+                                trace_collector,
+                                final_query_hidden_collector,
+                                trace_layer_indices,
+                            )
                 set_gate_context = getattr(expert_layer_callback, "set_gate_context", None)
                 if set_gate_context is not None and prefix_context is not None:
                     set_gate_context(prefix_context)
@@ -3495,7 +5344,7 @@ class SmolVLATTTFlowMatching(nn.Module):
                     if set_writer_inputs is None:
                         raise RuntimeError("prefix_only writer requires a callback writer-input setter")
                     writer_inputs, writer_mask = self._prefix_writer_inputs_with_registers(
-                        prefix_embs, prefix_pad_masks
+                        prefix_embs, prefix_pad_masks, previous_action
                     )
                     set_writer_inputs(writer_inputs, writer_mask)
 
@@ -3545,6 +5394,11 @@ class SmolVLATTTFlowMatching(nn.Module):
         state,
         fast_states: TTTFastStates | None = None,
         noise=None,
+        previous_action: Tensor | None = None,
+        trace_indices: int | Tensor | tuple[int, ...] | list[int] | None = None,
+        trace_collector: dict[int, TTTBoundedTrace] | None = None,
+        final_query_hidden_collector: dict[int, Tensor] | None = None,
+        trace_layer_indices: int | Tensor | Sequence[int] | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> tuple[Tensor, TTTFastStates]:
         """Denoise an action chunk while advancing TTT memory exactly once."""
@@ -3562,6 +5416,10 @@ class SmolVLATTTFlowMatching(nn.Module):
                     getattr(self.config, "hd_ttt_enabled", False)
                     and getattr(self.config, "hd_learned_write_gate", False)
                 ),
+                trace_indices=trace_indices if update else None,
+                trace_collector=trace_collector if update else None,
+                final_query_hidden_collector=final_query_hidden_collector if update else None,
+                trace_layer_indices=trace_layer_indices if update else None,
             )
 
         actions = self.sample_actions(
@@ -3571,6 +5429,7 @@ class SmolVLATTTFlowMatching(nn.Module):
             lang_masks,
             state,
             noise=noise,
+            previous_action=previous_action,
             _expert_layer_callback_factory=callback_factory,
             **kwargs,
         )

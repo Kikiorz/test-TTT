@@ -66,6 +66,7 @@ def _credit_ttt_protocol_identity(config: Any) -> dict[str, Any] | None:
         "version",
         "pair_schema",
         "intervention",
+        "intervention_scope",
         "target",
         "state",
         "causal",
@@ -269,6 +270,17 @@ def _load_policy(args: argparse.Namespace):
         # source value at 1.0 would make the paired clean ablation fail before
         # the policy is even constructed.
         hd_kwargs["hd_effect_weight"] = 0.0
+    # The previous executed action is an optional *input-schema* extension,
+    # not an HD loss switch.  The primary Clean-TTT control must be able to
+    # retain this projection while disabling hindsight objectives; otherwise
+    # a score difference would conflate CreditTTT with an extra observation
+    # feature.  Keep auto-detection for ordinary checkpoints, but make an
+    # explicit CLI value authoritative (including the clean-baseline command).
+    requested_previous_action = getattr(args, "hd_v3_include_previous_action", None)
+    if requested_previous_action is not None:
+        hd_kwargs["hd_v3_include_previous_action"] = bool(
+            requested_previous_action
+        )
     hd_kwargs["hd_ttt_enabled"] = hd_enabled
     hd_kwargs["hd_learned_write_gate"] = learned_gate
     # ``ttt_writer_mode`` is structural rather than an HD loss switch.  It
@@ -492,6 +504,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable/disable the deployable learned write gate; default auto-detects the checkpoint config",
+    )
+    parser.add_argument(
+        "--hd-v3-include-previous-action",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable/disable the CreditTTT previous-executed-action input projection. "
+            "Set explicitly for architecture-matched Clean-TTT evaluation."
+        ),
     )
     parser.add_argument(
         "--reset-memory-every-step",

@@ -16,6 +16,7 @@
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -63,6 +64,116 @@ class TTTFastState:
     @property
     def batch_size(self) -> int:
         return self.w1.shape[0]
+
+
+@dataclass(frozen=True)
+class TTTStateTransition:
+    """A bounded, per-physical-step snapshot of one TTT layer.
+
+    ``state_before`` is the recurrent state immediately before the selected
+    timestep's writer update and ``state_after`` is the state used for that
+    timestep's query/read.  ``query_hidden`` is the projected/rotary query
+    tensor consumed by the fast MLP; ``read_hidden`` is its residual output
+    before the external effective gate; ``residual_hidden`` is the stream
+    before that read.  Optional tensors retain the autograd graph during
+    training, enabling local QH2L effect diagnostics.
+    """
+
+    timestep_index: int
+    state_before: TTTFastState
+    state_after: TTTFastState
+    query_hidden: Tensor | None = None
+    read_hidden: Tensor | None = None
+    # Residual stream immediately before the fast-MLP read.  Keeping this
+    # small per-token tensor lets a local QH2L replay reconstruct
+    # ``h_j + f_{W_i}(q_j)`` without reusing the actual future state ``W_j``;
+    # it is optional for compatibility with traces written by older code.
+    residual_hidden: Tensor | None = None
+
+
+@dataclass(frozen=True)
+class TTTBoundedTrace:
+    """Sparse trace returned when callers explicitly request it.
+
+    The normal :class:`TTTMLPLayer` return signature is unchanged.  A trace is
+    opt-in via ``trace_indices``/``return_bounded_trace`` or a mutable
+    ``trace_sink``.  Keeping only selected physical timesteps avoids the
+    memory cost of the legacy all-step ``return_state_trace`` path.
+    """
+
+    transitions: tuple[TTTStateTransition, ...]
+
+    @property
+    def indices(self) -> tuple[int, ...]:
+        """Selected physical timestep indices in ascending execution order."""
+
+        return tuple(item.timestep_index for item in self.transitions)
+
+    def for_timestep(self, timestep_index: int) -> TTTStateTransition | None:
+        """Return one transition or ``None`` when it was not captured."""
+
+        for transition in self.transitions:
+            if transition.timestep_index == timestep_index:
+                return transition
+        return None
+
+
+def _normalize_trace_indices(
+    trace_indices: int | Tensor | tuple[int, ...] | list[int] | None,
+    sequence_length: int,
+) -> tuple[int, ...]:
+    """Validate and canonicalize sparse physical-step trace indices."""
+
+    if trace_indices is None:
+        return ()
+    if isinstance(trace_indices, Tensor):
+        if trace_indices.ndim == 0:
+            raw_indices = [int(trace_indices.detach().item())]
+        elif trace_indices.ndim == 1:
+            raw_indices = [int(value) for value in trace_indices.detach().to(device="cpu").tolist()]
+        else:
+            raise ValueError("trace_indices tensor must be scalar or one-dimensional")
+    elif isinstance(trace_indices, int):
+        raw_indices = [trace_indices]
+    else:
+        try:
+            raw_indices = [int(value) for value in trace_indices]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("trace_indices must be an integer or a sequence of integers") from exc
+    if any(index < 0 or index >= sequence_length for index in raw_indices):
+        raise ValueError(
+            f"trace_indices must lie in [0, {sequence_length}), got {raw_indices}"
+        )
+    return tuple(sorted(set(raw_indices)))
+
+
+def _trace_clone_state(state: TTTFastState) -> TTTFastState:
+    """Clone a state while retaining its autograd connection."""
+
+    return TTTFastState(
+        *(tensor.clone() for tensor in state.tensors()),
+        position=None if state.position is None else state.position.clone(),
+    )
+
+
+def _detach_trace(trace: TTTBoundedTrace) -> TTTBoundedTrace:
+    """Detach a sparse trace when inference/reader-only mode requires it."""
+
+    transitions: list[TTTStateTransition] = []
+    for item in trace.transitions:
+        transitions.append(
+            TTTStateTransition(
+                timestep_index=item.timestep_index,
+                state_before=item.state_before.detach(requires_grad=False),
+                state_after=item.state_after.detach(requires_grad=False),
+                query_hidden=None if item.query_hidden is None else item.query_hidden.detach(),
+                read_hidden=None if item.read_hidden is None else item.read_hidden.detach(),
+                residual_hidden=(
+                    None if item.residual_hidden is None else item.residual_hidden.detach()
+                ),
+            )
+        )
+    return TTTBoundedTrace(tuple(transitions))
 
 
 class TTTMLPLayer(nn.Module):
@@ -597,11 +708,15 @@ class TTTMLPLayer(nn.Module):
         detach_writer: bool = False,
         return_state_trace: bool = False,
         return_local_loss: bool = False,
+        trace_indices: int | Tensor | tuple[int, ...] | list[int] | None = None,
+        trace_sink: list[TTTStateTransition] | None = None,
+        return_bounded_trace: bool = False,
     ) -> (
         tuple[Tensor, TTTFastState]
         | tuple[Tensor, TTTFastState, Tensor]
         | tuple[Tensor, TTTFastState, tuple[TTTFastState, ...]]
         | tuple[Tensor, TTTFastState, tuple[TTTFastState, ...], Tensor]
+        | tuple[Tensor, TTTFastState, TTTBoundedTrace]
     ):
         """Process ``[batch, timesteps, tokens, dim]`` and return the next fast state.
 
@@ -619,7 +734,11 @@ class TTTMLPLayer(nn.Module):
         cuts all outer gradients through K/V/inner-update fast weights; query
         and downstream readout gradients remain active for reader-only
         counterfactual grounding. ``return_state_trace`` is used by hindsight
-        replay and is off on the normal path. When ``return_local_loss`` is
+        replay and is off on the normal path. ``trace_indices`` selects a
+        bounded subset of physical timesteps for a lighter transition trace;
+        selected transitions can also be appended to ``trace_sink``. Set
+        ``return_bounded_trace=True`` to append a :class:`TTTBoundedTrace` to
+        the otherwise unchanged return tuple. When ``return_local_loss`` is
         true, the optional extra return is a ``[batch, timesteps]`` tensor
         containing the raw (ungated) inner K/V prediction loss for each
         timestep. Callers can apply a hindsight write gate outside the layer.
@@ -629,6 +748,10 @@ class TTTMLPLayer(nn.Module):
             raise ValueError(
                 f"Expected inputs with shape [batch, timesteps, tokens, {self.dim}], got {tuple(inputs.shape)}"
             )
+        normalized_trace_indices = _normalize_trace_indices(trace_indices, inputs.shape[1])
+        trace_index_set = set(normalized_trace_indices)
+        bounded_transitions: list[TTTStateTransition] = []
+        trace_sink_start = len(trace_sink) if trace_sink is not None else 0
         if writer_inputs is not None:
             if writer_inputs.ndim != 4 or writer_inputs.shape[:2] != inputs.shape[:2]:
                 raise ValueError(
@@ -747,6 +870,9 @@ class TTTMLPLayer(nn.Module):
             local_losses: list[Tensor] = []
             for timestep_index, timestep_inputs in enumerate(projected_inputs.unbind(dim=1)):
                 self._record_nonfinite(timestep_inputs)
+                trace_state_before = (
+                    _trace_clone_state(state) if timestep_index in trace_index_set else None
+                )
                 normalized_inputs = F.layer_norm(timestep_inputs, (self.dim,))
                 timestep_position = state.position + 1 if update else state.position.clamp_min(0)
                 # Queries and writer keys must share one physical-position
@@ -838,10 +964,23 @@ class TTTMLPLayer(nn.Module):
                 output_step = timestep_inputs + residual_gate * ttt_output
                 self._record_nonfinite(output_step)
                 outputs.append(output_step)
+                if trace_state_before is not None:
+                    transition = TTTStateTransition(
+                        timestep_index=timestep_index,
+                        state_before=trace_state_before,
+                        state_after=_trace_clone_state(state),
+                        query_hidden=queries.clone(),
+                        read_hidden=ttt_output.clone(),
+                        residual_hidden=timestep_inputs.clone(),
+                    )
+                    bounded_transitions.append(transition)
+                    if trace_sink is not None:
+                        trace_sink.append(transition)
                 if return_state_trace:
                     state_trace.append(state.clone(detach=False, requires_grad=False))
 
             output = torch.stack(outputs, dim=1).to(dtype=input_dtype)
+            bounded_trace = TTTBoundedTrace(tuple(bounded_transitions))
             if detach_writer:
                 # Do not expose replay-only state leaves to the outer graph.
                 # They were kept differentiable internally so each timestep
@@ -850,20 +989,31 @@ class TTTMLPLayer(nn.Module):
                 state = state.detach(requires_grad=False)
                 if return_state_trace:
                     state_trace = [trace.detach(requires_grad=False) for trace in state_trace]
+                bounded_trace = _detach_trace(bounded_trace)
             if not outer_grad_enabled:
                 output = output.detach()
                 state = state.detach(requires_grad=False)
                 if return_state_trace:
                     state_trace = [trace.detach(requires_grad=False) for trace in state_trace]
+                bounded_trace = _detach_trace(bounded_trace)
+
+            if trace_sink is not None and len(trace_sink) > trace_sink_start:
+                # Keep the caller-owned sink consistent with the returned
+                # trace when inference/reader-only execution detached it.
+                trace_sink[trace_sink_start:] = list(bounded_trace.transitions)
 
             local_loss = torch.stack(local_losses, dim=1) if return_local_loss else None
             if return_local_loss and not outer_grad_enabled:
                 local_loss = local_loss.detach()
 
         if return_state_trace and return_local_loss:
-            return output, state, tuple(state_trace), local_loss
-        if return_state_trace:
-            return output, state, tuple(state_trace)
-        if return_local_loss:
-            return output, state, local_loss
-        return output, state
+            result: tuple[Any, ...] = (output, state, tuple(state_trace), local_loss)
+        elif return_state_trace:
+            result = (output, state, tuple(state_trace))
+        elif return_local_loss:
+            result = (output, state, local_loss)
+        else:
+            result = (output, state)
+        if return_bounded_trace:
+            return (*result, bounded_trace)
+        return result

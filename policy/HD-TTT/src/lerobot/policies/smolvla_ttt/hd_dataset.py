@@ -214,6 +214,8 @@ class HindsightLabelDataset(Dataset):
                 protocol = "legacy_raw_hinge_max"
             elif protocol == "v2":
                 protocol = "v2_relative_antithetic_robust"
+            elif protocol in {"v3", "credit_ttt_v3"}:
+                protocol = "credit_ttt_v3_query_effect"
             self.hd_attribution_protocol = str(protocol)
             # Older artifacts may encode an absent optional field as JSON
             # null.  Treat it as the legacy suffix writer instead of the

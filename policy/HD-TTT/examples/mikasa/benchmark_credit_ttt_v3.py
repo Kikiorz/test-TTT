@@ -76,7 +76,8 @@ CANONICAL_V3_PROTOCOL_IDENTITY: dict[str, Any] = {
     "protocol": "creditttt_qh2l_v3",
     "version": 3,
     "pair_schema": "event_future_control_pair_v3",
-    "intervention": "content_replacement",
+    "intervention": "event_write_deletion",
+    "intervention_scope": "event_write_only_previous_executed_action_held_fixed",
     "target": "final_slot0_action",
     "state": "causal_fast_weights",
     "causal": True,
@@ -661,8 +662,16 @@ def _eval_command(
     if method["id"] == "clean_ttt":
         # This is an explicit structural clean baseline.  It prevents a
         # checkpoint carrying HD fields from being evaluated as a hidden HD
-        # model while retaining the same TTT student/action cadence.
-        command.extend(["--no-hd-ttt-enabled", "--no-hd-learned-write-gate"])
+        # model while retaining the same TTT student/action cadence.  The
+        # previous-action projection is also forced on: it is part of the
+        # architecture-matched input schema, not part of the hindsight loss.
+        command.extend(
+            [
+                "--no-hd-ttt-enabled",
+                "--no-hd-learned-write-gate",
+                "--hd-v3-include-previous-action",
+            ]
+        )
     return command
 
 
@@ -725,6 +734,13 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         },
         "fairness_controls": {
             "match_trainable_student_parameters": True,
+            "clean_ttt_architecture_control_required": True,
+            "clean_ttt_architecture_control_note": (
+                "The primary Clean-TTT checkpoint must be trained with the same "
+                "SmolVLA-TTT config and hd_v3_include_previous_action=true, while "
+                "hd_ttt_enabled/HD losses are disabled. A legacy checkpoint without "
+                "that projection is reported only as an explicitly named ablation."
+            ),
             "match_action_tail_unfreezing": True,
             "native_chunk_control_required": True,
             "native_chunk_control_note": (
@@ -1763,7 +1779,7 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
     for field, bad_value in (
         ("target", "denoising_velocity"),
         ("causal", 1),
-        ("intervention", "content_deletion"),
+        ("intervention", "content_replacement"),
     ):
         malformed = dict(canonical_record)
         malformed_model = dict(canonical_record["model"])
