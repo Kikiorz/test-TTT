@@ -232,8 +232,8 @@ def test_ttt_bounded_trace_validates_indices_without_affecting_legacy_return() -
         layer(inputs, trace_indices=[2])
 
 
-def test_qh2l_reference_hybrid_routes_local_pairs_to_bounded_trace() -> None:
-    """Same-segment V3 pairs must not pay for a full-flow reference replay."""
+def test_qh2l_reference_routes_all_pairs_to_final_action_replay() -> None:
+    """Canonical V3 never mixes a local velocity read with action labels."""
 
     pytest.importorskip("datasets")
     pytest.importorskip("transformers")
@@ -314,8 +314,12 @@ def test_qh2l_reference_hybrid_routes_local_pairs_to_bounded_trace() -> None:
         reference_batch={},
     )
     assert torch.isfinite(loss)
-    assert harness.model.local_calls == [([0, 2], [1, 3])]
-    assert harness.cross_calls == [([1, 3], [16, 18])]
+    # A complete reference window selects the canonical final-action backend
+    # for *every* pair, including futures in this TBPTT segment.  The helper
+    # internally chunks these rows for memory; routing a subset through the
+    # bounded trace would compare instantaneous velocity to final action.
+    assert harness.model.local_calls == []
+    assert harness.cross_calls == [([0, 1, 2, 3], [11, 16, 13, 18])]
     assert harness.observed_student is not None
     torch.testing.assert_close(
         harness.observed_student,
@@ -327,8 +331,8 @@ def test_qh2l_reference_hybrid_routes_local_pairs_to_bounded_trace() -> None:
     assert torch.isfinite(harness.model.scale.grad)
 
 
-def test_qh2l_reference_all_local_does_not_require_global_indices() -> None:
-    """A reference batch must not force full-flow-only metadata for local pairs."""
+def test_qh2l_without_reference_uses_bounded_trace_diagnostic() -> None:
+    """The velocity trace helper remains available outside canonical V3."""
 
     pytest.importorskip("datasets")
     pytest.importorskip("transformers")
@@ -382,6 +386,6 @@ def test_qh2l_reference_all_local_does_not_require_global_indices() -> None:
         trace_collector={10: object()},
         final_hidden_collector={10: torch.zeros(1, 3, 2, 2)},
         trace_indices=(0, 1, 2),
-        reference_batch={},
+        reference_batch=None,
     )
     assert harness.model.local_called
