@@ -126,6 +126,8 @@ def test_pretrained_config_accepts_null_v2_fields(tmp_path: Path) -> None:
         json.dumps(
             {
                 "type": "smolvla_ttt",
+                "hd_ttt_enabled": None,
+                "hd_learned_write_gate": None,
                 "hd_effect_weight": None,
                 "hd_attribution_protocol": None,
             }
@@ -135,6 +137,8 @@ def test_pretrained_config_accepts_null_v2_fields(tmp_path: Path) -> None:
     loaded = PreTrainedConfig.from_pretrained(tmp_path)
 
     assert isinstance(loaded, SmolVLATTTConfig)
+    assert loaded.hd_ttt_enabled is False
+    assert loaded.hd_learned_write_gate is False
     assert loaded.hd_effect_weight == 0.0
     assert loaded.hd_attribution_protocol == "legacy_raw_hinge_max"
 

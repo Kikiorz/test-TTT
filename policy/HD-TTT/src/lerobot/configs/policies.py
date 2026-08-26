@@ -270,4 +270,15 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
             ):
                 cli_overrides.append("--hd_effect_weight=0.0")
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            parsed_config = draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+        # Keep the generic parser and the custom SmolVLA-TTT checkpoint
+        # decoder on the same canonical representation.  Early checkpoints
+        # occasionally serialized the two boolean HD switches as JSON null;
+        # allowing ``None`` to escape here makes metadata/contract checks
+        # nondeterministic even though downstream ``bool(None)`` happens to
+        # disable the feature.  Normalize only this policy family.
+        if getattr(orig_config, "type", None) == "smolvla_ttt":
+            for field_name in ("hd_ttt_enabled", "hd_learned_write_gate"):
+                if getattr(parsed_config, field_name, None) is None:
+                    setattr(parsed_config, field_name, False)
+        return parsed_config
