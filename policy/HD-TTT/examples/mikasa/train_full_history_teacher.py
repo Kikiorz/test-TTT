@@ -503,8 +503,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     validation_is_diagnostic_reuse = False
     if args.validation_episode_start is None:
-        split = max(1, int(round(len(rows) * 0.8)))
-        train_rows, validation_rows = rows[:split], rows[split:]
+        # No implicit 80/20 hold-out: the canonical teacher must see every
+        # official demonstration.  Validation is diagnostic-only, so reuse all
+        # rows and mark the resulting metrics accordingly.
+        train_rows = rows
+        validation_rows = rows
+        validation_is_diagnostic_reuse = True
+        LOGGER.info(
+            "No validation threshold supplied; fitting on all selected episodes "
+            "and reporting train-set diagnostics without gradients."
+        )
     else:
         threshold = int(args.validation_episode_start)
         train_rows = [row for row in rows if int(row["episode_indices"][0]) < threshold]
@@ -605,7 +613,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--episode-start", type=int, default=0)
     parser.add_argument("--episode-end", type=int, default=None)
-    parser.add_argument("--validation-episode-start", type=int, default=None)
+    parser.add_argument(
+        "--validation-episode-start",
+        type=int,
+        default=None,
+        help=(
+            "Optional held-out diagnostic threshold.  Omit (canonical) or set "
+            "at/after the selected range to fit on all episodes; diagnostics "
+            "never affect optimization."
+        ),
+    )
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=0, help="Optional epoch cap for a smoke run")

@@ -303,7 +303,8 @@ silently reserved for tuning:
 | simulator evaluation | fixed simulator seeds, never used for selection |
 
 The launcher defaults are `FEATURE_EPISODE_END=250`, `TRAIN_EPISODE_END=250`,
-and `VALIDATION_EPISODE_START=250`.  A validation threshold at the dataset end
+and `VALIDATION_EPISODE_START=250`; the teacher script also treats an omitted
+validation threshold as full-data fitting.  A validation threshold at the dataset end
 causes the teacher to report a clearly marked train-set diagnostic loss without
 back-propagating it or using it for checkpoint selection.  Any reduced split
 must be an explicitly named smoke/ablation override and recorded in the
