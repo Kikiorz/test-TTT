@@ -1015,11 +1015,11 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     tasks = _task_specs(args)
     methods = _method_specs(args.include_optional)
     protocol_id = TASK_SET_PROTOCOL_IDS[task_set]
-    # Native SmolVLA is normally one frozen base checkpoint.  Student methods
-    # are often trained independently for each task because LeRobot action
-    # normalization statistics are task-local.  Optional maps make that
-    # distinction explicit while retaining the historical common-checkpoint
-    # command-line arguments for shared/multitask runs.
+    # Native and student policies are frozen independently for each task in
+    # the canonical profile because LeRobot action-normalization statistics
+    # are task-local.  The historical singular checkpoint arguments remain
+    # available only for the legacy shared-checkpoint profile; canonical runs
+    # must provide explicit task maps below.
     checkpoint_map_inputs = {
         NATIVE_VARIANT_CHUNK: getattr(args, "native_checkpoints_json", None),
         NATIVE_VARIANT_K1: getattr(args, "native_checkpoints_json", None),
