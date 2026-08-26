@@ -939,6 +939,78 @@ def _slice_flattened_sequence_batch(
     return select(batch)
 
 
+def _compute_hd_effect_normalization_floor(
+    batch: dict[str, Any],
+    sequence_shape: tuple[int, int],
+    policy_config: Any,
+) -> torch.Tensor | None:
+    """Compute one robust action-effect floor for a complete TBPTT window.
+
+    ``action_effect_distillation_loss`` normally estimates its floor from the
+    tensors passed to one call.  That is undesirable for TBPTT because each
+    segment would then have a different median.  This helper mirrors the
+    model's v2 label convention (flattened ``B*T`` rows, optional event axis,
+    selected slot 0) before the sequence is sliced, and returns the detached
+    scalar that every segment should reuse.  The active action coordinates are
+    limited to the configured task dimension so padded model coordinates do
+    not alter the statistic.
+    """
+
+    teacher_effect = batch.get("hd_teacher_effect")
+    if teacher_effect is None:
+        return None
+    if not isinstance(teacher_effect, torch.Tensor) or teacher_effect.ndim == 0:
+        raise ValueError("hd_teacher_effect must be a non-scalar tensor")
+
+    batch_size, sequence_length = sequence_shape
+    if (
+        teacher_effect.ndim >= 2
+        and teacher_effect.shape[0] == batch_size
+        and teacher_effect.shape[1] == sequence_length
+    ):
+        effect = teacher_effect
+    elif teacher_effect.shape[0] == batch_size * sequence_length:
+        effect = teacher_effect.reshape(batch_size, sequence_length, *teacher_effect.shape[1:])
+    elif (
+        teacher_effect.ndim >= 2
+        and teacher_effect.shape[0] == sequence_length
+        and batch_size != sequence_length
+    ):
+        # Match ``_reshape_hd_field`` for a shared [T,...] label field.
+        effect = teacher_effect.unsqueeze(0).expand(batch_size, *teacher_effect.shape)
+    else:
+        raise ValueError(
+            "hd_teacher_effect must start with [B,T] or flattened B*T dimensions, "
+            f"got {tuple(teacher_effect.shape)} for sequence {sequence_shape}"
+        )
+
+    if effect.ndim == 4:
+        if effect.shape[2] < 1:
+            raise ValueError("hd_teacher_effect must contain at least one event slot")
+        effect = effect[:, :, 0, :]
+    elif effect.ndim != 3:
+        raise ValueError(
+            "hd_teacher_effect must have [B,T,D] or [B,T,K,D] shape, "
+            f"got {tuple(effect.shape)}"
+        )
+
+    feature = getattr(policy_config, "action_feature", None)
+    feature_shape = getattr(feature, "shape", None)
+    configured_dim = (
+        int(feature_shape[0])
+        if feature_shape and feature_shape[0] is not None
+        else int(effect.shape[-1])
+    )
+    active_dim = min(int(effect.shape[-1]), configured_dim)
+    if active_dim <= 0:
+        raise ValueError("hd_teacher_effect requires a positive active action dimension")
+
+    # Import lazily so ordinary policies do not import HD-TTT tensor helpers.
+    from lerobot.policies.smolvla_ttt.hd_ttt import compute_action_effect_normalization_floor
+
+    return compute_action_effect_normalization_floor(effect[..., :active_dim])
+
+
 def _tbptt_segment_loss_weights(
     batch: dict[str, Any],
     sequence_shape: tuple[int, int],
@@ -1110,6 +1182,15 @@ def update_policy_tbptt(
     hd_normalization_denominator = (
         float(batch_size * sequence_length) if use_global_hd_normalization else None
     )
+    # Estimate the robust action-effect floor from the complete physical
+    # window, before TBPTT slicing.  Reusing this detached scalar in every
+    # segment keeps action-effect normalization invariant to segment length while
+    # retaining the per-timestep RMS normalization inside the loss.
+    effect_normalization_floor = (
+        _compute_hd_effect_normalization_floor(batch, sequence_shape, policy_config)
+        if use_global_hd_normalization
+        else None
+    )
 
     local_num_segments = len(segment_loss_weights)
     # Tail-preserving windows intentionally have variable physical lengths.
@@ -1159,6 +1240,7 @@ def update_policy_tbptt(
                 if use_global_hd_normalization:
                     segment_kwargs["flow_loss_weight"] = segment_loss_weights[segment_index]
                     segment_kwargs["hd_normalization_denominator"] = hd_normalization_denominator
+                    segment_kwargs["effect_normalization_floor"] = effect_normalization_floor
                 segment_loss, segment_output, fast_states = unwrapped_policy.forward_sequence_segment(
                     segment_batch,
                     **segment_kwargs,

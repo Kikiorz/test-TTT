@@ -1124,6 +1124,48 @@ class ActionEffectDistillationBreakdown:
     invariance: Tensor
 
 
+def compute_action_effect_normalization_floor(
+    teacher_effect: Tensor,
+    *,
+    eps: float = _EPS,
+) -> Tensor:
+    """Return the detached robust RMS floor used by action-effect distillation.
+
+    The statistic is intentionally separable from
+    :func:`action_effect_distillation_loss`: a sequence trainer can compute it
+    once over the complete physical window and reuse it for every TBPTT
+    segment.  Rows retain their own teacher RMS; this scalar only lower-bounds
+    those per-row scales.  Consequently truncation boundaries cannot change a
+    row's normalization while large effects still normalize by their own
+    magnitude.
+
+    Non-finite coordinates are treated as padded zeros, matching the public
+    loss.  The median is taken over positive row-wise RMS values.  An all-zero
+    window uses unit scale, and the small numerical lower bound preserves the
+    historical behavior for sub-quantization effects.
+    """
+
+    if eps <= 0:
+        raise ValueError("eps must be positive")
+    if not isinstance(teacher_effect, Tensor) or teacher_effect.ndim == 0:
+        raise ValueError("teacher_effect must have a feature dimension")
+    safe_effect = teacher_effect.detach()
+    safe_effect = torch.where(
+        torch.isfinite(safe_effect),
+        safe_effect,
+        torch.zeros_like(safe_effect),
+    )
+    teacher_rms = safe_effect.square().mean(dim=-1).sqrt()
+    flat_rms = teacher_rms.reshape(-1)
+    positive_rms = flat_rms[torch.isfinite(flat_rms) & (flat_rms > eps)]
+    positive_floor = safe_effect.new_tensor(1e-3)
+    if positive_rms.numel():
+        floor = positive_rms.median().clamp_min(positive_floor)
+    else:
+        floor = safe_effect.new_tensor(1.0)
+    return floor.detach()
+
+
 def action_effect_distillation_loss(
     student_true: Tensor,
     student_wrong: Tensor,
@@ -1135,6 +1177,7 @@ def action_effect_distillation_loss(
     valid_mask: Tensor | None = None,
     reduction: Literal["mean", "sum", "none"] = "mean",
     return_components: bool = False,
+    normalization_floor: Tensor | float | None = None,
     eps: float = _EPS,
 ) -> Tensor | ActionEffectDistillationBreakdown:
     """Distill *how memory changes the action*, with writer gradients intact.
@@ -1145,7 +1188,9 @@ def action_effect_distillation_loss(
     writer.  The teacher is detached, while both student branches receive
     gradients.  A dimensionless robust scale (the median non-zero teacher
     effect RMS) prevents a single large action coordinate or task from
-    dominating the objective.
+    dominating the objective.  ``normalization_floor`` may provide that
+    scalar from the complete trajectory; when omitted, it is computed from
+    this call's teacher batch for backward compatibility.
 
     ``d_s = student_true - student_wrong`` and
     ``d_t = teacher_true - teacher_wrong`` (or the explicit ``teacher_effect``)
@@ -1228,13 +1273,24 @@ def action_effect_distillation_loss(
     # which remains finite and still teaches the student that an intervention
     # with no measured effect should not change the action.
     teacher_rms = teacher_effect.square().mean(dim=-1).sqrt()
-    flat_rms = teacher_rms.reshape(-1)
-    positive_rms = flat_rms[torch.isfinite(flat_rms) & (flat_rms > eps)]
     positive_floor = teacher_effect.new_tensor(1e-3)
-    if positive_rms.numel():
-        floor = positive_rms.median().clamp_min(positive_floor)
+    if normalization_floor is None:
+        floor = compute_action_effect_normalization_floor(
+            teacher_effect,
+            eps=eps,
+        )
     else:
-        floor = teacher_effect.new_tensor(1.0)
+        floor = torch.as_tensor(
+            normalization_floor,
+            device=teacher_effect.device,
+            dtype=teacher_effect.dtype,
+        ).detach()
+        if floor.numel() != 1:
+            raise ValueError("normalization_floor must be a scalar")
+        floor = floor.reshape(())
+        if not bool(torch.isfinite(floor).item()) or not bool((floor > 0).item()):
+            raise ValueError("normalization_floor must be finite and positive")
+        floor = floor.clamp_min(positive_floor)
     scale = teacher_rms.clamp_min(floor).unsqueeze(-1)
     normalized_delta_error = (student_effect - teacher_effect) / scale
     normalized_invariance = student_effect / scale
@@ -1375,6 +1431,7 @@ __all__ = [
     "build_event_block_mask",
     "compute_hindsight_attribution",
     "compute_robust_hindsight_attribution",
+    "compute_action_effect_normalization_floor",
     "counterfactual_grounding_loss",
     "action_effect_distillation_loss",
     "adaptive_topk_mean",

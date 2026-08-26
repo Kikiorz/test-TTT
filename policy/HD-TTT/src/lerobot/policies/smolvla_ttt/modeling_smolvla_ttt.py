@@ -1248,6 +1248,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         local_ttt_loss: Tensor | None = None,
         predicted_write_gate: Tensor | None = None,
         normalization_denominator: float | Tensor | None = None,
+        effect_normalization_floor: float | Tensor | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         """Compute optional HD terms from training-only teacher/intervention labels.
 
@@ -1703,6 +1704,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 valid_mask=effect_valid > 0,
                 reduction="none",
                 return_components=True,
+                normalization_floor=effect_normalization_floor,
             )
             effect_loss = effect_parts.total
             # ``effect_parts.total`` is [B,T] under reduction='none'.  Apply
@@ -1933,6 +1935,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         grounding_states: dict[str, TTTFastStates | None] | None = None,
         flow_loss_weight: float | Tensor | None = None,
         hd_normalization_denominator: float | Tensor | None = None,
+        effect_normalization_floor: float | Tensor | None = None,
     ) -> tuple[Tensor, dict, TTTFastStates]:
         """Train one contiguous TBPTT segment and return its numerical fast state.
 
@@ -1946,10 +1949,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         and ``hd_normalization_denominator`` are optional sequence-level
         controls used by the v2 trainer: the former weights only this segment's
         valid-action flow numerator, while the latter normalizes every HD
-        auxiliary numerator by the full physical-frame count.  Keeping these
-        factors separate makes the objective independent of the chosen TBPTT
-        segment length; omitted values preserve the historical local-mean
-        behavior.
+        auxiliary numerator by the full physical-frame count.
+        ``effect_normalization_floor`` is likewise computed on the complete
+        window and reused by every segment, so the robust action-effect scale
+        does not depend on where TBPTT is split.  Keeping these factors
+        separate makes the objective independent of the chosen TBPTT segment
+        length; omitted values preserve the historical local-mean behavior.
         """
         batch_size, sequence_length = sequence_shape
         expected_flat_batch = batch_size * sequence_length
@@ -2354,6 +2359,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 local_ttt_loss=local_ttt_loss,
                 predicted_write_gate=predicted_write_gate,
                 normalization_denominator=hd_normalization_denominator,
+                effect_normalization_floor=effect_normalization_floor,
             )
         else:
             losses, fast_states = self.model.forward_with_state(

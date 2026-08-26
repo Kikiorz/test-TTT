@@ -15,6 +15,7 @@ from lerobot.policies.smolvla_ttt.hd_ttt import (
     action_effect_distillation_loss,
     adaptive_topk_mean,
     build_episode_event_block_mask,
+    compute_action_effect_normalization_floor,
     compute_hindsight_attribution,
     compute_robust_hindsight_attribution,
     counterfactual_grounding_loss,
@@ -39,6 +40,7 @@ from lerobot.policies.smolvla_ttt.sequence import (
 from lerobot.policies.smolvla_ttt.smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
 from lerobot.policies.smolvla_ttt.ttt import TTTFastState, TTTMLPLayer
 from lerobot.scripts.lerobot_train import (
+    _compute_hd_effect_normalization_floor,
     _normalize_hd_attribution_protocol,
     _tbptt_segment_loss_weights,
 )
@@ -1413,6 +1415,74 @@ def test_action_effect_target_is_scale_invariant_in_normalized_coordinates() -> 
         importance=importance,
     )
     torch.testing.assert_close(base, scaled, rtol=1e-5, atol=1e-5)
+
+
+def test_action_effect_fixed_floor_is_partition_invariant() -> None:
+    """A complete-window floor must be reused when an effect loss is split."""
+
+    # Deliberately make the two halves have very different local medians.  A
+    # fresh floor per segment would scale the first row by 1 instead of the
+    # full-window floor 2 and therefore change the objective.
+    teacher_effect = torch.tensor([1.0, 2.0, 100.0, 200.0]).reshape(1, 4, 1)
+    student_true = torch.zeros_like(teacher_effect)
+    student_wrong = torch.zeros_like(teacher_effect)
+    full_floor = compute_action_effect_normalization_floor(teacher_effect)
+    torch.testing.assert_close(full_floor, torch.tensor(2.0))
+
+    full = action_effect_distillation_loss(
+        student_true,
+        student_wrong,
+        teacher_effect=teacher_effect,
+        importance=torch.ones(1, 4),
+        normalization_floor=full_floor,
+    )
+    first = action_effect_distillation_loss(
+        student_true[:, :2],
+        student_wrong[:, :2],
+        teacher_effect=teacher_effect[:, :2],
+        importance=torch.ones(1, 2),
+        normalization_floor=full_floor,
+    )
+    second = action_effect_distillation_loss(
+        student_true[:, 2:],
+        student_wrong[:, 2:],
+        teacher_effect=teacher_effect[:, 2:],
+        importance=torch.ones(1, 2),
+        normalization_floor=full_floor,
+    )
+    torch.testing.assert_close(full, 0.5 * (first + second))
+
+    # This assertion guards the regression: estimating a median independently
+    # in each segment is observably different for this deliberately skewed
+    # sequence.
+    local_first = action_effect_distillation_loss(
+        student_true[:, :2],
+        student_wrong[:, :2],
+        teacher_effect=teacher_effect[:, :2],
+        importance=torch.ones(1, 2),
+    )
+    assert not torch.allclose(local_first, first)
+
+
+def test_trainer_effect_floor_uses_full_window_and_active_action_dim() -> None:
+    """The trainer helper selects slot 0 and ignores padded action coordinates."""
+
+    labels = torch.zeros(4, 2, 4)
+    # Slot 0's active coordinates have row RMS [1, 2, 100, 200], while the
+    # padded coordinates are intentionally huge and must not affect the floor.
+    labels[:, 0, :2] = torch.tensor(
+        [[1.0, 1.0], [2.0, 2.0], [100.0, 100.0], [200.0, 200.0]]
+    )
+    labels[:, 0, 2:] = 1e6
+    labels[:, 1, :] = -123.0  # ignored event branch
+    config = SimpleNamespace(action_feature=SimpleNamespace(shape=(2,)))
+    floor = _compute_hd_effect_normalization_floor(
+        {"hd_teacher_effect": labels},
+        sequence_shape=(1, 4),
+        policy_config=config,
+    )
+    assert floor is not None
+    torch.testing.assert_close(floor, torch.tensor(2.0))
 
 
 def test_action_effect_backpropagates_through_differentiable_ttt_writer() -> None:
