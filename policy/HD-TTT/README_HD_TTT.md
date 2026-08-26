@@ -297,6 +297,30 @@ label artifact 必须由 clean `smolvla_ttt` teacher 生成，不能用普通 Sm
 
 不匹配的旧 artifact 会直接拒绝，而不是静默解释。推荐保留每个 label shard 的 metadata 和 merge audit trail。
 
+### 7.3 当前正式 recipe 的超参数
+
+除任务专属的 `sequence_length` 外，Color 和 Shuffle-Long 使用同一套模型/优化设置：
+
+| 项目 | 值 |
+| --- | --- |
+| TTT layers | `[12, 13, 14, 15]` |
+| TTT fast hidden dim | `1024` |
+| fast inner learning rate | `0.1`（每层可学习 multiplier） |
+| residual effective gate init | `0.05` |
+| second-order TTT | `false`（first-order，控制显存） |
+| register tokens | `16` |
+| action chunk / executed steps | `50` / `1` |
+| denoising steps | `10` |
+| training stage | `ttt_only`（VLM、expert 和 projection head 冻结） |
+| optimizer | AdamW，lr `1e-4`，betas `(0.9, 0.95)`，weight decay `1e-10` |
+| scheduler | warmup `1000`，decay `30000`，final lr `2.5e-6` |
+| gradient clip | `10` |
+| distributed precision | 4 GPU、`bf16`、batch size `1` |
+| image resize | `[224, 224]`（padding 保持比例） |
+| train / label / eval seed | `1000` / `1729` / `7000`（eval seed 可按实验登记） |
+
+HD 阶段在 clean checkpoint 上开启 `hd_ttt_enabled=true`、`hd_learned_write_gate=true`，并使用 `hd_phase_mode=deployment`、`event_block_size=4`、`max_events=8`、`grounding_min_future_frames=64`、`attribution_threshold=0`。这些值构成当前两任务的可复现实验 protocol；做 ablation 时必须把改动写入 checkpoint config 和 label metadata。
+
 ## 8. MIKASA-Robo-VLA 实验
 
 MIKASA 的官方安装、任务定义和评估协议见：
