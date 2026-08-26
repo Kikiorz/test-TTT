@@ -491,6 +491,12 @@ HD-v2 阶段在 clean prefix-writer checkpoint 上开启
 任务共享的预注册 protocol；做 ablation 时必须把改动写入 checkpoint config 和
 label metadata，不能只在命令行临时覆盖而不留 provenance。
 
+`examples/mikasa/train_hd_ttt.sh` 也把这一条作为入口契约：当
+`HD_ENABLED=true` 且调用者没有显式设置 `TTT_WRITER_MODE` 时，自动选择
+`prefix_only`；clean/legacy 调用仍默认 `suffix`。显式设置始终优先，因此
+`suffix` 只能作为登记过的兼容或结构消融，而不会因为漏写一个环境变量而被误报成
+论文主路径。
+
 ### 7.4 参数使用与跨任务复现（辅助审计，不是算法贡献）
 
 HD-TTT 并不是“去掉参数”的方法。`η`、residual gate、各辅助项的
