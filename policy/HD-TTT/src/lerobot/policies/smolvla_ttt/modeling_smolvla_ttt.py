@@ -69,6 +69,32 @@ from .ttt import TTTBoundedTrace, TTTFastState, TTTMLPLayer, TTTStateTransition
 
 TTTFastStates = dict[int, TTTFastState]
 
+# The paired CreditTTT V3 replay is checkpointed with ``save_on_cpu`` by
+# default.  This keeps peak device memory bounded when a 10-step replay runs
+# alongside the second-order training graph, at the cost of moving saved
+# activations over the device/host boundary.  On a machine with enough device
+# headroom those transfers can dominate replay wall time, so allow an explicit
+# opt-out without changing the scientific default.  The value is intentionally
+# parsed at call time (rather than import time) so launchers/tests can set it
+# after importing this module.
+_CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV = "CREDIT_TTT_REPLAY_SAVE_ON_CPU"
+
+
+def _credit_ttt_replay_save_on_cpu_enabled() -> bool:
+    """Return whether V3 replay checkpoint tensors should be moved to CPU.
+
+    ``CREDIT_TTT_REPLAY_SAVE_ON_CPU`` defaults to enabled.  Set it to one of
+    ``0``, ``false``, ``off``, or ``no`` only when the training job has enough
+    GPU memory for the replay graph; disabling the offload is an exact
+    recomputation optimization, but increases peak device memory.  Unknown
+    values intentionally retain the safe/default behavior.
+    """
+
+    value = os.environ.get(_CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV)
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "off", "no"}
+
 
 def _coerce_sequence_offset(value: object | None) -> int:
     """Normalize a sequence origin carried through the policy batch.
@@ -4939,22 +4965,38 @@ class SmolVLATTTFlowMatching(nn.Module):
             del _checkpoint_token
             # Keep the hook inside the closure so it is active during both
             # the original checkpointed forward and backward-time
-            # recomputation.  Saved replay activations are moved to host RAM;
-            # no tensor is detached and the final-action gradient contract is
-            # unchanged.  This is needed because a paired ten-step VLM replay
-            # can otherwise exceed the 32-GB device alongside the main
-            # second-order sequence graph.
-            with save_on_cpu(pin_memory=False):
-                return self.sample_actions(
-                    paired_images,
-                    paired_masks,
-                    paired_lang_tokens,
-                    paired_lang_masks,
-                    paired_state_input,
-                    noise=paired_noise,
-                    previous_action=paired_previous,
-                    _expert_layer_callback_factory=callback_factory,
-                )
+            # recomputation.  Saved replay activations are moved to host RAM
+            # by default; no tensor is detached and the final-action gradient
+            # contract is unchanged.  This is needed because a paired
+            # ten-step VLM replay can otherwise exceed the 32-GB device
+            # alongside the main second-order sequence graph.  Jobs with
+            # measured device headroom may set
+            # ``CREDIT_TTT_REPLAY_SAVE_ON_CPU=0`` to avoid the host-transfer
+            # overhead; the replay computation and denoise count are identical
+            # in either mode.
+            replay_kwargs = dict(
+                noise=paired_noise,
+                previous_action=paired_previous,
+                _expert_layer_callback_factory=callback_factory,
+            )
+            if _credit_ttt_replay_save_on_cpu_enabled():
+                with save_on_cpu(pin_memory=False):
+                    return self.sample_actions(
+                        paired_images,
+                        paired_masks,
+                        paired_lang_tokens,
+                        paired_lang_masks,
+                        paired_state_input,
+                        **replay_kwargs,
+                    )
+            return self.sample_actions(
+                paired_images,
+                paired_masks,
+                paired_lang_tokens,
+                paired_lang_masks,
+                paired_state_input,
+                **replay_kwargs,
+            )
 
         # Full-flow replay is only introduced by the V3 auxiliary objectives.
         # In training it can otherwise retain a second ten-step VLM graph for

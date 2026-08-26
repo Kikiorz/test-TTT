@@ -27,6 +27,8 @@ from lerobot.policies.smolvla_ttt.hd_ttt import (
 from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import (
     SmolVLATTTFlowMatching,
     SmolVLATTTPolicy,
+    _CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV,
+    _credit_ttt_replay_save_on_cpu_enabled,
     _hd_loss_balance_metrics,
     _hd_ttt_parameter_range_metrics,
     _restore_checkpoint_model_fields,
@@ -101,6 +103,23 @@ def test_stable_inner_update_flag_is_serialized_and_defaults_off(tmp_path: Path)
     config._save_pretrained(tmp_path)
     payload = json.loads((tmp_path / "config.json").read_text())
     assert payload["ttt_stable_inner_update"] is True
+
+
+def test_v3_replay_save_on_cpu_toggle_defaults_safe_and_parses_explicit_opt_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The replay memory guard stays on unless a launcher opts out explicitly."""
+
+    monkeypatch.delenv(_CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV, raising=False)
+    assert _credit_ttt_replay_save_on_cpu_enabled() is True
+
+    for value in ("0", "false", "OFF", "no"):
+        monkeypatch.setenv(_CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV, value)
+        assert _credit_ttt_replay_save_on_cpu_enabled() is False
+
+    for value in ("1", "true", "on", "unexpected"):
+        monkeypatch.setenv(_CREDIT_TTT_REPLAY_SAVE_ON_CPU_ENV, value)
+        assert _credit_ttt_replay_save_on_cpu_enabled() is True
 
 
 def test_hd_loss_balance_diagnostics_are_scale_explicit_and_zero_safe() -> None:
