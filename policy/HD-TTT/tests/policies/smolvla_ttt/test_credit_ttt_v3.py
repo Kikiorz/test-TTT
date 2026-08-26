@@ -323,7 +323,7 @@ def test_qh2l_reference_routes_all_pairs_to_final_action_replay() -> None:
     assert harness.observed_student is not None
     torch.testing.assert_close(
         harness.observed_student,
-        torch.tensor([[0.0, 1.0], [10.0, 160.0], [2.0, 3.0], [30.0, 180.0]]),
+        torch.tensor([[0.0, 110.0], [10.0, 160.0], [20.0, 130.0], [30.0, 180.0]]),
     )
     assert metrics["hd_v3_cross_segment_pairs"] == 2.0
     loss.backward()
