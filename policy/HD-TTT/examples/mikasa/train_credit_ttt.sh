@@ -137,7 +137,11 @@ FEATURES_PATH="${FEATURES_PATH:-${OUTPUT_ROOT}/full_history_features.pt}"
 TEACHER_CHECKPOINT="${TEACHER_CHECKPOINT:-${OUTPUT_ROOT}/full_history_teacher.pt}"
 LABEL_PATH="${LABEL_PATH:-${OUTPUT_ROOT}/credit_pairs.pt}"
 STUDENT_OUTPUT_DIR="${STUDENT_OUTPUT_DIR:-${OUTPUT_ROOT}/student}"
-TRAINING_METADATA_PATH="${TRAINING_METADATA_PATH:-${STUDENT_OUTPUT_DIR}/training_metadata.json}"
+# Keep provenance beside (rather than inside) the trainer output directory.
+# lerobot_train intentionally refuses to start in a non-empty output directory
+# when resume=false; placing this sidecar under ``student/`` would therefore
+# make every fresh canonical run fail during its own preflight.
+TRAINING_METADATA_PATH="${TRAINING_METADATA_PATH:-${OUTPUT_ROOT}/training_metadata.json}"
 
 FEATURE_EPISODE_START="${FEATURE_EPISODE_START:-0}"
 FEATURE_EPISODE_END="${FEATURE_EPISODE_END:-250}"
@@ -214,7 +218,7 @@ case "${V3_ABLATION}" in
     exit 2
     ;;
 esac
-# The paper recipe trains each task-specific student for at least 100 complete
+# The paper recipe trains each task-specific student for at least 150 complete
 # passes over the selected episode windows.  A shorter run is allowed only
 # when the caller explicitly marks it as a smoke/pilot run; this prevents a
 # 3k-step diagnostic from being accidentally promoted to a paper checkpoint.
