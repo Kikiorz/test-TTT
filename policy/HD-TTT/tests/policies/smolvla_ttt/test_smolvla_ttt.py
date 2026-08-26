@@ -38,7 +38,10 @@ from lerobot.policies.smolvla_ttt.sequence import (
 )
 from lerobot.policies.smolvla_ttt.smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
 from lerobot.policies.smolvla_ttt.ttt import TTTFastState, TTTMLPLayer
-from lerobot.scripts.lerobot_train import _tbptt_segment_loss_weights
+from lerobot.scripts.lerobot_train import (
+    _normalize_hd_attribution_protocol,
+    _tbptt_segment_loss_weights,
+)
 
 
 class _EpisodeDataset(Dataset):
@@ -171,6 +174,17 @@ def test_hd_attribution_protocol_aliases_serialize_canonically() -> None:
     )
     assert (
         SmolVLATTTConfig(hd_attribution_protocol="v2").hd_attribution_protocol
+        == "v2_relative_antithetic_robust"
+    )
+
+
+def test_train_contract_normalizes_null_attribution_protocol() -> None:
+    assert (
+        _normalize_hd_attribution_protocol(None, default="legacy_raw_hinge_max")
+        == "legacy_raw_hinge_max"
+    )
+    assert (
+        _normalize_hd_attribution_protocol("v2", default="legacy_raw_hinge_max")
         == "v2_relative_antithetic_robust"
     )
 

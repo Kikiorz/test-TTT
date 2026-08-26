@@ -1232,7 +1232,11 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         copied = dict(metadata)
         # Artifacts generated before v2 did not carry an explicit protocol;
         # infer the legacy contract so they remain mergeable and auditable.
-        copied.setdefault("attribution_protocol", HD_ATTRIBUTION_PROTOCOL_LEGACY)
+        # ``setdefault`` does not replace an explicit JSON null.  Treat null
+        # exactly like a missing field so legacy shards remain mergeable.
+        copied["attribution_protocol"] = copied.get(
+            "attribution_protocol", HD_ATTRIBUTION_PROTOCOL_LEGACY
+        ) or HD_ATTRIBUTION_PROTOCOL_LEGACY
         copied.setdefault("attribution_slot_mode", "all")
         copied.setdefault("attribution_replays", 1)
         # Resolve the default after normalizing the protocol: legacy artifacts

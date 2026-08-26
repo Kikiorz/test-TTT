@@ -471,7 +471,9 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
         # checking the shared contract while rejecting malformed values below.
         if shard_meta.get("teacher_ttt_stable_inner_update") is None:
             shard_meta["teacher_ttt_stable_inner_update"] = False
-        protocol = shard_meta.get("attribution_protocol", HD_ATTRIBUTION_PROTOCOL_LEGACY)
+        # ``dict.get(..., default)`` preserves an explicit JSON null; older
+        # shards used null for this optional field, so normalize it to legacy.
+        protocol = shard_meta.get("attribution_protocol") or HD_ATTRIBUTION_PROTOCOL_LEGACY
         if protocol in {"legacy", "v1"}:
             protocol = HD_ATTRIBUTION_PROTOCOL_LEGACY
         elif protocol == "v2":

@@ -90,6 +90,29 @@ from .lerobot_eval import eval_policy_all
 # frame/window label artifact generated with a different rule can have a
 # single-branch ``hd_rho`` that no longer matches its stored wrong velocity.
 _HD_GROUNDING_EVENT_POLICY = "min_future_horizon_mean_else_total_credit"
+_HD_ATTRIBUTION_PROTOCOL_LEGACY = "legacy_raw_hinge_max"
+_HD_ATTRIBUTION_PROTOCOL_V2 = "v2_relative_antithetic_robust"
+
+
+def _normalize_hd_attribution_protocol(value: Any, *, default: str) -> str:
+    """Canonicalize an HD label protocol, including legacy JSON ``null``.
+
+    Early artifacts omitted this optional field (and some serializers emitted
+    it as explicit ``null``).  Treat both forms as the legacy protocol rather
+    than converting ``None`` to the literal string ``"None"`` and rejecting a
+    otherwise valid artifact.  Unknown values are left as strings so the
+    caller can raise the existing contract error with a useful value.
+    """
+
+    if value is None:
+        value = default
+    if not isinstance(value, str):
+        value = str(value)
+    if value in {"legacy", "v1"}:
+        return _HD_ATTRIBUTION_PROTOCOL_LEGACY
+    if value == "v2":
+        return _HD_ATTRIBUTION_PROTOCOL_V2
+    return value
 
 
 def _hd_ttt_finite_guard(
@@ -393,29 +416,23 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
     # files predate this field and are interpreted as the raw-hinge protocol;
     # this keeps old checkpoints loadable while preventing a silent mix of
     # slot-0/antithetic labels with the legacy all-slot objective.
-    artifact_attribution_protocol = str(
-        metadata.get("attribution_protocol", "legacy_raw_hinge_max")
+    artifact_attribution_protocol = _normalize_hd_attribution_protocol(
+        metadata.get("attribution_protocol"),
+        default=_HD_ATTRIBUTION_PROTOCOL_LEGACY,
     )
-    if artifact_attribution_protocol in {"legacy", "v1"}:
-        artifact_attribution_protocol = "legacy_raw_hinge_max"
-    elif artifact_attribution_protocol == "v2":
-        artifact_attribution_protocol = "v2_relative_antithetic_robust"
     if artifact_attribution_protocol not in {
-        "legacy_raw_hinge_max",
-        "v2_relative_antithetic_robust",
+        _HD_ATTRIBUTION_PROTOCOL_LEGACY,
+        _HD_ATTRIBUTION_PROTOCOL_V2,
     }:
         raise ValueError(
             "HD labels have unsupported attribution_protocol="
             f"{artifact_attribution_protocol!r}"
         )
-    expected_attribution_protocol = getattr(
-        policy_cfg, "hd_attribution_protocol", artifact_attribution_protocol
+    expected_attribution_protocol = _normalize_hd_attribution_protocol(
+        getattr(policy_cfg, "hd_attribution_protocol", artifact_attribution_protocol),
+        default=_HD_ATTRIBUTION_PROTOCOL_LEGACY,
     )
-    if expected_attribution_protocol in {"legacy", "v1"}:
-        expected_attribution_protocol = "legacy_raw_hinge_max"
-    elif expected_attribution_protocol == "v2":
-        expected_attribution_protocol = "v2_relative_antithetic_robust"
-    if str(expected_attribution_protocol) != artifact_attribution_protocol:
+    if expected_attribution_protocol != artifact_attribution_protocol:
         raise ValueError(
             "HD attribution protocol mismatch: artifact uses "
             f"{artifact_attribution_protocol!r}, policy.hd_attribution_protocol="

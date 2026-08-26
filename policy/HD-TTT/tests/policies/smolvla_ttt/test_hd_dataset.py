@@ -75,6 +75,24 @@ def test_episode_records_and_nested_metadata_are_supported(tmp_path) -> None:
     assert [labeled[i]["hd_rho"].item() for i in range(5)] == list(range(5))
 
 
+def test_explicit_null_attribution_protocol_is_legacy(tmp_path) -> None:
+    """Early JSON/torch artifacts may encode the optional protocol as null."""
+
+    dataset = _EpisodeDataset([2])
+    path = tmp_path / "labels.pt"
+    torch.save(
+        {
+            "hd_rho": torch.ones(2),
+            "metadata": {"attribution_protocol": None},
+        },
+        path,
+    )
+
+    labeled = HindsightLabelDataset(dataset, path)
+
+    assert labeled.hd_attribution_protocol == "legacy_raw_hinge_max"
+
+
 def test_full_attribution_matrix_is_reduced_to_future_weight(tmp_path) -> None:
     dataset = _EpisodeDataset([4])
     matrix = torch.zeros(4, 4)

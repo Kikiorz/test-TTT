@@ -206,7 +206,10 @@ class HindsightLabelDataset(Dataset):
         if isinstance(payload, Mapping) and isinstance(payload.get("metadata"), Mapping):
             self.label_metadata = dict(payload["metadata"])
             self.hd_window_local = bool(self.label_metadata.get("window_local", False))
-            protocol = self.label_metadata.get("attribution_protocol", "legacy_raw_hinge_max")
+            # ``dict.get`` keeps an explicit JSON null, which appeared in a
+            # few early artifacts; normalize it to the legacy protocol just
+            # like a missing field.
+            protocol = self.label_metadata.get("attribution_protocol") or "legacy_raw_hinge_max"
             if protocol in {"legacy", "v1"}:
                 protocol = "legacy_raw_hinge_max"
             elif protocol == "v2":
