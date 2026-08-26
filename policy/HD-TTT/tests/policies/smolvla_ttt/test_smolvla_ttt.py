@@ -178,6 +178,33 @@ def test_pretrained_config_clean_opt_out_zeros_stale_effect_weight(tmp_path: Pat
         )
 
 
+def test_pretrained_config_clean_opt_out_zeros_v2_effect_source(tmp_path: Path) -> None:
+    """The same clean shorthand also works for a valid no-gate v2 checkpoint."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "smolvla_ttt",
+                "hd_ttt_enabled": True,
+                "hd_learned_write_gate": False,
+                "hd_effect_weight": 1.0,
+                "hd_attribution_protocol": "v2_relative_antithetic_robust",
+                "ttt_second_order": True,
+            }
+        )
+    )
+
+    loaded = PreTrainedConfig.from_pretrained(
+        tmp_path,
+        cli_overrides=["--hd_ttt_enabled=false"],
+    )
+
+    assert isinstance(loaded, SmolVLATTTConfig)
+    assert loaded.hd_ttt_enabled is False
+    assert loaded.hd_learned_write_gate is False
+    assert loaded.hd_effect_weight == 0.0
+
+
 def test_config_allows_disabling_register_tokens_and_rejects_negative_count() -> None:
     assert SmolVLATTTConfig(ttt_num_register_tokens=0).ttt_num_register_tokens == 0
     with pytest.raises(ValueError, match="ttt_num_register_tokens must be non-negative"):
