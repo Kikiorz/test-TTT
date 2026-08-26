@@ -27,9 +27,57 @@ def _manifest(tmp_path: Path, *, n_episodes: int = 2) -> dict:
             "200",
             "--train-seeds",
             "1000",
+            "--task-set",
+            "legacy_two",
         ]
     )
     return benchmark.build_manifest(args)
+
+
+def test_published_four_task_profile_schema(tmp_path: Path) -> None:
+    parser = benchmark._build_parser()
+    args = parser.parse_args(
+        [
+            "manifest",
+            "--output",
+            str(tmp_path / "published_manifest.json"),
+            "--repo-root",
+            str(tmp_path),
+            "--python-bin",
+            "python",
+            "--n-episodes",
+            "1",
+            "--train-seeds",
+            "1000",
+            "--task-set",
+            "published_four",
+        ]
+    )
+    manifest = benchmark.build_manifest(args)
+    assert manifest["task_set"] == "published_four"
+    assert manifest["protocol_id"] == benchmark.PUBLISHED_FOUR_TASK_PROTOCOL_ID
+    assert [task["id"] for task in manifest["tasks"]] == [
+        "shell_touch",
+        "intercept_medium",
+        "remember_color3",
+        "remember_color9",
+    ]
+    assert [task["env_id"] for task in manifest["tasks"]] == [
+        "ShellGameTouch-VLA-v0",
+        "InterceptMedium-VLA-v0",
+        "RememberColor3-VLA-v0",
+        "RememberColor9-VLA-v0",
+    ]
+    assert set(manifest["mechanism_audits"]["delay_bins_by_task"]) == {
+        "shell_touch",
+        "intercept_medium",
+        "remember_color3",
+        "remember_color9",
+    }
+    assert manifest["mechanism_audits"]["delay_bins"] == ["1-16"]
+    # Four tasks × one train seed × four method variants.  Native K=50 and K=1
+    # still point to the same frozen checkpoint, differing only in cadence.
+    assert len(manifest["commands"]) == 16
 
 
 def test_manifest_separates_native_cadences(tmp_path: Path) -> None:

@@ -55,7 +55,8 @@ Required for executable stages:
   DATASET_REPO_ID, DATASET_ROOT, BASE_CHECKPOINT
 
 Useful overrides:
-  TASK_ID=color|shuffle_long, TRAIN_EPISODE_END=200,
+  TASK_ID=color|shuffle_long|shell_touch|intercept_medium|remember_color3|remember_color9,
+  TRAIN_EPISODE_END=200,
   FEATURE_EPISODE_END=250, OUTPUT_ROOT=..., SEED=1000,
   NATIVE_CHECKPOINT=..., CLEAN_CHECKPOINT=...
 
@@ -92,8 +93,28 @@ case "${TASK_ID}" in
     DEFAULT_DATASET_REPO_ID="shell_game_shuffle_color_lamp_touch_long_vla_v0"
     DEFAULT_ENV_ID="ShellGameShuffleColorLampTouch-Long-VLA-v0"
     ;;
+  shell_touch|shell_game_touch)
+    TASK_ID="shell_touch"
+    DEFAULT_DATASET_REPO_ID="shell_game_touch_vla_v0"
+    DEFAULT_ENV_ID="ShellGameTouch-VLA-v0"
+    ;;
+  intercept_medium|intercept)
+    TASK_ID="intercept_medium"
+    DEFAULT_DATASET_REPO_ID="intercept_medium_vla_v0"
+    DEFAULT_ENV_ID="InterceptMedium-VLA-v0"
+    ;;
+  remember_color3|remember_color_3)
+    TASK_ID="remember_color3"
+    DEFAULT_DATASET_REPO_ID="remember_color_3_vla_v0"
+    DEFAULT_ENV_ID="RememberColor3-VLA-v0"
+    ;;
+  remember_color9|remember_color_9)
+    TASK_ID="remember_color9"
+    DEFAULT_DATASET_REPO_ID="remember_color_9_vla_v0"
+    DEFAULT_ENV_ID="RememberColor9-VLA-v0"
+    ;;
   *)
-    echo "TASK_ID must be color or shuffle_long, got '${TASK_ID}'" >&2
+    echo "TASK_ID must be one of color, shuffle_long, shell_touch, intercept_medium, remember_color3, remember_color9; got '${TASK_ID}'" >&2
     exit 2
     ;;
 esac

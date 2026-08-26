@@ -54,7 +54,16 @@ except ImportError as exc:  # pragma: no cover - project runtime always has nump
     raise RuntimeError("This benchmark coordinator requires numpy") from exc
 
 
-PROTOCOL_ID = "credit_ttt_v3_mikasa_two_task"
+# The benchmark envelope is versioned independently from the model's canonical
+# CreditTTT identity below.  The published-four profile is the default paper
+# profile; the original two-task profile remains loadable for old runs.
+PUBLISHED_FOUR_TASK_PROTOCOL_ID = "credit_ttt_v3_mikasa_published_four_task"
+LEGACY_TWO_TASK_PROTOCOL_ID = "credit_ttt_v3_mikasa_two_task"
+SUPPORTED_PROTOCOL_IDS = {
+    PUBLISHED_FOUR_TASK_PROTOCOL_ID,
+    LEGACY_TWO_TASK_PROTOCOL_ID,
+}
+PROTOCOL_ID = PUBLISHED_FOUR_TASK_PROTOCOL_ID
 PROTOCOL_VERSION = "credit_ttt_v3_baseline_protocol_1"
 # Checkpoint/label implementations may serialize the same method under one
 # of these names.  Keep the benchmark manifest version out of this set: it is
@@ -102,7 +111,7 @@ DEFAULT_TORCH_SEED = 7_000
 DEFAULT_TRAIN_SEEDS = (1000, 1001, 1002)
 DEFAULT_RESULTS_ROOT = "benchmark_results/credit_ttt_v3"
 
-DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
+LEGACY_TWO_TASKS: tuple[dict[str, Any], ...] = (
     {
         "id": "color",
         "env_id": "ShellGameColorLampTouch-VLA-v0",
@@ -130,6 +139,94 @@ DEFAULT_TASKS: tuple[dict[str, Any], ...] = (
         "delay_bins_present": ["1-16", "17-64", "65-256", "257-1024"],
     },
 )
+
+# Four tasks selected because their environment IDs and abbreviations are
+# present in the published MemoryVLA MIKASA-Robo table (SGT, IM, RC3, RC9).
+# They deliberately span a simple spatial interaction, a dynamic interception
+# task, and low/high-capacity object-memory tasks while retaining one common
+# short-horizon evaluation cadence.  Dataset roots are explicit so each task's
+# normalization statistics remain isolated.
+PUBLISHED_COMPARABLE_TASKS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "shell_touch",
+        "env_id": "ShellGameTouch-VLA-v0",
+        "dataset_repo_id": "shell_game_touch_vla_v0",
+        "dataset_root": "/workspace/data_mikasa_robo/data_lerobot/shell_game_touch_vla_v0",
+        "horizon_split": "Short",
+        "memory_type": "Spatial",
+        "max_episode_steps": 30,
+        "demo_count": 250,
+        "train_demo_indices": [0, 199],
+        "validation_demo_indices": [200, 249],
+        "delay_bins_present": ["1-16"],
+        "published_abbreviation": "SGT",
+    },
+    {
+        "id": "intercept_medium",
+        "env_id": "InterceptMedium-VLA-v0",
+        "dataset_repo_id": "intercept_medium_vla_v0",
+        "dataset_root": "/workspace/data_mikasa_robo/data_lerobot/intercept_medium_vla_v0",
+        "horizon_split": "Short",
+        "memory_type": "Spatial",
+        "max_episode_steps": 60,
+        "demo_count": 250,
+        "train_demo_indices": [0, 199],
+        "validation_demo_indices": [200, 249],
+        "delay_bins_present": ["1-16"],
+        "published_abbreviation": "IM",
+    },
+    {
+        "id": "remember_color3",
+        "env_id": "RememberColor3-VLA-v0",
+        "dataset_repo_id": "remember_color_3_vla_v0",
+        "dataset_root": "/workspace/data_mikasa_robo/data_lerobot/remember_color_3_vla_v0",
+        "horizon_split": "Short",
+        "memory_type": "Object",
+        "max_episode_steps": 25,
+        "demo_count": 250,
+        "train_demo_indices": [0, 199],
+        "validation_demo_indices": [200, 249],
+        "delay_bins_present": ["1-16"],
+        "published_abbreviation": "RC3",
+    },
+    {
+        "id": "remember_color9",
+        "env_id": "RememberColor9-VLA-v0",
+        "dataset_repo_id": "remember_color_9_vla_v0",
+        "dataset_root": "/workspace/data_mikasa_robo/data_lerobot/remember_color_9_vla_v0",
+        "horizon_split": "Short",
+        "memory_type": "Object",
+        "max_episode_steps": 25,
+        "demo_count": 250,
+        "train_demo_indices": [0, 199],
+        "validation_demo_indices": [200, 249],
+        "delay_bins_present": ["1-16"],
+        "published_abbreviation": "RC9",
+    },
+)
+
+# Keep the historical public name as an alias for callers that imported it.
+# New manifests select a profile explicitly (published_four by default).
+DEFAULT_TASKS = LEGACY_TWO_TASKS
+TASK_SET_ALIASES = {
+    "published_four": "published_four",
+    "published": "published_four",
+    "four": "published_four",
+    "legacy_two": "legacy_two",
+    "legacy": "legacy_two",
+    "two": "legacy_two",
+}
+TASK_SETS: dict[str, tuple[dict[str, Any], ...]] = {
+    "published_four": PUBLISHED_COMPARABLE_TASKS,
+    "legacy_two": LEGACY_TWO_TASKS,
+}
+TASK_SET_PROTOCOL_IDS = {
+    "published_four": PUBLISHED_FOUR_TASK_PROTOCOL_ID,
+    "legacy_two": LEGACY_TWO_TASK_PROTOCOL_ID,
+}
+DEFAULT_TASK_SET = "published_four"
+
+_DELAY_BIN_ORDER = ("1-16", "17-64", "65-256", "257-1024", "1025+")
 
 # These names are intentionally stable and human-readable in tables.  The
 # optional Utility-KVB entry is a mechanism baseline, not a version of our
@@ -645,13 +742,58 @@ def _parse_int_list(value: str) -> list[int]:
     return result
 
 
+def _normalize_task_set(value: str | None) -> str:
+    """Return a canonical task-profile name.
+
+    Aliases are accepted on the command line to make old experiment scripts
+    easy to replay, while the manifest always records one of the two stable
+    profile identifiers.
+    """
+
+    raw = DEFAULT_TASK_SET if value is None else str(value).strip().lower()
+    try:
+        return TASK_SET_ALIASES[raw]
+    except KeyError as exc:
+        choices = ", ".join(sorted(TASK_SETS))
+        raise ValueError(f"Unknown task_set={value!r}; expected one of {choices}") from exc
+
+
 def _task_specs(args: argparse.Namespace) -> list[dict[str, Any]]:
-    tasks = [dict(task) for task in DEFAULT_TASKS]
-    if getattr(args, "color_dataset_root", None):
-        tasks[0]["dataset_root"] = str(Path(args.color_dataset_root))
-    if getattr(args, "shuffle_dataset_root", None):
-        tasks[1]["dataset_root"] = str(Path(args.shuffle_dataset_root))
+    task_set = _normalize_task_set(getattr(args, "task_set", None))
+    tasks = [dict(task) for task in TASK_SETS[task_set]]
+
+    # Root overrides are deliberately keyed by stable task IDs rather than by
+    # positional indices.  This keeps the legacy color/shuffle flags working
+    # and prevents a four-task profile from silently receiving the wrong
+    # normalization statistics when task order changes.
+    root_flags = {
+        "color": "color_dataset_root",
+        "shuffle_long": "shuffle_dataset_root",
+        "shell_touch": "shell_touch_dataset_root",
+        "intercept_medium": "intercept_medium_dataset_root",
+        "remember_color3": "remember_color3_dataset_root",
+        "remember_color9": "remember_color9_dataset_root",
+    }
+    for task in tasks:
+        flag_name = root_flags.get(str(task["id"]))
+        override = getattr(args, flag_name, None) if flag_name else None
+        if override:
+            task["dataset_root"] = str(Path(override))
     return tasks
+
+
+def _union_delay_bins(tasks: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Return the declared delay bins in the protocol's canonical order."""
+
+    present = {
+        str(item)
+        for task in tasks
+        for item in task.get("delay_bins_present", [])
+    }
+    unknown = present.difference(_DELAY_BIN_ORDER)
+    if unknown:
+        raise ValueError(f"Unknown delay bin(s) in task profile: {sorted(unknown)}")
+    return [item for item in _DELAY_BIN_ORDER if item in present]
 
 
 def _method_specs(include_optional: bool) -> list[dict[str, Any]]:
@@ -733,8 +875,10 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     if int(args.start_seed) < 0 or int(args.torch_seed) < 0:
         raise ValueError("seeds must be non-negative")
     train_seeds = _parse_int_list(args.train_seeds)
+    task_set = _normalize_task_set(getattr(args, "task_set", None))
     tasks = _task_specs(args)
     methods = _method_specs(args.include_optional)
+    protocol_id = TASK_SET_PROTOCOL_IDS[task_set]
     checkpoint_map = {
         "native_smolvla": str(args.native_checkpoint),
         # Same frozen native checkpoint as K=50; this map entry changes only
@@ -747,8 +891,9 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint_map["utility_kvb"] = str(args.utility_checkpoint)
 
     manifest: dict[str, Any] = {
-        "protocol_id": PROTOCOL_ID,
+        "protocol_id": protocol_id,
         "protocol_version": PROTOCOL_VERSION,
+        "task_set": task_set,
         # This object authenticates the *model method* and is deliberately
         # independent from the benchmark-envelope version above.  It is
         # copied into every frozen manifest and required on CreditTTT eval
@@ -829,23 +974,23 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "fixed_episode_seeds_across_methods": True,
         },
         "mechanism_audits": {
-            # Delay bins are frozen per task.  Color episodes are only a few
-            # dozen frames long, so reporting 65+ bins for that task would be
-            # a fabricated extrapolation.  Shuffle-Long is the only task in
-            # this manifest with enough frames for the longer bins.
+            # Delay bins are frozen per task.  Short episodes only support the
+            # 1--16 bin; longer bins are included only by profiles whose task
+            # metadata declares enough temporal extent.  Never extrapolate a
+            # delay-bin result beyond the declared task support.
             "delay_bins_by_task": {
-                "color": ["1-16"],
-                "shuffle_long": ["1-16", "17-64", "65-256", "257-1024"],
+                str(task["id"]): list(task.get("delay_bins_present", []))
+                for task in tasks
             },
             # Union retained for consumers that expect one flat list.  The
             # task-specific map above is authoritative for tables/plots.
-            "delay_bins": ["1-16", "17-64", "65-256", "257-1024"],
+            "delay_bins": _union_delay_bins(tasks),
             "pairwise_teacher_effect": {
                 "metric": "pairwise_high_utility_delta_a_cosine",
                 "group_by": ["task_id", "delay_bin"],
                 "required_bins": {
-                    "color": ["1-16"],
-                    "shuffle_long": ["1-16", "17-64", "65-256", "257-1024"],
+                    str(task["id"]): list(task.get("delay_bins_present", []))
+                    for task in tasks
                 },
                 "report_confidence_interval": True,
                 "target": "final_slot0_action",
@@ -1758,6 +1903,8 @@ def run_go_no_go_checks(
     *,
     aggregate_payload: Mapping[str, Any] | None = None,
     strict: bool = False,
+    protocol_id: str = PROTOCOL_ID,
+    protocol_version: str = PROTOCOL_VERSION,
 ) -> dict[str, Any]:
     flattened = _flatten_numeric(mechanism_payload)
     checks: list[dict[str, Any]] = []
@@ -1864,8 +2011,8 @@ def run_go_no_go_checks(
     else:
         overall = "GO"
     return {
-        "protocol_id": PROTOCOL_ID,
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_id": str(protocol_id),
+        "protocol_version": str(protocol_version),
         "strict": bool(strict),
         "overall": overall,
         "checks": checks,
@@ -1877,8 +2024,24 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     if not isinstance(manifest, Mapping):
         raise ValueError(f"Manifest must be a JSON object: {path}")
     _verify_manifest(manifest)
-    if manifest.get("protocol_id") != PROTOCOL_ID:
+    if manifest.get("protocol_id") not in SUPPORTED_PROTOCOL_IDS:
         raise ValueError(f"Unsupported protocol_id={manifest.get('protocol_id')!r}")
+    # Manifests generated before the profile split have no ``task_set`` field;
+    # infer the legacy profile from their envelope ID.  New manifests record
+    # the profile explicitly and are checked against the envelope ID.
+    protocol_id = str(manifest.get("protocol_id"))
+    inferred_task_set = (
+        "legacy_two" if protocol_id == LEGACY_TWO_TASK_PROTOCOL_ID else "published_four"
+    )
+    task_set = _normalize_task_set(manifest.get("task_set", inferred_task_set))
+    expected_protocol = TASK_SET_PROTOCOL_IDS[task_set]
+    if protocol_id != expected_protocol:
+        raise ValueError(
+            f"Manifest task_set={task_set!r} conflicts with protocol_id={protocol_id!r}"
+        )
+    raw_tasks = manifest.get("tasks")
+    if not isinstance(raw_tasks, Sequence) or isinstance(raw_tasks, (str, bytes)) or not raw_tasks:
+        raise ValueError("Manifest must contain a non-empty tasks sequence")
     _validate_canonical_v3_identity(
         manifest.get("credit_ttt_protocol"),
         path=f"{path}:credit_ttt_protocol",
@@ -2016,7 +2179,13 @@ def _cmd_check(args: argparse.Namespace) -> int:
             raise ValueError("aggregate JSON must be an object")
         if aggregate.get("manifest_sha256") != manifest.get("manifest_sha256"):
             raise ValueError("aggregate JSON was produced from a different manifest")
-    payload = run_go_no_go_checks(mechanism, aggregate_payload=aggregate, strict=bool(args.strict))
+    payload = run_go_no_go_checks(
+        mechanism,
+        aggregate_payload=aggregate,
+        strict=bool(args.strict),
+        protocol_id=str(manifest["protocol_id"]),
+        protocol_version=str(manifest["protocol_version"]),
+    )
     payload["manifest_sha256"] = manifest["manifest_sha256"]
     payload["credit_ttt_protocol"] = mechanism_identity
     _write_json(Path(args.output), payload)
@@ -2037,6 +2206,8 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
             os.getcwd(),
             "--python-bin",
             "python",
+            "--task-set",
+            "legacy_two",
         ]
     )
     manifest = build_manifest(args)
@@ -2046,6 +2217,8 @@ def _cmd_self_check(_: argparse.Namespace) -> int:
     assert _validate_canonical_v3_identity(
         manifest["credit_ttt_protocol"], path="self-check manifest"
     ) == CANONICAL_V3_PROTOCOL_IDENTITY
+    assert manifest["task_set"] == "legacy_two"
+    assert manifest["protocol_id"] == LEGACY_TWO_TASK_PROTOCOL_ID
     assert sum(command["method_id"] == NATIVE_VARIANT_CHUNK for command in manifest["commands"]) == 2
     assert sum(command["method_id"] == NATIVE_VARIANT_K1 for command in manifest["commands"]) == 2
     assert all(
@@ -2246,12 +2419,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Python interpreter used in generated evaluation commands",
     )
     manifest.add_argument("--results-root", default=DEFAULT_RESULTS_ROOT)
+    manifest.add_argument(
+        "--task-set",
+        choices=tuple(sorted(TASK_SET_ALIASES)),
+        default=DEFAULT_TASK_SET,
+        help=(
+            "Task profile: published_four (default; SGT/IM/RC3/RC9) or "
+            "legacy_two (historical color/shuffle_long). Aliases are accepted."
+        ),
+    )
     manifest.add_argument("--native-checkpoint", default="<CHECKPOINT_NATIVE_SMOLVLA>")
     manifest.add_argument("--clean-checkpoint", default="<CHECKPOINT_CLEAN_TTT>")
     manifest.add_argument("--credit-checkpoint", default="<CHECKPOINT_CREDIT_TTT>")
     manifest.add_argument("--utility-checkpoint", default="<CHECKPOINT_UTILITY_KVB>")
     manifest.add_argument("--color-dataset-root", default=None)
     manifest.add_argument("--shuffle-dataset-root", default=None)
+    manifest.add_argument("--shell-touch-dataset-root", default=None)
+    manifest.add_argument("--intercept-medium-dataset-root", default=None)
+    manifest.add_argument("--remember-color3-dataset-root", default=None)
+    manifest.add_argument("--remember-color9-dataset-root", default=None)
     manifest.add_argument("--train-seeds", default=",".join(map(str, DEFAULT_TRAIN_SEEDS)))
     manifest.add_argument("--n-episodes", type=int, default=DEFAULT_EPISODES)
     manifest.add_argument("--start-seed", type=int, default=DEFAULT_START_SEED)
