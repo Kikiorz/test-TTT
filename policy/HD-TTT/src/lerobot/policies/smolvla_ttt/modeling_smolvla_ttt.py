@@ -1658,7 +1658,22 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 "hd_v3_pairs": 0.0,
                 "hd_v3_pairs_skipped": float(skipped),
             }
-        indices = valid.nonzero(as_tuple=False).flatten()
+        # Rows marked valid but belonging to neither the positive nor null
+        # stratum are intentionally ignored by QH2L below.  Filter them before
+        # replaying student effects: full-flow cross-segment replay is the
+        # expensive part of this objective, and evaluating an inactive row
+        # would only produce a value that is immediately discarded.  This is
+        # an exact optimization because the inactive rows have no contribution
+        # to either branch of ``query_conditioned_local_effect_loss``.
+        active_mask = valid & (pair_labels["positive"] | pair_labels["null"])
+        indices = active_mask.nonzero(as_tuple=False).flatten()
+        if indices.numel() == 0:
+            zero = self.model.action_out_proj.weight.sum() * 0.0
+            return zero, {
+                "hd_v3_qh2l": 0.0,
+                "hd_v3_pairs": 0.0,
+                "hd_v3_pairs_skipped": float(skipped),
+            }
         selected_event = pair_labels["event_index"].index_select(0, indices)
         selected_batch = pair_labels["batch_index"].index_select(0, indices)
         if reference_batch is not None:
@@ -1690,21 +1705,6 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         utility = pair_labels["utility"].index_select(0, indices)
         positive = pair_labels["positive"].index_select(0, indices)
         null = pair_labels["null"].index_select(0, indices)
-        # A pair may be marked neither positive nor null by a custom artifact;
-        # such rows are intentionally ignored instead of inventing a target.
-        active = positive | null
-        student_effect = student_effect[active]
-        teacher_effect = teacher_effect[active]
-        utility = utility[active]
-        positive = positive[active]
-        null = null[active]
-        if student_effect.numel() == 0:
-            zero = self.model.action_out_proj.weight.sum() * 0.0
-            return zero, {
-                "hd_v3_qh2l": 0.0,
-                "hd_v3_pairs": 0.0,
-                "hd_v3_pairs_skipped": float(skipped),
-            }
         active_dim = self._hd_active_action_dim(student_effect, teacher_effect)
         student_effect = student_effect[..., :active_dim]
         teacher_effect = teacher_effect[..., :active_dim]
