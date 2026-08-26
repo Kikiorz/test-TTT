@@ -156,6 +156,13 @@ class SmolVLATTTConfig(PreTrainedConfig):
     # the label/training compute contract explicit instead of silently
     # accepting an artifact generated with a different event budget.
     hd_max_events: int = 0
+    # Minimum number of eligible future frames required when selecting the
+    # single counterfactual branch used by grounding.  This prevents a late
+    # event with only one remaining frame from winning merely because its
+    # credit is averaged over a tiny horizon.  If an episode/window is too
+    # short to satisfy the threshold, the offline builder falls back to the
+    # highest-total-credit positive event.
+    hd_grounding_min_future_frames: int = 64
     hd_attribution_threshold: float = 0.0
     hd_attribution_topk: int = 8
     # Flow velocities in MIKASA's normalized action space are often much
@@ -241,6 +248,8 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("hd_event_block_size must be positive")
         if self.hd_max_events < 0:
             raise ValueError("hd_max_events must be non-negative")
+        if self.hd_grounding_min_future_frames < 0:
+            raise ValueError("hd_grounding_min_future_frames must be non-negative")
         if self.hd_attribution_topk < 0:
             raise ValueError("hd_attribution_topk must be non-negative")
         if self.hd_phase_mode not in {"random", "deployment"}:

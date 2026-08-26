@@ -12,7 +12,9 @@ optional episode-balanced window cap.  Noise is sampled once per episode and
 sliced into every context, so warm-up and target uses are deterministic and
 consistent.  By default ``phase_mode=deployment`` makes the written action
 interaction pure Gaussian noise at ``t=1``; future expert actions remain only
-the offline flow target.
+the offline flow target.  Grounding uses the same single-branch selector as
+``build_hd_labels.py``: events need 64 eligible future frames by default, with
+short contexts falling back to the highest-total-credit positive event.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from torch import Tensor
 
 try:  # Direct ``python examples/mikasa/...py`` invocation.
     from build_hd_labels import (
+        GROUNDING_EVENT_POLICY,
         _episode_labels,
         _episode_table,
         _fixed_noise_time,
@@ -37,6 +40,7 @@ try:  # Direct ``python examples/mikasa/...py`` invocation.
     )
 except ImportError:  # Package-style invocation.
     from .build_hd_labels import (
+        GROUNDING_EVENT_POLICY,
         _episode_labels,
         _episode_table,
         _fixed_noise_time,
@@ -147,6 +151,8 @@ def _window_record(
         "hd_event_starts",
         "hd_event_ends",
         "hd_selected_event",
+        "hd_event_eligible_counts",
+        "hd_event_total_credits",
         "hd_full_flow_loss",
         "hd_event_selection_scores",
     ):
@@ -265,6 +271,7 @@ def _build_shard(args: argparse.Namespace) -> None:
                 max_events=args.max_events,
                 attribution_threshold=args.attribution_threshold,
                 frame_batch_size=args.frame_batch_size,
+                grounding_min_future_frames=args.grounding_min_future_frames,
                 future_mask=future_mask,
                 global_offset=context_start,
             )
@@ -295,6 +302,10 @@ def _build_shard(args: argparse.Namespace) -> None:
                         ]
                         if selected_event[0] >= 0
                         else [-1, -1]
+                    ),
+                    "grounding_selection_mode": labels["hd_grounding_selection_mode"],
+                    "grounding_min_future_frames": int(
+                        labels["hd_grounding_min_future_frames"]
                     ),
                 }
             )
@@ -334,6 +345,8 @@ def _build_shard(args: argparse.Namespace) -> None:
             "max_windows_per_episode": args.max_windows_per_episode,
             "event_block_size": args.event_block_size,
             "max_events": args.max_events,
+            "grounding_event_policy": GROUNDING_EVENT_POLICY,
+            "grounding_min_future_frames": args.grounding_min_future_frames,
             "attribution_threshold": args.attribution_threshold,
             "seed": args.seed,
             "frame_batch_size": args.frame_batch_size,
@@ -371,6 +384,8 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
         "max_windows_per_episode",
         "event_block_size",
         "max_events",
+        "grounding_event_policy",
+        "grounding_min_future_frames",
         "attribution_threshold",
         "seed",
         "phase_mode",
@@ -400,6 +415,19 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
         if missing_metadata:
             raise ValueError(
                 f"Shard {path} is missing window metadata contract fields: {missing_metadata}"
+            )
+        if shard_meta["grounding_event_policy"] != GROUNDING_EVENT_POLICY:
+            raise ValueError(
+                f"Shard {path} has unsupported grounding_event_policy="
+                f"{shard_meta['grounding_event_policy']!r}"
+            )
+        if (
+            type(shard_meta["grounding_min_future_frames"]) is not int
+            or shard_meta["grounding_min_future_frames"] < 0
+        ):
+            raise ValueError(
+                f"Shard {path} has malformed grounding_min_future_frames; "
+                "expected a non-negative int"
             )
         for flag_name in ("teacher_hd_ttt_enabled", "teacher_hd_learned_write_gate"):
             flag_value = shard_meta[flag_name]
@@ -472,6 +500,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-windows-per-episode", type=int, default=None)
     parser.add_argument("--event-block-size", type=int, default=4)
     parser.add_argument("--max-events", type=int, default=0)
+    parser.add_argument(
+        "--grounding-min-future-frames",
+        type=int,
+        default=64,
+        help=(
+            "Minimum eligible future frames for the selected grounding event; "
+            "short contexts fall back to highest total credit (default: 64)"
+        ),
+    )
     parser.add_argument("--attribution-threshold", type=float, default=0.0)
     parser.add_argument("--frame-batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1729)
@@ -493,6 +530,8 @@ def _parse_args() -> argparse.Namespace:
             parser.error("generation requires: " + ", ".join("--" + name.replace("_", "-") for name in missing))
     if args.context_length < 0:
         parser.error("--context-length must be non-negative")
+    if args.grounding_min_future_frames < 0:
+        parser.error("--grounding-min-future-frames must be non-negative")
     if args.frame_batch_size <= 0:
         parser.error("--frame-batch-size must be positive")
     return args

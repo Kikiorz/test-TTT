@@ -82,6 +82,12 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 
+# Keep the offline selected-event rule explicit in the training contract.  A
+# frame/window label artifact generated with a different rule can have a
+# single-branch ``hd_rho`` that no longer matches its stored wrong velocity.
+_HD_GROUNDING_EVENT_POLICY = "min_future_horizon_mean_else_total_credit"
+
+
 def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool):
     """Attach offline HD-TTT labels while preserving the LeRobot dataset API.
 
@@ -124,6 +130,8 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
         "history_mode",
         "event_block_size",
         "max_events",
+        "grounding_event_policy",
+        "grounding_min_future_frames",
         "attribution_threshold",
         "dataset_repo_id",
         "action_chunk_size",
@@ -172,6 +180,9 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
     checks = {
         "event_block_size": getattr(policy_cfg, "hd_event_block_size", None),
         "max_events": getattr(policy_cfg, "hd_max_events", None),
+        "grounding_min_future_frames": getattr(
+            policy_cfg, "hd_grounding_min_future_frames", 64
+        ),
         "attribution_threshold": getattr(policy_cfg, "hd_attribution_threshold", None),
         "action_chunk_size": getattr(policy_cfg, "chunk_size", None),
         "max_action_dim": getattr(policy_cfg, "max_action_dim", None),
@@ -196,6 +207,18 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
     }
     if mismatches:
         raise ValueError(f"HD label/window contract mismatch: {mismatches}")
+    artifact_grounding_policy = metadata.get("grounding_event_policy")
+    if artifact_grounding_policy != _HD_GROUNDING_EVENT_POLICY:
+        raise ValueError(
+            "HD label grounding event policy mismatch: artifact uses "
+            f"{artifact_grounding_policy!r}, expected {_HD_GROUNDING_EVENT_POLICY!r}"
+        )
+    artifact_grounding_horizon = metadata.get("grounding_min_future_frames")
+    if type(artifact_grounding_horizon) is not int or artifact_grounding_horizon < 0:
+        raise ValueError(
+            "HD labels have malformed grounding_min_future_frames; "
+            "expected a non-negative integer"
+        )
 
     if metadata.get("teacher_policy_type") != "smolvla_ttt":
         raise ValueError(

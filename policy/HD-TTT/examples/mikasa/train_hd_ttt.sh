@@ -49,6 +49,7 @@ HD_ENABLED="${HD_ENABLED:-false}"
 HD_LEARNED_GATE="${HD_LEARNED_GATE:-${HD_ENABLED}}"
 HD_PHASE_MODE="${HD_PHASE_MODE:-deployment}"
 HD_MAX_EVENTS="${HD_MAX_EVENTS:-0}"
+HD_GROUNDING_MIN_FUTURE_FRAMES="${HD_GROUNDING_MIN_FUTURE_FRAMES:-64}"
 HD_HCA_WEIGHT="${HD_HCA_WEIGHT:-1.0}"
 HD_H2L_WEIGHT="${HD_H2L_WEIGHT:-1.0}"
 HD_GROUNDING_WEIGHT="${HD_GROUNDING_WEIGHT:-1.0}"
@@ -131,7 +132,7 @@ MAX_EPISODE_LENGTH="$("${PYTHON_BIN}" -c 'import sys; print(sys.argv[1].split()[
 STEPS_PER_EPOCH=$(( (WINDOWS + NUM_PROCESSES - 1) / NUM_PROCESSES ))
 STEPS=$(( STEPS_PER_EPOCH * EPOCHS ))
 
-echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, margin=${HD_COUNTERFACTUAL_MARGIN}, grounding_weight=${HD_GROUNDING_WEIGHT}"
+echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, grounding_min_future=${HD_GROUNDING_MIN_FUTURE_FRAMES}, margin=${HD_COUNTERFACTUAL_MARGIN}, grounding_weight=${HD_GROUNDING_WEIGHT}"
 
 COMMON_ARGS=(
   --dataset.repo_id="${DATASET_REPO_ID}"
@@ -157,6 +158,7 @@ COMMON_ARGS=(
   --policy.hd_learned_write_gate="${HD_LEARNED_GATE}"
   --policy.hd_phase_mode="${HD_PHASE_MODE}"
   --policy.hd_max_events="${HD_MAX_EVENTS}"
+  --policy.hd_grounding_min_future_frames="${HD_GROUNDING_MIN_FUTURE_FRAMES}"
   --policy.hd_hca_weight="${HD_HCA_WEIGHT}"
   --policy.hd_h2l_weight="${HD_H2L_WEIGHT}"
   --policy.hd_grounding_weight="${HD_GROUNDING_WEIGHT}"

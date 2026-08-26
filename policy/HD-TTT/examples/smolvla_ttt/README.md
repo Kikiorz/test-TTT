@@ -39,6 +39,20 @@ HCA intervention labels are training-only. Deployment keeps the ordinary SmolVLA
 one update-then-apply fast-weight write per physical observation, and the recurrent state reset
 at episode boundaries.
 
+The frame-level hindsight builder stores one selected wrong-memory branch for grounding. To keep
+that branch and `hd_rho` aligned, it requires at least 64 eligible future frames by default and
+selects by mean causal credit. Short episodes/windows with no eligible event use the positive
+event with the largest total credit. The rule is recorded as
+`grounding_event_policy=min_future_horizon_mean_else_total_credit` and the threshold as
+`grounding_min_future_frames`; override the builder CLI with
+`--grounding-min-future-frames N` and pass the same value as
+`--policy.hd_grounding_min_future_frames=N` during training. A value of `0` restores the
+pre-change mean-credit selection for an explicit ablation. HCA's all-event maximum attribution
+remains unchanged; do not replace `hd_rho` with that maximum unless the wrong branch is also
+made event-specific.
+Artifacts generated before this contract field was introduced are intentionally rejected by the
+strict loader; regenerate them rather than silently interpreting their terminal-event `hd_rho`.
+
 ### Causal local write gate
 
 For the paper HD-TTT run, enable the learned gate as well:

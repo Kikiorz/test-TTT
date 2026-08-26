@@ -30,6 +30,13 @@ top-level ``metadata`` key for auditing, but are intentionally not presented
 as frame labels.  This keeps the artifact compatible with
 ``HindsightLabelDataset`` and the normal sequence collator.
 
+Grounding stores one selected wrong-memory replay, so its ``hd_rho`` remains
+aligned with that same branch.  By default the selector only considers events
+with at least 64 eligible future frames and compares their mean causal credit;
+if a short episode/window has no such event it falls back to the positive event
+with the largest total credit.  The rule and threshold are recorded in
+metadata and can be changed with ``--grounding-min-future-frames``.
+
 Examples (run in the Python 3.11 MIKASA environment)::
 
     python examples/mikasa/build_hd_labels.py \
@@ -38,7 +45,8 @@ Examples (run in the Python 3.11 MIKASA environment)::
         shell_game_color_lamp_touch_vla_v0 \
       --checkpoint /workspace/experiments/short_ttt150_clean/checkpoints/016375/pretrained_model \
       --output /workspace/labels/color-000.pt \
-      --episode-start 0 --episode-end 50 --max-events 0
+      --episode-start 0 --episode-end 50 --max-events 0 \
+      --grounding-min-future-frames 64
 
     # Merge independently generated shards.  Inputs are sorted by
     # global_index and duplicate indices are rejected.
@@ -66,6 +74,13 @@ from torch import Tensor
 
 
 LOGGER = logging.getLogger("build_hd_labels")
+
+# Grounding keeps one counterfactual branch so the stored wrong velocity and
+# ``hd_rho`` always describe the same intervention.  Prefer an event with a
+# sufficiently long causal future and compare its mean credit; when an
+# episode/window is shorter than that horizon, fall back to total credit so a
+# one-frame terminal event cannot win solely because its denominator is one.
+GROUNDING_EVENT_POLICY = "min_future_horizon_mean_else_total_credit"
 
 
 def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
@@ -539,6 +554,55 @@ def _event_candidates(
     return [events[int(position)] for position in sorted(set(positions))]
 
 
+def _select_grounding_event(
+    eligible_counts: Sequence[int],
+    total_credits: Sequence[float],
+    mean_scores: Sequence[float],
+    *,
+    min_future_frames: int,
+) -> tuple[int, str]:
+    """Select the one event whose wrong branch is stored for grounding.
+
+    ``hd_attribution`` is an all-event maximum and may safely combine rows
+    from different interventions.  Grounding is different: the stored wrong
+    velocity comes from exactly one event, so its ``hd_rho`` must select that
+    same branch.  A positive minimum horizon avoids the terminal-event
+    denominator pathology while retaining the old mean-credit rule whenever
+    the threshold is zero.  If no positive event has the requested horizon,
+    use the highest *total* credit as a short-episode fallback.
+
+    Returns ``(-1, "none")`` when no event has positive causal credit.
+    Ties are resolved by the earliest event index for reproducibility.
+    """
+
+    if min_future_frames < 0:
+        raise ValueError("min_future_frames must be non-negative")
+    if not (len(eligible_counts) == len(total_credits) == len(mean_scores)):
+        raise ValueError("grounding event summaries must have equal lengths")
+
+    positive = [
+        index
+        for index, (eligible, total) in enumerate(zip(eligible_counts, total_credits, strict=True))
+        if int(eligible) > 0 and float(total) > 0.0
+    ]
+    if not positive:
+        return -1, "none"
+
+    preferred = [
+        index for index in positive if int(eligible_counts[index]) >= min_future_frames
+    ]
+    if preferred:
+        # ``max`` with ``-index`` keeps the earliest event on an exact tie.
+        selected = max(preferred, key=lambda index: (float(mean_scores[index]), -index))
+        return selected, "min_future_horizon_mean"
+
+    selected = max(
+        positive,
+        key=lambda index: (float(total_credits[index]), float(mean_scores[index]), -index),
+    )
+    return selected, "total_credit_fallback"
+
+
 def _episode_labels(
     policy: Any,
     prepared: dict[str, Tensor],
@@ -549,12 +613,16 @@ def _episode_labels(
     max_events: int,
     attribution_threshold: float,
     frame_batch_size: int,
+    grounding_min_future_frames: int = 64,
     future_mask: Tensor | None = None,
     global_offset: int = 0,
     event_global_start_min: int | None = None,
     event_global_end_max: int | None = None,
 ) -> dict[str, Any]:
     """Compute full teacher, causal interventions, and frame-aligned labels."""
+
+    if grounding_min_future_frames < 0:
+        raise ValueError("grounding_min_future_frames must be non-negative")
 
     actions = policy.prepare_action(prepared).detach().cpu()
     action_is_pad = prepared.get("action_is_pad")
@@ -584,11 +652,16 @@ def _episode_labels(
         global_end_max=event_global_end_max,
     )
     credit_rows: list[Tensor] = []
-    best_wrong: Tensor | None = None
-    best_gate = torch.ones(length, dtype=torch.float32)
-    best_score = float("-inf")
-    best_event: tuple[int, int] | None = None
-    best_event_index = -1
+    # Keep only the currently best preferred/fallback branches rather than
+    # retaining every intervention velocity.  This bounds CPU memory for an
+    # exhaustive event pass while still allowing the final scalar selector to
+    # apply deterministic tie-breaking.
+    preferred_branch: tuple[int, Tensor, Tensor] | None = None
+    fallback_branch: tuple[int, Tensor, Tensor] | None = None
+    preferred_score = float("-inf")
+    fallback_total = float("-inf")
+    eligible_counts: list[int] = []
+    total_credits: list[float] = []
     selection_scores: list[float] = []
 
     for event_index, (event_start, event_end) in enumerate(events):
@@ -613,19 +686,60 @@ def _episode_labels(
             row = torch.where(row >= attribution_threshold, row, torch.zeros_like(row))
         credit_rows.append(row)
 
-        # Normalize by the number of eligible future frames.  Otherwise an
-        # early event wins simply because it has a longer future horizon,
-        # even when its per-frame intervention effect is identical.
+        # Keep the historical mean score for long-enough candidates.  The
+        # minimum-horizon selector below prevents a one-frame terminal event
+        # from winning just because this denominator is tiny.
         eligible_count = int(causal.sum().item())
         score = float(row.sum().item()) / max(eligible_count, 1) if eligible_count else float("-inf")
+        total_credit = float(row.sum().item())
+        eligible_counts.append(eligible_count)
+        total_credits.append(total_credit)
         selection_scores.append(score)
-        positive_credit = float(row.sum().item()) > 0.0
-        if eligible_count > 0 and positive_credit and (best_wrong is None or score > best_score):
-            best_score = score
-            best_wrong = wrong_velocity
-            best_gate = gate.detach().cpu()
-            best_event = (event_start, event_end)
-            best_event_index = event_index
+        positive_credit = eligible_count > 0 and total_credit > 0.0
+        if not positive_credit:
+            continue
+        branch = (event_index, wrong_velocity, gate.detach().cpu())
+        fallback_key = (total_credit, score, -event_index)
+        current_fallback_key = (
+            fallback_total,
+            float("-inf") if fallback_branch is None else selection_scores[fallback_branch[0]],
+            -1 if fallback_branch is None else -fallback_branch[0],
+        )
+        if fallback_branch is None or fallback_key > current_fallback_key:
+            fallback_total = total_credit
+            fallback_branch = branch
+        preferred_key = (score, -event_index)
+        current_preferred_key = (
+            preferred_score,
+            -1 if preferred_branch is None else -preferred_branch[0],
+        )
+        if eligible_count >= grounding_min_future_frames and (
+            preferred_branch is None or preferred_key > current_preferred_key
+        ):
+            preferred_score = score
+            preferred_branch = branch
+
+    selected_event_index, grounding_selection_mode = _select_grounding_event(
+        eligible_counts,
+        total_credits,
+        selection_scores,
+        min_future_frames=grounding_min_future_frames,
+    )
+    selected_branch: tuple[int, Tensor, Tensor] | None
+    if preferred_branch is not None and selected_event_index == preferred_branch[0]:
+        selected_branch = preferred_branch
+    elif fallback_branch is not None and selected_event_index == fallback_branch[0]:
+        selected_branch = fallback_branch
+    else:
+        selected_branch = None
+    best_wrong = selected_branch[1] if selected_branch is not None else None
+    best_gate = selected_branch[2] if selected_branch is not None else torch.ones(
+        length, dtype=torch.float32
+    )
+    best_event_index = selected_event_index
+    best_event: tuple[int, int] | None = (
+        events[selected_event_index] if selected_event_index >= 0 else None
+    )
 
     if credit_rows:
         credits = torch.stack(credit_rows, dim=0)
@@ -692,6 +806,11 @@ def _episode_labels(
         "hd_C": credits.float(),
         "hd_event_u": event_u.float(),
         "hd_attribution_aggregation": "all_event_max_for_hca_selected_event_for_grounding",
+        "hd_grounding_event_policy": GROUNDING_EVENT_POLICY,
+        "hd_grounding_min_future_frames": int(grounding_min_future_frames),
+        "hd_grounding_selection_mode": grounding_selection_mode,
+        "hd_event_eligible_counts": torch.tensor(eligible_counts, dtype=torch.int64),
+        "hd_event_total_credits": torch.tensor(total_credits, dtype=torch.float32),
         "hd_event_selection_scores": torch.tensor(selection_scores, dtype=torch.float32),
         "hd_event_starts": torch.tensor([event[0] for event in events], dtype=torch.int64),
         "hd_event_ends": torch.tensor([event[1] for event in events], dtype=torch.int64),
@@ -755,6 +874,8 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         "history_mode",
         "event_block_size",
         "max_events",
+        "grounding_event_policy",
+        "grounding_min_future_frames",
         "attribution_threshold",
         "action_chunk_size",
         "max_action_dim",
@@ -772,6 +893,19 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         if missing_metadata:
             raise ValueError(
                 f"Shard {path} is missing hindsight metadata contract fields: {missing_metadata}"
+            )
+        if metadata["grounding_event_policy"] != GROUNDING_EVENT_POLICY:
+            raise ValueError(
+                f"Shard {path} has unsupported grounding_event_policy="
+                f"{metadata['grounding_event_policy']!r}"
+            )
+        if (
+            type(metadata["grounding_min_future_frames"]) is not int
+            or metadata["grounding_min_future_frames"] < 0
+        ):
+            raise ValueError(
+                f"Shard {path} has malformed grounding_min_future_frames; "
+                "expected a non-negative int"
             )
         for flag_name in ("teacher_hd_ttt_enabled", "teacher_hd_learned_write_gate"):
             flag_value = metadata[flag_name]
@@ -975,6 +1109,7 @@ def _build_shard(args: argparse.Namespace) -> None:
             max_events=args.max_events,
             attribution_threshold=args.attribution_threshold,
             frame_batch_size=args.frame_batch_size,
+            grounding_min_future_frames=args.grounding_min_future_frames,
         )
         for key in columns:
             if key == "global_index":
@@ -995,6 +1130,11 @@ def _build_shard(args: argparse.Namespace) -> None:
             "C": labels["hd_C"].tolist(),
             "event_u": labels["hd_event_u"].tolist(),
             "full_flow_loss": labels["hd_full_flow_loss"].tolist(),
+            "event_eligible_counts": labels["hd_event_eligible_counts"].tolist(),
+            "event_total_credits": labels["hd_event_total_credits"].tolist(),
+            "grounding_event_policy": labels["hd_grounding_event_policy"],
+            "grounding_min_future_frames": int(labels["hd_grounding_min_future_frames"]),
+            "grounding_selection_mode": labels["hd_grounding_selection_mode"],
         }
         del prepared, labels, noise, time
         if device.type == "cuda":
@@ -1029,6 +1169,8 @@ def _build_shard(args: argparse.Namespace) -> None:
         ),
         "event_block_size": args.event_block_size,
         "max_events": args.max_events,
+        "grounding_event_policy": GROUNDING_EVENT_POLICY,
+        "grounding_min_future_frames": args.grounding_min_future_frames,
         "event_sampling": "all_causal_blocks" if args.max_events == 0 else "uniform",
         "unsampled_write_gate_default": 1.0,
         "write_gate_observed_column": "hd_write_gate_observed",
@@ -1067,6 +1209,15 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Maximum causal event replays; 0 (default) evaluates every event block",
     )
+    parser.add_argument(
+        "--grounding-min-future-frames",
+        type=int,
+        default=64,
+        help=(
+            "Minimum eligible future frames for the selected grounding event; "
+            "short episodes fall back to highest total credit (default: 64)"
+        ),
+    )
     parser.add_argument("--attribution-threshold", type=float, default=0.0)
     parser.add_argument("--frame-batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1729)
@@ -1092,6 +1243,8 @@ def _parse_args() -> argparse.Namespace:
             parser.error("generation requires: " + ", ".join("--" + name.replace("_", "-") for name in missing))
     if args.frame_batch_size <= 0:
         parser.error("--frame-batch-size must be positive")
+    if args.grounding_min_future_frames < 0:
+        parser.error("--grounding-min-future-frames must be non-negative")
     return args
 
 

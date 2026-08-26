@@ -73,6 +73,13 @@ def test_default_ttt_layers_match_last_four_smolvla_expert_layers() -> None:
     assert config.ttt_num_register_tokens == 16
     assert config.n_action_steps == 1
     assert config.hd_counterfactual_margin == 0.0
+    assert config.hd_grounding_min_future_frames == 64
+
+
+def test_grounding_min_future_horizon_is_non_negative() -> None:
+    assert SmolVLATTTConfig(hd_grounding_min_future_frames=0).hd_grounding_min_future_frames == 0
+    with pytest.raises(ValueError, match="hd_grounding_min_future_frames must be non-negative"):
+        SmolVLATTTConfig(hd_grounding_min_future_frames=-1)
 
 
 def test_legacy_null_hd_flags_decode_as_clean_checkpoint() -> None:
