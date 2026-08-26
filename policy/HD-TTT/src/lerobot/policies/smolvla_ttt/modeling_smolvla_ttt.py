@@ -1730,6 +1730,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         trace_indices: Sequence[int],
         reference_batch: Mapping[str, object] | None = None,
         normalizers: Mapping[str, Tensor | float] | None = None,
+        normalization_floor: Tensor | float | None = None,
         stream_backward: Callable[[Tensor, bool], None] | None = None,
         stream_weight: float = 1.0,
     ) -> tuple[Tensor, dict[str, float]]:
@@ -1847,8 +1848,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 active_dim = min(int(teacher_effect.shape[-1]), configured_dim)
                 if active_dim <= 0:
                     raise ValueError("CreditTTT QH2L requires a positive action dimension")
-                normalization_floor = compute_action_effect_normalization_floor(
-                    teacher_effect[..., :active_dim]
+                replay_floor = (
+                    normalization_floor
+                    if normalization_floor is not None
+                    else compute_action_effect_normalization_floor(
+                        teacher_effect[..., :active_dim]
+                    )
                 )
                 # Keep metric reductions on the device while replay chunks
                 # are being processed. Calling ``.item()`` for every
@@ -1926,7 +1931,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                         positive_denominator=normalizers.get("positive"),
                         null_denominator=normalizers.get("null"),
                         null_loss_weight=float(getattr(self.config, "hd_v3_null_weight", 0.25)),
-                        normalization_floor=normalization_floor,
+                        normalization_floor=replay_floor,
                         relative=True,
                         return_components=True,
                     )
@@ -2022,6 +2027,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             positive_denominator=(None if normalizers is None else normalizers.get("positive")),
             null_denominator=(None if normalizers is None else normalizers.get("null")),
             null_loss_weight=float(getattr(self.config, "hd_v3_null_weight", 0.25)),
+            normalization_floor=normalization_floor,
             relative=True,
             return_components=True,
         )
@@ -2049,6 +2055,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         trace_collector: dict[int, TTTBoundedTrace],
         reference_batch: Mapping[str, object] | None = None,
         normalizers: Mapping[str, Tensor | float] | None = None,
+        normalization_floor: Tensor | float | None = None,
         stream_backward: Callable[[Tensor, bool], None] | None = None,
         stream_weight: float = 1.0,
     ) -> tuple[Tensor, dict[str, float]]:
@@ -2147,8 +2154,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             if active_dim <= 0:
                 raise ValueError("CreditTTT CMD requires a positive action dimension")
             teacher_effect_all = pair_labels["teacher_effect"].index_select(0, indices)
-            normalization_floor = compute_action_effect_normalization_floor(
-                teacher_effect_all[..., :active_dim]
+            replay_floor = (
+                normalization_floor
+                if normalization_floor is not None
+                else compute_action_effect_normalization_floor(
+                    teacher_effect_all[..., :active_dim]
+                )
             )
             # Accumulate detached scalar metrics on the device and synchronize
             # once after all replay chunks. Per-chunk ``.item()`` calls here
@@ -2232,7 +2243,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     full_denominator=normalizers.get("full"),
                     positive_denominator=normalizers.get("positive"),
                     null_denominator=normalizers.get("null"),
-                    normalization_floor=normalization_floor,
+                    normalization_floor=replay_floor,
                     return_components=True,
                 )
                 # CMD is intentionally detached from the event writer, so its
@@ -2345,6 +2356,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             full_denominator=(None if normalizers is None else normalizers.get("full")),
             positive_denominator=(None if normalizers is None else normalizers.get("positive")),
             null_denominator=(None if normalizers is None else normalizers.get("null")),
+            normalization_floor=normalization_floor,
             return_components=True,
         )
         metrics.update(
@@ -3973,6 +3985,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                             trace_indices=v3_trace_indices,
                             reference_batch=v3_reference_batch,
                             normalizers=v3_pair_normalizers,
+                            normalization_floor=effect_normalization_floor,
                             stream_backward=_stream_qh2l if stream_v3 else None,
                             stream_weight=1.0,
                         )
@@ -3994,6 +4007,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                             trace_collector=v3_trace_collector,
                             reference_batch=v3_reference_batch,
                             normalizers=v3_pair_normalizers,
+                            normalization_floor=effect_normalization_floor,
                             stream_backward=_stream_cmd if stream_v3 else None,
                             stream_weight=1.0,
                         )

@@ -1590,6 +1590,64 @@ def test_trainer_effect_floor_uses_full_window_and_active_action_dim() -> None:
     torch.testing.assert_close(floor, torch.tensor(2.0))
 
 
+def test_trainer_v3_effect_floor_uses_all_valid_pairs() -> None:
+    """Canonical V3 floors are computed over the complete pair population.
+
+    V3 stores one effect for each sampled event--future pair, unlike the
+    legacy/v2 frame-aligned artifact whose slot-0 effect is selected above.
+    Invalid/padded pair columns (including deliberately huge values here)
+    must not alter the robust median used by every TBPTT segment.
+    """
+
+    labels = torch.zeros(1, 4, 3, 4)
+    # Four valid pair rows have active-coordinate RMS [1, 2, 100, 200].
+    labels[0, 0, 0, :2] = torch.tensor([1.0, 1.0])
+    labels[0, 1, 0, :2] = torch.tensor([2.0, 2.0])
+    labels[0, 2, 0, :2] = torch.tensor([100.0, 100.0])
+    labels[0, 3, 0, :2] = torch.tensor([200.0, 200.0])
+    # Invalid padding is intentionally extreme; it is excluded by the pair
+    # mask and therefore cannot move the floor.
+    labels[0, :, 1:, 2:] = 1e6
+    valid = torch.zeros(1, 4, 3, dtype=torch.bool)
+    valid[0, :, 0] = True
+    config = SimpleNamespace(action_feature=SimpleNamespace(shape=(2,)))
+
+    floor = _compute_hd_effect_normalization_floor(
+        {
+            "hd_v3_pair_effect": labels,
+            "hd_v3_pair_valid": valid,
+        },
+        sequence_shape=(1, 4),
+        policy_config=config,
+    )
+    assert floor is not None
+    torch.testing.assert_close(floor, torch.tensor(2.0))
+
+
+def test_trainer_v3_effect_floor_accepts_flattened_pair_labels() -> None:
+    """The collator's flattened ``B*T`` pair spelling has identical scale."""
+
+    labels = torch.zeros(4, 2, 2)
+    labels[:, 0, :2] = torch.tensor(
+        [[1.0, 1.0], [2.0, 2.0], [100.0, 100.0], [200.0, 200.0]]
+    )
+    valid = torch.tensor(
+        [[True, False], [True, False], [True, False], [True, False]],
+        dtype=torch.bool,
+    )
+    config = SimpleNamespace(action_feature=SimpleNamespace(shape=(2,)))
+    floor = _compute_hd_effect_normalization_floor(
+        {
+            "hd_v3_pair_effect": labels,
+            "hd_v3_pair_valid": valid,
+        },
+        sequence_shape=(1, 4),
+        policy_config=config,
+    )
+    assert floor is not None
+    torch.testing.assert_close(floor, torch.tensor(2.0))
+
+
 def test_action_effect_backpropagates_through_differentiable_ttt_writer() -> None:
     """The v2 meta-gradient keeps the raw value target in the inner update."""
 

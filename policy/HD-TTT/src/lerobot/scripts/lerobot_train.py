@@ -1342,19 +1342,24 @@ def _compute_hd_effect_normalization_floor(
 
     ``action_effect_distillation_loss`` normally estimates its floor from the
     tensors passed to one call.  That is undesirable for TBPTT because each
-    segment would then have a different median.  This helper mirrors the
-    model's v2 label convention (flattened ``B*T`` rows, optional event axis,
-    selected slot 0) before the sequence is sliced, and returns the detached
-    scalar that every segment should reuse.  The active action coordinates are
-    limited to the configured task dimension so padded model coordinates do
-    not alter the statistic.
+    segment would then have a different median.  This helper mirrors both
+    legacy/v2 per-frame labels (flattened ``B*T`` rows, optional event axis,
+    selected slot 0) and canonical V3 pair labels (``[B,T,K,D]``): the
+    complete-window effect population is assembled *before* the sequence is
+    sliced, and the detached scalar is reused by every segment.  The active
+    action coordinates are limited to the configured task dimension so padded
+    model coordinates do not alter the statistic.
     """
 
     teacher_effect = batch.get("hd_teacher_effect")
+    pair_effect = teacher_effect is None and batch.get("hd_v3_pair_effect") is not None
+    if pair_effect:
+        teacher_effect = batch.get("hd_v3_pair_effect")
     if teacher_effect is None:
         return None
     if not isinstance(teacher_effect, torch.Tensor) or teacher_effect.ndim == 0:
-        raise ValueError("hd_teacher_effect must be a non-scalar tensor")
+        field_name = "hd_v3_pair_effect" if pair_effect else "hd_teacher_effect"
+        raise ValueError(f"{field_name} must be a non-scalar tensor")
 
     batch_size, sequence_length = sequence_shape
     if (
@@ -1373,20 +1378,72 @@ def _compute_hd_effect_normalization_floor(
         # Match ``_reshape_hd_field`` for a shared [T,...] label field.
         effect = teacher_effect.unsqueeze(0).expand(batch_size, *teacher_effect.shape)
     else:
+        field_name = "hd_v3_pair_effect" if pair_effect else "hd_teacher_effect"
         raise ValueError(
-            "hd_teacher_effect must start with [B,T] or flattened B*T dimensions, "
+            f"{field_name} must start with [B,T] or flattened B*T dimensions, "
             f"got {tuple(teacher_effect.shape)} for sequence {sequence_shape}"
         )
 
-    if effect.ndim == 4:
-        if effect.shape[2] < 1:
-            raise ValueError("hd_teacher_effect must contain at least one event slot")
-        effect = effect[:, :, 0, :]
-    elif effect.ndim != 3:
-        raise ValueError(
-            "hd_teacher_effect must have [B,T,D] or [B,T,K,D] shape, "
-            f"got {tuple(effect.shape)}"
-        )
+    if pair_effect:
+        # V3 supervises sampled event--future pairs.  Keep every pair in the
+        # floor population (rather than selecting slot 0 as in v2), while
+        # excluding invalid padded rows when the mask is available.  Invalid
+        # rows are normally zero, but filtering them makes the statistic
+        # robust to malformed/legacy artifacts without changing valid labels.
+        if effect.ndim == 3:
+            # Accept a compact K=1 spelling ``[B,T,D]`` for old collators.
+            effect = effect.unsqueeze(2)
+        elif effect.ndim != 4:
+            raise ValueError(
+                "hd_v3_pair_effect must have [B,T,K,D] (or compact [B,T,D]) shape, "
+                f"got {tuple(effect.shape)}"
+            )
+        valid_field = batch.get("hd_v3_pair_valid")
+        if valid_field is not None:
+            if not isinstance(valid_field, torch.Tensor) or valid_field.ndim == 0:
+                raise ValueError("hd_v3_pair_valid must be a non-scalar tensor")
+            if (
+                valid_field.ndim >= 2
+                and valid_field.shape[0] == batch_size
+                and valid_field.shape[1] == sequence_length
+            ):
+                valid = valid_field
+            elif valid_field.shape[0] == batch_size * sequence_length:
+                valid = valid_field.reshape(batch_size, sequence_length, *valid_field.shape[1:])
+            elif (
+                valid_field.ndim >= 1
+                and valid_field.shape[0] == sequence_length
+                and batch_size != sequence_length
+            ):
+                valid = valid_field.unsqueeze(0).expand(batch_size, *valid_field.shape)
+            else:
+                raise ValueError(
+                    "hd_v3_pair_valid must start with [B,T] or flattened B*T dimensions, "
+                    f"got {tuple(valid_field.shape)} for sequence {sequence_shape}"
+                )
+            if valid.ndim == 2:
+                valid = valid.unsqueeze(-1)
+            if valid.shape[:3] != effect.shape[:3]:
+                try:
+                    valid = torch.broadcast_to(valid, effect.shape[:3])
+                except RuntimeError as exc:
+                    raise ValueError(
+                        "hd_v3_pair_valid leading shape must align with hd_v3_pair_effect; "
+                        f"got {tuple(valid.shape)} vs {tuple(effect.shape[:3])}"
+                    ) from exc
+            effect = effect[valid.bool()]
+        else:
+            effect = effect.reshape(-1, effect.shape[-1])
+    else:
+        if effect.ndim == 4:
+            if effect.shape[2] < 1:
+                raise ValueError("hd_teacher_effect must contain at least one event slot")
+            effect = effect[:, :, 0, :]
+        elif effect.ndim != 3:
+            raise ValueError(
+                "hd_teacher_effect must have [B,T,D] or [B,T,K,D] shape, "
+                f"got {tuple(effect.shape)}"
+            )
 
     feature = getattr(policy_config, "action_feature", None)
     feature_shape = getattr(feature, "shape", None)
