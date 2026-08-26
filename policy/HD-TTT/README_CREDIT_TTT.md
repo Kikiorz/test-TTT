@@ -217,18 +217,25 @@ construction.
 ### 5.2 Query-conditioned local effect (QH2L)
 
 At the final selected TTT layer, retain the event transition
-((W_i^-,W_i^+)).  For a later query (q_j), the student replays the same
-action tail in two branches and computes
+((W_i^-,W_i^+)).  For a later query (q_j), the student replays the deployed
+denoising flow (same future observation, noise, timestep schedule, and
+previous executed action) in two branches and computes the final executed
+slot-0 action effect
 
 \[
 \Delta a^S_{ij}
  =A(h_j,f_{W_i^+}(q_j))-A(h_j,f_{W_i^-}(q_j)).
 \]
 
-For pairs crossing a TBPTT segment, the implementation gathers the future
-observation from the complete reference window and runs a deterministic,
-identical-noise full-flow replay in both branches.  The deployment state is
-never reconstructed from a future state; only the event snapshot is varied.
+The canonical implementation uses this full-flow replay for every sampled
+pair, including pairs whose future happens to lie in the current TBPTT
+segment.  Pair chunks are an execution-only memory bound: they do not alter
+the objective or drop pairs.  The complete reference window supplies a future
+observation for cross-segment pairs, while the event snapshot is always the
+only varied state.  The deployment state is never reconstructed from a future
+state.  The lower-level ``v3_local_effects_from_trace`` helper is retained for
+diagnostics and returns a single-phase velocity effect; it is not mixed with
+the final-action labels in canonical QH2L.
 
 The target is detached from student gradients.  With robust detached scale
 (s_{ij}), a positive/null loss is
@@ -659,9 +666,11 @@ ablations or a license to pick the best test result.
 - The current pair effect is defined for the final selected TTT layer and the
   executed slot-0 action.  It does not claim all 50 action slots or every
   intermediate denoising velocity has been independently attributed.
-- Full-flow cross-segment replay is computationally expensive; it is a
-  training-time reference operation.  Deployment remains one causal writer
-  update and nine read-only denoising reads per observation.
+- Full-flow pair replay is computationally expensive (especially with
+  second-order writer gradients); it is a training-time reference operation.
+  Pair chunking bounds peak memory without changing the sampled population.
+  Deployment remains one causal writer update and nine read-only denoising
+  reads per observation.
 - Color supports only the short delay bin in the frozen benchmark.  Long-delay
   conclusions require Shuffle-Long or another episode set with those delays.
 - A passing tensor/unit smoke test proves shape, finite, or gradient contracts,
