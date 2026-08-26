@@ -754,13 +754,45 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
         meta_episodes = getattr(getattr(dataset, "meta", None), "episodes", None)
         selected_ids: list[int] | None = None
         actual_lengths: dict[int, int] = {}
+        # ``LeRobotDatasetMetadata.episodes`` is a HuggingFace Dataset in the
+        # normal loader, but lightweight tests/adapters may expose a mapping
+        # or a list of row mappings.  Normalize all three representations so
+        # a selected short episode is not accidentally treated as an
+        # artifact-wide max-length request.
+        starts = ends = None
         if isinstance(meta_episodes, Mapping):
-            starts, ends = meta_episodes.get("dataset_from_index"), meta_episodes.get("dataset_to_index")
-            if starts is not None and ends is not None:
-                total = len(starts)
-                selected_raw = getattr(dataset, "episodes", None)
-                selected_ids = list(range(total)) if selected_raw is None else [int(v) for v in selected_raw]
-                actual_lengths = {ep: int(ends[ep]) - int(starts[ep]) for ep in selected_ids}
+            starts = meta_episodes.get("dataset_from_index")
+            ends = meta_episodes.get("dataset_to_index")
+        elif meta_episodes is not None:
+            column_names = getattr(meta_episodes, "column_names", None)
+            if column_names and {
+                "dataset_from_index",
+                "dataset_to_index",
+            }.issubset(set(column_names)):
+                starts = meta_episodes["dataset_from_index"]
+                ends = meta_episodes["dataset_to_index"]
+            else:
+                try:
+                    rows = list(meta_episodes)
+                except TypeError:
+                    rows = []
+                if rows and isinstance(rows[0], Mapping):
+                    starts = [row.get("dataset_from_index") for row in rows]
+                    ends = [row.get("dataset_to_index") for row in rows]
+        if starts is not None and ends is not None:
+            total = len(starts)
+            selected_raw = getattr(dataset, "episodes", None)
+            selected_ids = (
+                list(range(total))
+                if selected_raw is None
+                else [int(v) for v in selected_raw]
+            )
+            if any(
+                ep < 0 or ep >= total or starts[ep] is None or ends[ep] is None
+                for ep in selected_ids
+            ):
+                raise ValueError("CreditTTT V3 selected dataset episodes have invalid metadata bounds")
+            actual_lengths = {ep: int(ends[ep]) - int(starts[ep]) for ep in selected_ids}
         if selected_ids is not None:
             unknown = [ep for ep in selected_ids if ep not in declared_lengths]
             if unknown:
