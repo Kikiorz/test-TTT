@@ -1654,46 +1654,101 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 "hd_v3_pairs": 0.0,
                 "hd_v3_pairs_skipped": float(skipped),
             }
-        indices = valid.nonzero(as_tuple=False).flatten()
+        # Do not replay inactive padded rows.  Besides avoiding pointless
+        # compute, this is important for the full-flow adapter: a padded row
+        # has no well-defined future observation and must never become an
+        # accidental training target.
+        positive_all = pair_labels["positive"]
+        null_all = pair_labels["null"]
+        active_indices = valid.nonzero(as_tuple=False).flatten()
+        active_flags = (
+            positive_all.index_select(0, active_indices)
+            | null_all.index_select(0, active_indices)
+        )
+        indices = active_indices[active_flags]
+        if indices.numel() == 0:
+            zero = self.model.action_out_proj.weight.sum() * 0.0
+            return zero, {
+                "hd_v3_qh2l": 0.0,
+                "hd_v3_pairs": 0.0,
+                "hd_v3_pairs_skipped": float(skipped),
+            }
+
         selected_event = pair_labels["event_index"].index_select(0, indices)
         selected_batch = pair_labels["batch_index"].index_select(0, indices)
-        if reference_batch is not None:
-            if "event_index_global" not in pair_labels or "future_index_global" not in pair_labels:
-                raise ValueError(
-                    "Cross-segment CreditTTT replay requires global event/future indices; "
-                    "regenerate labels with the V3 pair schema"
+        selected_future = pair_labels["future_index"].index_select(0, indices)
+        cross_flags = pair_labels.get("cross_segment")
+        if cross_flags is None:
+            cross_flags = torch.zeros_like(valid)
+        cross_flags = cross_flags.bool().index_select(0, indices)
+
+        # A complete reference window is supplied by the sequence trainer for
+        # every V3 segment.  Same-segment pairs nevertheless have an exact,
+        # much cheaper representation already present in the bounded trace.
+        # Route those pairs through the local action-tail replay and reserve
+        # the fixed-context full-flow adapter strictly for genuinely
+        # cross-segment queries.  This is an algebraic decomposition of the
+        # same objective, not a new loss or a tunable approximation; it keeps
+        # the expensive replay memory bounded on ordinary full-history
+        # windows while preserving the documented cross-segment semantics.
+        route_order_parts: list[Tensor] = []
+        effect_parts: list[Tensor] = []
+        if reference_batch is None:
+            route_order_parts.append(torch.arange(indices.numel(), device=indices.device))
+            effect_parts.append(
+                self.model.v3_local_effects_from_trace(
+                    trace_collector,
+                    final_hidden_collector,
+                    trace_indices,
+                    selected_event,
+                    selected_future,
+                    selected_batch,
                 )
-            student_effect = self._v3_reference_student_effects(
-                reference_batch=reference_batch,
-                trace_collector=trace_collector,
-                event_indices=selected_event,
-                event_indices_global=pair_labels["event_index_global"].index_select(0, indices),
-                future_indices_global=pair_labels["future_index_global"].index_select(0, indices),
-                batch_indices=selected_batch,
             )
-            replay_cross_count = int(pair_labels.get("cross_segment", torch.zeros_like(valid))[indices].sum().item())
         else:
-            student_effect = self.model.v3_local_effects_from_trace(
-                trace_collector,
-                final_hidden_collector,
-                trace_indices,
-                selected_event,
-                pair_labels["future_index"].index_select(0, indices),
-                selected_batch,
-            )
-            replay_cross_count = 0
-        teacher_effect = pair_labels["teacher_effect"].index_select(0, indices)
-        utility = pair_labels["utility"].index_select(0, indices)
-        positive = pair_labels["positive"].index_select(0, indices)
-        null = pair_labels["null"].index_select(0, indices)
-        # A pair may be marked neither positive nor null by a custom artifact;
-        # such rows are intentionally ignored instead of inventing a target.
-        active = positive | null
-        student_effect = student_effect[active]
-        teacher_effect = teacher_effect[active]
-        utility = utility[active]
-        positive = positive[active]
-        null = null[active]
+            local_positions = (~cross_flags).nonzero(as_tuple=False).flatten()
+            cross_positions = cross_flags.nonzero(as_tuple=False).flatten()
+            if local_positions.numel():
+                route_order_parts.append(local_positions)
+                effect_parts.append(
+                    self.model.v3_local_effects_from_trace(
+                        trace_collector,
+                        final_hidden_collector,
+                        trace_indices,
+                        selected_event.index_select(0, local_positions),
+                        selected_future.index_select(0, local_positions),
+                        selected_batch.index_select(0, local_positions),
+                    )
+                )
+            if cross_positions.numel():
+                if "event_index_global" not in pair_labels or "future_index_global" not in pair_labels:
+                    raise ValueError(
+                        "Cross-segment CreditTTT replay requires global event/future indices; "
+                        "regenerate labels with the V3 pair schema"
+                    )
+                route_order_parts.append(cross_positions)
+                effect_parts.append(
+                    self._v3_reference_student_effects(
+                        reference_batch=reference_batch,
+                        trace_collector=trace_collector,
+                        event_indices=selected_event.index_select(0, cross_positions),
+                        event_indices_global=pair_labels["event_index_global"].index_select(
+                            0, indices.index_select(0, cross_positions)
+                        ),
+                        future_indices_global=pair_labels["future_index_global"].index_select(
+                            0, indices.index_select(0, cross_positions)
+                        ),
+                        batch_indices=selected_batch.index_select(0, cross_positions),
+                    )
+                )
+        route_order = torch.cat(route_order_parts, dim=0)
+        student_effect = torch.cat(effect_parts, dim=0)
+        routed_indices = indices.index_select(0, route_order)
+        teacher_effect = pair_labels["teacher_effect"].index_select(0, routed_indices)
+        utility = pair_labels["utility"].index_select(0, routed_indices)
+        positive = pair_labels["positive"].index_select(0, routed_indices)
+        null = pair_labels["null"].index_select(0, routed_indices)
+        replay_cross_count = int(cross_flags.sum().item())
         if student_effect.numel() == 0:
             zero = self.model.action_out_proj.weight.sum() * 0.0
             return zero, {
@@ -1732,7 +1787,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             "hd_v3_pairs_skipped": float(skipped),
             "hd_v3_cross_segment_pairs": float(replay_cross_count),
             "hd_v3_delay_mean": float(
-                pair_labels["delay"].index_select(0, indices)[active].float().mean().item()
+                pair_labels["delay"].index_select(0, routed_indices).float().mean().item()
             ),
             "hd_v3_teacher_effect_rms": float(teacher_effect.detach().square().mean().sqrt().item()),
             "hd_v3_student_effect_rms": float(student_effect.detach().square().mean().sqrt().item()),

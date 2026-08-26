@@ -580,6 +580,8 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             "max_windows_per_episode",
             "ttt_history_warmup_length",
             "sequence_offset_policy",
+            "episode_slices",
+            "episode_lengths",
         }
         missing_v3 = sorted(required_v3_metadata - set(metadata))
         if missing_v3:
@@ -717,6 +719,68 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             raise ValueError(
                 "CreditTTT V3 canonical training requires episode-local zero offsets"
             )
+        # Labels are generated on a (possibly larger) feature split, whereas
+        # training may select a strict episode subset.  Validate the mapping
+        # explicitly instead of comparing only the global maximum length: a
+        # long held-out episode must not force the train sequence length, while
+        # a missing/short selected episode must fail before workers start.
+        slices = metadata.get("episode_slices")
+        lengths_declared = metadata.get("episode_lengths")
+        if not isinstance(slices, list) or not slices:
+            raise ValueError("CreditTTT V3 episode_slices must be a non-empty list")
+        if not isinstance(lengths_declared, list) or len(lengths_declared) != len(slices):
+            raise ValueError("CreditTTT V3 episode_lengths must align with episode_slices")
+        declared_lengths: dict[int, int] = {}
+        for item, length_raw in zip(slices, lengths_declared, strict=True):
+            if not isinstance(item, Mapping):
+                raise ValueError("CreditTTT V3 episode_slices entries must be objects")
+            try:
+                episode_id = int(item["episode_index"])
+                item_length = int(item["length"])
+                declared_length = int(length_raw)
+                row_start = int(item["row_start"])
+                row_end = int(item["row_end"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("CreditTTT V3 episode_slices contain malformed indices/lengths") from error
+            if episode_id in declared_lengths or item_length != declared_length or item_length <= 0:
+                raise ValueError("CreditTTT V3 episode_slices contain duplicate or inconsistent lengths")
+            if row_start < 0 or row_end - row_start != item_length:
+                raise ValueError("CreditTTT V3 episode_slices row bounds are inconsistent")
+            declared_lengths[episode_id] = item_length
+        if int(metadata["min_sequence_length"]) != max(declared_lengths.values()):
+            raise ValueError(
+                "CreditTTT V3 min_sequence_length does not match episode_lengths"
+            )
+        meta_episodes = getattr(getattr(dataset, "meta", None), "episodes", None)
+        selected_ids: list[int] | None = None
+        actual_lengths: dict[int, int] = {}
+        if isinstance(meta_episodes, Mapping):
+            starts, ends = meta_episodes.get("dataset_from_index"), meta_episodes.get("dataset_to_index")
+            if starts is not None and ends is not None:
+                total = len(starts)
+                selected_raw = getattr(dataset, "episodes", None)
+                selected_ids = list(range(total)) if selected_raw is None else [int(v) for v in selected_raw]
+                actual_lengths = {ep: int(ends[ep]) - int(starts[ep]) for ep in selected_ids}
+        if selected_ids is not None:
+            unknown = [ep for ep in selected_ids if ep not in declared_lengths]
+            if unknown:
+                raise ValueError(
+                    "CreditTTT V3 labels do not cover selected dataset episodes: "
+                    f"{unknown[:8]}"
+                )
+            mismatched = [
+                ep for ep in selected_ids if declared_lengths[ep] != actual_lengths[ep]
+            ]
+            if mismatched:
+                raise ValueError(
+                    "CreditTTT V3 episode length mismatch for selected episodes: "
+                    f"{mismatched[:8]}"
+                )
+            selected_max_length = max(actual_lengths.values()) if actual_lengths else 0
+        else:
+            # Lightweight datasets without episode metadata can only be
+            # checked against the artifact-wide contract.
+            selected_max_length = max(declared_lengths.values())
         if type(metadata.get("antithetic_noise")) is not bool:
             raise ValueError("CreditTTT V3 antithetic_noise must be a boolean")
         if type(metadata.get("includes_previous_executed_action")) is not bool:
@@ -768,11 +832,11 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             raise ValueError(
                 "CreditTTT V3 frame labels require ttt_history_warmup_length=None or 0"
             )
-        if int(getattr(policy_cfg, "sequence_length", 0)) < min_sequence_length:
+        if int(getattr(policy_cfg, "sequence_length", 0)) < selected_max_length:
             raise ValueError(
-                "CreditTTT V3 sequence_length is shorter than the longest episode used "
+                "CreditTTT V3 sequence_length is shorter than the longest selected episode "
                 f"to build labels ({getattr(policy_cfg, 'sequence_length', None)} < "
-                f"{min_sequence_length})"
+                f"{selected_max_length})"
             )
         if int(getattr(policy_cfg, "sequence_stride", 0)) != int(
             getattr(policy_cfg, "sequence_length", 0)

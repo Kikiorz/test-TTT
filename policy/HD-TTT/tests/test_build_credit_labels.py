@@ -107,6 +107,14 @@ def test_builder_emits_causal_frame_aligned_pairs_and_is_deterministic(tmp_path:
     assert first["metadata"]["intervention_scope"] == (
         "event_write_only_previous_executed_action_held_fixed"
     )
+    metadata = first["metadata"]
+    # Full-history provenance is episode-indexed rather than merely a global
+    # max length.  These invariants are consumed by the trainer's fail-closed
+    # selected-episode check.
+    assert metadata["min_sequence_length"] == max(metadata["episode_lengths"])
+    assert len(metadata["episode_slices"]) == len(metadata["episode_lengths"])
+    for item, length in zip(metadata["episode_slices"], metadata["episode_lengths"], strict=True):
+        assert item["row_end"] - item["row_start"] == item["length"] == length
     for key in (
         "hd_v3_pair_event_index",
         "hd_v3_pair_future_index",
