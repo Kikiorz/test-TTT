@@ -35,6 +35,7 @@ from typing import TypedDict, Unpack
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
@@ -1654,101 +1655,46 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 "hd_v3_pairs": 0.0,
                 "hd_v3_pairs_skipped": float(skipped),
             }
-        # Do not replay inactive padded rows.  Besides avoiding pointless
-        # compute, this is important for the full-flow adapter: a padded row
-        # has no well-defined future observation and must never become an
-        # accidental training target.
-        positive_all = pair_labels["positive"]
-        null_all = pair_labels["null"]
-        active_indices = valid.nonzero(as_tuple=False).flatten()
-        active_flags = (
-            positive_all.index_select(0, active_indices)
-            | null_all.index_select(0, active_indices)
-        )
-        indices = active_indices[active_flags]
-        if indices.numel() == 0:
-            zero = self.model.action_out_proj.weight.sum() * 0.0
-            return zero, {
-                "hd_v3_qh2l": 0.0,
-                "hd_v3_pairs": 0.0,
-                "hd_v3_pairs_skipped": float(skipped),
-            }
-
+        indices = valid.nonzero(as_tuple=False).flatten()
         selected_event = pair_labels["event_index"].index_select(0, indices)
         selected_batch = pair_labels["batch_index"].index_select(0, indices)
-        selected_future = pair_labels["future_index"].index_select(0, indices)
-        cross_flags = pair_labels.get("cross_segment")
-        if cross_flags is None:
-            cross_flags = torch.zeros_like(valid)
-        cross_flags = cross_flags.bool().index_select(0, indices)
-
-        # A complete reference window is supplied by the sequence trainer for
-        # every V3 segment.  Same-segment pairs nevertheless have an exact,
-        # much cheaper representation already present in the bounded trace.
-        # Route those pairs through the local action-tail replay and reserve
-        # the fixed-context full-flow adapter strictly for genuinely
-        # cross-segment queries.  This is an algebraic decomposition of the
-        # same objective, not a new loss or a tunable approximation; it keeps
-        # the expensive replay memory bounded on ordinary full-history
-        # windows while preserving the documented cross-segment semantics.
-        route_order_parts: list[Tensor] = []
-        effect_parts: list[Tensor] = []
-        if reference_batch is None:
-            route_order_parts.append(torch.arange(indices.numel(), device=indices.device))
-            effect_parts.append(
-                self.model.v3_local_effects_from_trace(
-                    trace_collector,
-                    final_hidden_collector,
-                    trace_indices,
-                    selected_event,
-                    selected_future,
-                    selected_batch,
+        if reference_batch is not None:
+            if "event_index_global" not in pair_labels or "future_index_global" not in pair_labels:
+                raise ValueError(
+                    "Cross-segment CreditTTT replay requires global event/future indices; "
+                    "regenerate labels with the V3 pair schema"
                 )
+            student_effect = self._v3_reference_student_effects(
+                reference_batch=reference_batch,
+                trace_collector=trace_collector,
+                event_indices=selected_event,
+                event_indices_global=pair_labels["event_index_global"].index_select(0, indices),
+                future_indices_global=pair_labels["future_index_global"].index_select(0, indices),
+                batch_indices=selected_batch,
             )
+            replay_cross_count = int(pair_labels.get("cross_segment", torch.zeros_like(valid))[indices].sum().item())
         else:
-            local_positions = (~cross_flags).nonzero(as_tuple=False).flatten()
-            cross_positions = cross_flags.nonzero(as_tuple=False).flatten()
-            if local_positions.numel():
-                route_order_parts.append(local_positions)
-                effect_parts.append(
-                    self.model.v3_local_effects_from_trace(
-                        trace_collector,
-                        final_hidden_collector,
-                        trace_indices,
-                        selected_event.index_select(0, local_positions),
-                        selected_future.index_select(0, local_positions),
-                        selected_batch.index_select(0, local_positions),
-                    )
-                )
-            if cross_positions.numel():
-                if "event_index_global" not in pair_labels or "future_index_global" not in pair_labels:
-                    raise ValueError(
-                        "Cross-segment CreditTTT replay requires global event/future indices; "
-                        "regenerate labels with the V3 pair schema"
-                    )
-                route_order_parts.append(cross_positions)
-                effect_parts.append(
-                    self._v3_reference_student_effects(
-                        reference_batch=reference_batch,
-                        trace_collector=trace_collector,
-                        event_indices=selected_event.index_select(0, cross_positions),
-                        event_indices_global=pair_labels["event_index_global"].index_select(
-                            0, indices.index_select(0, cross_positions)
-                        ),
-                        future_indices_global=pair_labels["future_index_global"].index_select(
-                            0, indices.index_select(0, cross_positions)
-                        ),
-                        batch_indices=selected_batch.index_select(0, cross_positions),
-                    )
-                )
-        route_order = torch.cat(route_order_parts, dim=0)
-        student_effect = torch.cat(effect_parts, dim=0)
-        routed_indices = indices.index_select(0, route_order)
-        teacher_effect = pair_labels["teacher_effect"].index_select(0, routed_indices)
-        utility = pair_labels["utility"].index_select(0, routed_indices)
-        positive = pair_labels["positive"].index_select(0, routed_indices)
-        null = pair_labels["null"].index_select(0, routed_indices)
-        replay_cross_count = int(cross_flags.sum().item())
+            student_effect = self.model.v3_local_effects_from_trace(
+                trace_collector,
+                final_hidden_collector,
+                trace_indices,
+                selected_event,
+                pair_labels["future_index"].index_select(0, indices),
+                selected_batch,
+            )
+            replay_cross_count = 0
+        teacher_effect = pair_labels["teacher_effect"].index_select(0, indices)
+        utility = pair_labels["utility"].index_select(0, indices)
+        positive = pair_labels["positive"].index_select(0, indices)
+        null = pair_labels["null"].index_select(0, indices)
+        # A pair may be marked neither positive nor null by a custom artifact;
+        # such rows are intentionally ignored instead of inventing a target.
+        active = positive | null
+        student_effect = student_effect[active]
+        teacher_effect = teacher_effect[active]
+        utility = utility[active]
+        positive = positive[active]
+        null = null[active]
         if student_effect.numel() == 0:
             zero = self.model.action_out_proj.weight.sum() * 0.0
             return zero, {
@@ -1787,7 +1733,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             "hd_v3_pairs_skipped": float(skipped),
             "hd_v3_cross_segment_pairs": float(replay_cross_count),
             "hd_v3_delay_mean": float(
-                pair_labels["delay"].index_select(0, routed_indices).float().mean().item()
+                pair_labels["delay"].index_select(0, indices)[active].float().mean().item()
             ),
             "hd_v3_teacher_effect_rms": float(teacher_effect.detach().square().mean().sqrt().item()),
             "hd_v3_student_effect_rms": float(student_effect.detach().square().mean().sqrt().item()),
@@ -4953,16 +4899,41 @@ class SmolVLATTTFlowMatching(nn.Module):
             callback.set_writer_inputs = lambda _inputs, _mask=None: None
             return callback
 
-        paired_actions = self.sample_actions(
-            paired_images,
-            paired_masks,
-            paired_lang_tokens,
-            paired_lang_masks,
-            paired_state_input,
-            noise=paired_noise,
-            previous_action=paired_previous,
-            _expert_layer_callback_factory=callback_factory,
-        )
+        def _run_replay(_checkpoint_token: Tensor) -> Tensor:
+            # The token is a deliberately tiny differentiable input for the
+            # non-reentrant checkpoint wrapper.  All actual replay tensors are
+            # captured from the lexical scope; checkpoint recomputation keeps
+            # their gradients (including QH2L's writer-connected state) while
+            # discarding the ten-step transformer activations between forward
+            # and backward.  The token itself is not used in the calculation.
+            del _checkpoint_token
+            return self.sample_actions(
+                paired_images,
+                paired_masks,
+                paired_lang_tokens,
+                paired_lang_masks,
+                paired_state_input,
+                noise=paired_noise,
+                previous_action=paired_previous,
+                _expert_layer_callback_factory=callback_factory,
+            )
+
+        # Full-flow replay is only introduced by the V3 auxiliary objectives.
+        # In training it can otherwise retain a second ten-step VLM graph for
+        # every event/future pair and exceed a 32-GB device even though the
+        # base policy itself fits.  Non-reentrant checkpointing is an exact
+        # recomputation of the same deterministic flow (not a numerical
+        # approximation); inference and no-grad diagnostic calls keep the
+        # original direct path.
+        if self.training and torch.is_grad_enabled():
+            checkpoint_token = paired_noise.new_zeros((), requires_grad=True)
+            paired_actions = _checkpoint(
+                _run_replay,
+                checkpoint_token,
+                use_reentrant=False,
+            )
+        else:
+            paired_actions = _run_replay(paired_noise.new_zeros(()))
         if paired_actions.ndim != 3 or paired_actions.shape[0] != 2 * pair_count:
             raise ValueError(
                 "CreditTTT replay must return paired action chunks with shape [2*pairs,chunk,D]"
