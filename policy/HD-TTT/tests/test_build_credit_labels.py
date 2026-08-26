@@ -155,3 +155,19 @@ def test_builder_fails_fast_when_query_features_are_required(tmp_path: Path) -> 
             pair_k=2,
             require_query_features=True,
         )
+
+
+def test_canonical_builder_rejects_multi_frame_event_spans(tmp_path: Path) -> None:
+    builder, _teacher, features, checkpoint = _artifacts(tmp_path)
+    payload = torch.load(features, map_location="cpu", weights_only=True)
+    payload["episodes"][0]["event_starts"] = torch.arange(9)
+    payload["episodes"][0]["event_ends"] = torch.tensor([2, 2, 3, 4, 5, 6, 7, 8, 9])
+    malformed = tmp_path / "multi_frame_features.pt"
+    torch.save(payload, malformed)
+    with pytest.raises(ValueError, match="one event span per frame"):
+        builder.build_labels(
+            malformed,
+            checkpoint,
+            tmp_path / "malformed.pt",
+            pair_k=2,
+        )

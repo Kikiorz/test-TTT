@@ -751,6 +751,23 @@ def build_labels(
         targets = row["target_actions"]
         length = int(events.shape[0])
         starts, ends = _event_spans(row, length, event_block_size)
+        # The production student traces one fast-weight transition per
+        # physical frame.  A multi-frame deletion would therefore remove a
+        # different transition set from the one used by QH2L/CMD while still
+        # looking like a canonical artifact in the metadata.  Keep block
+        # interventions available for explicitly named offline ablations, but
+        # fail closed for the canonical event-write protocol.
+        if intervention == "delete":
+            expected_starts = torch.arange(length, dtype=torch.int64)
+            expected_ends = expected_starts + 1
+            if not torch.equal(starts.cpu(), expected_starts) or not torch.equal(
+                ends.cpu(), expected_ends
+            ):
+                raise ValueError(
+                    "Canonical CreditTTT event-write deletion requires one "
+                    "event span per frame ([i, i+1)); multi-frame/custom "
+                    "spans need a separately implemented block-state replay"
+                )
         replacement = row.get("replacement_event_tokens")
         if intervention == "replace" and replacement is None:
             # Replacement is an explicitly named ablation.  The canonical
