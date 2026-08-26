@@ -80,6 +80,25 @@ def test_published_four_task_profile_schema(tmp_path: Path) -> None:
     assert len(manifest["commands"]) == 16
 
 
+def test_published_profile_uses_all_official_demos() -> None:
+    """The canonical four-task recipe must not reserve an implicit 20% split."""
+    for task in benchmark.PUBLISHED_COMPARABLE_TASKS:
+        assert task["demo_count"] == 250
+        assert task["train_demo_indices"] == [0, 249]
+        assert task["validation_demo_indices"] == []
+
+    parser = benchmark._build_parser()
+    args = parser.parse_args(
+        ["manifest", "--output", "manifest.json", "--repo-root", ".", "--task-set", "published_four"]
+    )
+    manifest = benchmark.build_manifest(args)
+    split = manifest["training"]["demo_split"]
+    assert "all official" in split["train_and_label"]
+    assert manifest["training"]["official_demo_count"] == 250
+    assert manifest["training"]["all_official_demos_used"] is True
+    assert manifest["training"]["validation_affects_training"] is False
+
+
 def test_task_checkpoint_maps_are_frozen_per_task(tmp_path: Path) -> None:
     parser = benchmark._build_parser()
     task_ids = [task["id"] for task in benchmark.PUBLISHED_COMPARABLE_TASKS]

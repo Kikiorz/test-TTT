@@ -291,15 +291,23 @@ new source of hindsight supervision.
 
 ## 6. Full-history training and sequence semantics
 
-The complete episode is the unit of causal credit.  The reproducible launcher
-uses the following split unless a manifest explicitly records another split:
+The complete episode is the unit of causal credit.  The canonical published
+four-task recipe uses all 250 official demonstrations; no demonstration is
+silently reserved for tuning:
 
 | Purpose | Episodes |
 | --- | --- |
 | frozen-prefix feature extraction and teacher fitting | `[0, 250)` |
-| student training and label construction | `[0, 200)` |
-| offline teacher validation | `[200, 250)` |
+| student training and label construction | `[0, 250)` (all demos) |
+| offline teacher validation | none (optional diagnostics only) |
 | simulator evaluation | fixed simulator seeds, never used for selection |
+
+The launcher defaults are `FEATURE_EPISODE_END=250`, `TRAIN_EPISODE_END=250`,
+and `VALIDATION_EPISODE_START=250`.  A validation threshold at the dataset end
+causes the teacher to report a clearly marked train-set diagnostic loss without
+back-propagating it or using it for checkpoint selection.  Any reduced split
+must be an explicitly named smoke/ablation override and recorded in the
+manifest.
 
 For the student, `sequence_length` is resolved to at least the longest selected
 training episode, `sequence_stride == sequence_length`,

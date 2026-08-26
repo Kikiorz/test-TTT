@@ -23,7 +23,13 @@ Example (MIKASA environment)::
       --base-checkpoint /workspace/experiments/clean_ttt/checkpoints/last/pretrained_model \
       --output /workspace/credit_ttt/teacher.pt \
       --features-output /workspace/credit_ttt/features.pt \
-      --episode-start 0 --episode-end 200 --epochs 20 --device cuda
+      --episode-start 0 --episode-end 250 --validation-episode-start 250 \
+      --epochs 20 --device cuda
+
+With ``--validation-episode-start`` at or beyond ``--episode-end`` all
+selected demonstrations are used for fitting.  The script then reports
+diagnostic losses on those same rows without gradients; this avoids silently
+discarding official demonstrations from the canonical 250-episode recipe.
 
 This file only reads the LeRobot dataset and writes the requested artifacts;
 it does not modify the source dataset or either protected policy directory.
@@ -495,6 +501,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 fps=getattr(metadata, "fps", None),
             )
 
+    validation_is_diagnostic_reuse = False
     if args.validation_episode_start is None:
         split = max(1, int(round(len(rows) * 0.8)))
         train_rows, validation_rows = rows[:split], rows[split:]
@@ -502,8 +509,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         threshold = int(args.validation_episode_start)
         train_rows = [row for row in rows if int(row["episode_indices"][0]) < threshold]
         validation_rows = [row for row in rows if int(row["episode_indices"][0]) >= threshold]
-        if not train_rows or not validation_rows:
-            raise ValueError("validation_episode_start must leave both train and validation episodes")
+        if not train_rows:
+            raise ValueError("validation_episode_start must leave at least one training episode")
+        # The canonical benchmark intentionally fits on all 250 demonstrations.
+        # When the threshold is at/after the selected range there is no held-out
+        # demo split.  Reuse the training rows for *diagnostic* loss only; these
+        # metrics are never back-propagated and cannot affect optimization.
+        if not validation_rows:
+            validation_rows = train_rows
+            validation_is_diagnostic_reuse = True
+            LOGGER.info(
+                "No offline validation episodes; reporting diagnostic metrics on "
+                "training demonstrations (no gradient/selection influence)."
+            )
 
     teacher = FullHistoryActionTeacher(
         event_dim=event_dim,
@@ -546,7 +564,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "base_config_sha256": _source_config_sha256(args.base_checkpoint),
             "feature_format": FEATURE_FORMAT,
             "train_episode_count": len(train_rows),
-            "validation_episode_count": len(validation_rows),
+            "validation_episode_count": 0 if validation_is_diagnostic_reuse else len(validation_rows),
+            "diagnostic_episode_count": len(validation_rows),
+            "validation_is_diagnostic_reuse": validation_is_diagnostic_reuse,
             "seed": int(args.seed),
             "epochs": len(history),
             "history": history,

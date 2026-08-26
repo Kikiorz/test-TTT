@@ -156,8 +156,11 @@ PUBLISHED_COMPARABLE_TASKS: tuple[dict[str, Any], ...] = (
         "memory_type": "Spatial",
         "max_episode_steps": 30,
         "demo_count": 250,
-        "train_demo_indices": [0, 199],
-        "validation_demo_indices": [200, 249],
+        # All 250 official demonstrations are used for fitting/credit labels.
+        # Simulator episodes are the held-out evaluation; no demo is reserved
+        # for model selection in the canonical recipe.
+        "train_demo_indices": [0, 249],
+        "validation_demo_indices": [],
         "delay_bins_present": ["1-16"],
         "published_abbreviation": "SGT",
     },
@@ -170,8 +173,8 @@ PUBLISHED_COMPARABLE_TASKS: tuple[dict[str, Any], ...] = (
         "memory_type": "Spatial",
         "max_episode_steps": 60,
         "demo_count": 250,
-        "train_demo_indices": [0, 199],
-        "validation_demo_indices": [200, 249],
+        "train_demo_indices": [0, 249],
+        "validation_demo_indices": [],
         "delay_bins_present": ["1-16"],
         "published_abbreviation": "IM",
     },
@@ -184,8 +187,8 @@ PUBLISHED_COMPARABLE_TASKS: tuple[dict[str, Any], ...] = (
         "memory_type": "Object",
         "max_episode_steps": 25,
         "demo_count": 250,
-        "train_demo_indices": [0, 199],
-        "validation_demo_indices": [200, 249],
+        "train_demo_indices": [0, 249],
+        "validation_demo_indices": [],
         "delay_bins_present": ["1-16"],
         "published_abbreviation": "RC3",
     },
@@ -198,8 +201,8 @@ PUBLISHED_COMPARABLE_TASKS: tuple[dict[str, Any], ...] = (
         "memory_type": "Object",
         "max_episode_steps": 25,
         "demo_count": 250,
-        "train_demo_indices": [0, 199],
-        "validation_demo_indices": [200, 249],
+        "train_demo_indices": [0, 249],
+        "validation_demo_indices": [],
         "delay_bins_present": ["1-16"],
         "published_abbreviation": "RC9",
     },
@@ -990,6 +993,11 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     if args.include_optional:
         checkpoint_map["utility_kvb"] = str(args.utility_checkpoint)
 
+    full_demo_recipe = all(
+        list(task.get("train_demo_indices", [])) == [0, int(task.get("demo_count", 0)) - 1]
+        and not task.get("validation_demo_indices")
+        for task in tasks
+    )
     manifest: dict[str, Any] = {
         "protocol_id": protocol_id,
         "protocol_version": PROTOCOL_VERSION,
@@ -1029,10 +1037,21 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "student_budget_policy": "same optimizer updates and seen frames for every student baseline",
             "teacher_cost_accounting": "reported separately; teacher is not deployed",
             "demo_split": {
-                "train_and_label": "episodes [0, 199]",
-                "offline_validation": "episodes [200, 249]",
+                "train_and_label": (
+                    "all official demonstrations [0, 249]"
+                    if full_demo_recipe
+                    else "task-profile declared training range"
+                ),
+                "offline_validation": (
+                    "none (diagnostic-only metrics may reuse training demos)"
+                    if full_demo_recipe
+                    else "task-profile declared validation range"
+                ),
                 "test": "simulator seeds only; no test-seed tuning",
             },
+            "official_demo_count": 250 if full_demo_recipe else None,
+            "all_official_demos_used": full_demo_recipe,
+            "validation_affects_training": False,
             "task_specific_statistics": True,
             "label_reuse_across_tasks": False,
         },

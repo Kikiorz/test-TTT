@@ -56,7 +56,7 @@ Required for executable stages:
 
 Useful overrides:
   TASK_ID=color|shuffle_long|shell_touch|intercept_medium|remember_color3|remember_color9,
-  TRAIN_EPISODE_END=200,
+  TRAIN_EPISODE_END=250 (canonical: all 250 demos),
   FEATURE_EPISODE_END=250, OUTPUT_ROOT=..., SEED=1000,
   NATIVE_CHECKPOINT=..., CLEAN_CHECKPOINT=...
 
@@ -132,8 +132,13 @@ STUDENT_OUTPUT_DIR="${STUDENT_OUTPUT_DIR:-${OUTPUT_ROOT}/student}"
 FEATURE_EPISODE_START="${FEATURE_EPISODE_START:-0}"
 FEATURE_EPISODE_END="${FEATURE_EPISODE_END:-250}"
 TRAIN_EPISODE_START="${TRAIN_EPISODE_START:-0}"
-TRAIN_EPISODE_END="${TRAIN_EPISODE_END:-200}"
-VALIDATION_EPISODE_START="${VALIDATION_EPISODE_START:-200}"
+# Canonical V3 uses every official demonstration (250/250) for feature,
+# teacher, label, and student fitting.  Validation is optional diagnostics
+# only and is placed after the dataset by default, so it cannot remove demos
+# from training or influence optimization.  A smaller split remains possible
+# only as an explicitly named smoke/ablation override.
+TRAIN_EPISODE_END="${TRAIN_EPISODE_END:-250}"
+VALIDATION_EPISODE_START="${VALIDATION_EPISODE_START:-250}"
 
 # A comma-separated list is accepted for non-contiguous paper shards.  The
 # default is exactly the declared train split [0, TRAIN_EPISODE_END).
