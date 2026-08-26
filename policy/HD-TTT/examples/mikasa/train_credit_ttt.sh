@@ -63,6 +63,8 @@ Useful overrides:
   BATCH_SIZE=1 (per-device; set to 2 or 4 with EQUAL_LENGTH_BATCHING=1 for
   exact-length trajectory buckets),
   NUM_PROCESSES=4 (use all four GPUs on the reference server),
+  TEACHER_EPISODE_BATCH_SIZE=1 (legacy default; set >1 to right-pad cached
+  feature episodes with a valid_mask for higher teacher-fit throughput),
   EQUAL_LENGTH_BATCHING=0 (opt-in; never pads time or mixes offset domains),
   TRAINING_METADATA_PATH=... (default: <student_output>/training_metadata.json),
   NATIVE_CHECKPOINT=..., CLEAN_CHECKPOINT=...
@@ -231,6 +233,7 @@ BATCHING_METADATA_JSON="{}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 TEACHER_HIDDEN_DIM="${TEACHER_HIDDEN_DIM:-256}"
 TEACHER_LR="${TEACHER_LR:-0.001}"
+TEACHER_EPISODE_BATCH_SIZE="${TEACHER_EPISODE_BATCH_SIZE:-1}"
 SEED="${SEED:-1000}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
@@ -288,6 +291,10 @@ require_runtime_inputs() {
   fi
   if ! [[ "${NUM_PROCESSES}" =~ ^[1-9][0-9]*$ ]]; then
     echo "NUM_PROCESSES must be a positive integer; got '${NUM_PROCESSES}'" >&2
+    return 2
+  fi
+  if ! [[ "${TEACHER_EPISODE_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TEACHER_EPISODE_BATCH_SIZE must be a positive integer; got '${TEACHER_EPISODE_BATCH_SIZE}'" >&2
     return 2
   fi
   if (( BATCH_SIZE > 1 && EQUAL_LENGTH_BATCHING != 1 )); then
@@ -556,6 +563,7 @@ teacher_command() {
     --episode-end "${FEATURE_EPISODE_END}"
     --validation-episode-start "${VALIDATION_EPISODE_START}"
     --epochs "${TEACHER_EPOCHS}"
+    --episode-batch-size "${TEACHER_EPISODE_BATCH_SIZE}"
     --hidden-dim "${TEACHER_HIDDEN_DIM}"
     --lr "${TEACHER_LR}"
     --seed "${SEED}"
@@ -751,6 +759,7 @@ print_protocol() {
   echo "episodes: features=${FEATURE_EPISODE_START}..$((FEATURE_EPISODE_END - 1)), train=${TRAIN_EPISODES_JSON}, validation_start=${VALIDATION_EPISODE_START}"
   echo "full-history window: sequence_length=${SEQUENCE_LENGTH} sequence_stride=${SEQUENCE_STRIDE} max_windows_per_episode=${MAX_WINDOWS_PER_EPISODE} history_warmup_length=${HISTORY_WARMUP_LENGTH}"
   echo "trajectory batch: per_device=${BATCH_SIZE} equal_length=${EQUAL_LENGTH_BATCHING} processes=${NUM_PROCESSES} (no temporal padding)"
+  echo "teacher fit: episode_batch_size=${TEACHER_EPISODE_BATCH_SIZE} (right-padded valid_mask; checkpoint execution provenance records this value)"
   echo "offset contract: episode-local origin; full window offset=0; TBPTT segment offset=window_offset+segment_start; reset at episode boundary"
   echo "stages: full-history teacher -> pair labels -> QH2L student; baseline commands are evaluation-only"
   echo "outputs: features=${FEATURES_PATH} teacher=${TEACHER_CHECKPOINT} labels=${LABEL_PATH} student=${STUDENT_OUTPUT_DIR} training_metadata=${TRAINING_METADATA_PATH}"

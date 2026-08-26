@@ -24,7 +24,7 @@ Example (MIKASA environment)::
       --output /workspace/credit_ttt/teacher.pt \
       --features-output /workspace/credit_ttt/features.pt \
       --episode-start 0 --episode-end 250 --validation-episode-start 250 \
-      --epochs 20 --device cuda
+      --epochs 20 --episode-batch-size 8 --device cuda
 
 With ``--validation-episode-start`` at or beyond ``--episode-end`` all
 selected demonstrations are used for fitting.  The script then reports
@@ -33,6 +33,15 @@ discarding official demonstrations from the canonical 250-episode recipe.
 
 This file only reads the LeRobot dataset and writes the requested artifacts;
 it does not modify the source dataset or either protected policy directory.
+
+For a strict reproduction of the original per-episode optimizer schedule,
+leave ``--episode-batch-size`` at its default value of ``1``.  A value greater
+than one is an optional throughput variant for a cached feature set: episodes
+are right-padded and passed with ``valid_mask``.  The masked objective is the
+exact frame-weighted mean of the independent episode objectives, while the
+optimizer takes one update per packed batch; the execution choice is recorded
+in the teacher checkpoint manifest and does not change downstream label
+schemas.
 """
 
 from __future__ import annotations
@@ -385,6 +394,125 @@ def _run_teacher_epoch(
     return total / max(count, 1)
 
 
+def _pad_episode_batch(
+    rows: Sequence[Mapping[str, Tensor]],
+    *,
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Pack variable-length feature episodes into one masked mini-batch.
+
+    Feature caches are intentionally stored one episode at a time (``[T,D]``)
+    so their on-disk representation is independent of the execution batch
+    size.  This helper is the sole place where padding is introduced for the
+    optional batched teacher fit.  Episodes are right-padded with zeros and a
+    boolean ``valid_mask`` marks the physical frames; consequently the causal
+    teacher never advances its state, nor contributes loss, on a padded row.
+
+    The row order is preserved exactly.  In particular, the first valid frame
+    of every row is still a fresh episode and therefore receives the same
+    start-of-episode previous-action validity marker as the legacy
+    per-episode path.
+    """
+
+    if not rows:
+        raise ValueError("cannot pad an empty episode batch")
+
+    # Validate dimensions before allocating a potentially large padded tensor.
+    lengths: list[int] = []
+    event_dim: int | None = None
+    action_dim: int | None = None
+    tensors: list[tuple[Tensor, Tensor, Tensor]] = []
+    for index, row in enumerate(rows):
+        events, previous, targets = _episode_tensors(row, device=device)
+        length = int(events.shape[1])
+        if length <= 0:
+            raise ValueError(f"episode batch row {index} is empty")
+        row_event_dim = int(events.shape[-1])
+        row_action_dim = int(targets.shape[-1])
+        if event_dim is None:
+            event_dim = row_event_dim
+            action_dim = row_action_dim
+        elif (row_event_dim, row_action_dim) != (event_dim, action_dim):
+            raise ValueError(
+                "all episodes in a padded batch must share feature widths; "
+                f"row 0 has ({event_dim},{action_dim}) but row {index} has "
+                f"({row_event_dim},{row_action_dim})"
+            )
+        if int(previous.shape[-1]) != row_action_dim:
+            raise ValueError(
+                f"episode batch row {index} previous-action width "
+                f"{previous.shape[-1]} does not match target width {row_action_dim}"
+            )
+        lengths.append(length)
+        tensors.append((events[0], previous[0], targets[0]))
+
+    assert event_dim is not None and action_dim is not None  # rows is non-empty
+    batch_size = len(tensors)
+    max_length = max(lengths)
+    # Keep the cache's dtype (normally float32) and let the teacher convert to
+    # its parameter dtype in ``forward``.  This also avoids an implicit dtype
+    # promotion when a caller supplies a mixed-precision feature cache.
+    dtype = tensors[0][0].dtype
+    events = torch.zeros(batch_size, max_length, event_dim, device=device, dtype=dtype)
+    previous = torch.zeros(batch_size, max_length, action_dim, device=device, dtype=dtype)
+    targets = torch.zeros(batch_size, max_length, action_dim, device=device, dtype=dtype)
+    valid = torch.zeros(batch_size, max_length, device=device, dtype=torch.bool)
+    for batch_index, (length, (row_events, row_previous, row_targets)) in enumerate(
+        zip(lengths, tensors, strict=True)
+    ):
+        events[batch_index, :length] = row_events
+        previous[batch_index, :length] = row_previous
+        targets[batch_index, :length] = row_targets
+        valid[batch_index, :length] = True
+    return events, previous, targets, valid
+
+
+def _run_teacher_epoch_batched(
+    teacher: FullHistoryActionTeacher,
+    rows: Sequence[Mapping[str, Tensor]],
+    optimizer: torch.optim.Optimizer | None,
+    *,
+    device: torch.device,
+    episode_batch_size: int,
+) -> float:
+    """Fit/evaluate episodes with right-padding and a frame-validity mask.
+
+    ``episode_batch_size=1`` deliberately delegates to
+    :func:`_run_teacher_epoch`, preserving the historical per-episode update
+    schedule bit-for-bit.  For values greater than one, one optimizer step is
+    taken per padded mini-batch.  The objective in that step is the exact
+    frame-weighted mean of the corresponding independent episode losses; only
+    optimizer update granularity changes.  This makes the speed/throughput
+    trade-off explicit instead of silently changing the canonical default.
+    """
+
+    if int(episode_batch_size) <= 0:
+        raise ValueError("episode_batch_size must be positive")
+    if int(episode_batch_size) == 1:
+        return _run_teacher_epoch(teacher, rows, optimizer, device=device)
+
+    total = 0.0
+    count = 0
+    batch_size = int(episode_batch_size)
+    for start in range(0, len(rows), batch_size):
+        events, previous, targets, valid = _pad_episode_batch(
+            rows[start : start + batch_size],
+            device=device,
+        )
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+        output = teacher(events, previous, valid_mask=valid)
+        loss = teacher.action_loss(output.actions, targets, valid_mask=valid)
+        if optimizer is not None:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(teacher.parameters(), 1.0)
+            optimizer.step()
+        frame_count = int(valid.sum().item())
+        total += float(loss.detach().item()) * frame_count
+        count += frame_count
+    return total / max(count, 1)
+
+
 @torch.no_grad()
 def _evaluate_teacher(
     teacher: FullHistoryActionTeacher,
@@ -409,6 +537,36 @@ def _evaluate_teacher(
             predictions = torch.stack(pieces, dim=1)
         loss = teacher.action_loss(predictions, targets)
         frame_count = int(events.shape[1])
+        total += float(loss.item()) * frame_count
+        count += frame_count
+    return total / max(count, 1)
+
+
+@torch.no_grad()
+def _evaluate_teacher_batched(
+    teacher: FullHistoryActionTeacher,
+    rows: Sequence[Mapping[str, Tensor]],
+    *,
+    device: torch.device,
+    episode_batch_size: int,
+) -> float:
+    """Evaluate full-history teacher loss using the optional padded batches."""
+
+    if int(episode_batch_size) <= 0:
+        raise ValueError("episode_batch_size must be positive")
+    if int(episode_batch_size) == 1:
+        return _evaluate_teacher(teacher, rows, device=device, short_context=0)
+    total = 0.0
+    count = 0
+    batch_size = int(episode_batch_size)
+    for start in range(0, len(rows), batch_size):
+        events, previous, targets, valid = _pad_episode_batch(
+            rows[start : start + batch_size],
+            device=device,
+        )
+        predictions = teacher(events, previous, valid_mask=valid).actions
+        loss = teacher.action_loss(predictions, targets, valid_mask=valid)
+        frame_count = int(valid.sum().item())
         total += float(loss.item()) * frame_count
         count += frame_count
     return total / max(count, 1)
@@ -550,15 +708,37 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         target_mode="normalized_executed_slot0_action",
     ).to(device)
     optimizer = torch.optim.AdamW(teacher.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    episode_batch_size = int(getattr(args, "episode_batch_size", 1))
+    if episode_batch_size <= 0:
+        raise ValueError("episode_batch_size must be positive")
+    if episode_batch_size > 1:
+        LOGGER.info(
+            "Using padded full-history teacher batches of %d episodes; "
+            "valid_mask keeps padded frames out of the causal state/loss. "
+            "This changes only optimizer update granularity; batch size 1 "
+            "is the legacy per-episode schedule.",
+            episode_batch_size,
+        )
     history: list[dict[str, float]] = []
     epochs = int(args.epochs)
     if epochs <= 0:
         raise ValueError("epochs must be positive")
     for epoch in range(epochs):
         teacher.train()
-        train_loss = _run_teacher_epoch(teacher, train_rows, optimizer, device=device)
+        train_loss = _run_teacher_epoch_batched(
+            teacher,
+            train_rows,
+            optimizer,
+            device=device,
+            episode_batch_size=episode_batch_size,
+        )
         teacher.eval()
-        validation_loss = _evaluate_teacher(teacher, validation_rows, device=device, short_context=0)
+        validation_loss = _evaluate_teacher_batched(
+            teacher,
+            validation_rows,
+            device=device,
+            episode_batch_size=episode_batch_size,
+        )
         history.append({"epoch": float(epoch + 1), "train_loss": train_loss, "validation_loss": validation_loss})
         if epoch == 0 or (epoch + 1) % max(1, int(args.log_every)) == 0 or epoch + 1 == epochs:
             LOGGER.info("teacher epoch %d/%d: train=%.6f validation=%.6f", epoch + 1, epochs, train_loss, validation_loss)
@@ -566,7 +746,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             break
 
     teacher.eval()
-    full_loss = _evaluate_teacher(teacher, validation_rows, device=device, short_context=0)
+    full_loss = _evaluate_teacher_batched(
+        teacher,
+        validation_rows,
+        device=device,
+        episode_batch_size=episode_batch_size,
+    )
     short_loss = _evaluate_teacher(teacher, validation_rows, device=device, short_context=int(args.short_context))
     improvement = (short_loss - full_loss) / max(short_loss, 1e-8)
     audit = _history_swap_audit(teacher, validation_rows, device=device)
@@ -584,6 +769,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "validation_is_diagnostic_reuse": validation_is_diagnostic_reuse,
             "seed": int(args.seed),
             "epochs": len(history),
+            # Execution provenance only: this does not enter the teacher
+            # architecture or the downstream HCA/QH2L/CMD label protocol.
+            # Values >1 use the same masked frame objective but take one
+            # optimizer step per padded episode mini-batch.
+            "episode_batch_size": episode_batch_size,
             "history": history,
             "full_history_validation_loss": full_loss,
             "short_context_validation_loss": short_loss,
@@ -633,6 +823,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=0, help="Optional epoch cap for a smoke run")
+    parser.add_argument(
+        "--episode-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Optional number of variable-length episodes packed per teacher "
+            "step using right-padding and valid_mask.  The default 1 keeps "
+            "the legacy per-episode optimizer schedule; values >1 are an "
+            "execution/throughput variant and do not alter the label protocol."
+        ),
+    )
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-6)
@@ -652,6 +853,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--short-context must be non-negative")
     if args.hidden_dim <= 0 or args.lr <= 0:
         parser.error("--hidden-dim and --lr must be positive")
+    if args.episode_batch_size <= 0:
+        parser.error("--episode-batch-size must be positive")
     return args
 
 
