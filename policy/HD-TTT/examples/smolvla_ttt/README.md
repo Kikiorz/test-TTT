@@ -25,19 +25,35 @@ TTT-KVB update, layer placement, denoising schedule, and losses unchanged.
 ## HD-TTT training objects
 
 The optional HD-TTT objectives are enabled with `--policy.hd_ttt_enabled=true` after a
-causal teacher pass has produced attribution labels.  `hd_ttt.py` contains the pure tensor
-implementations of the three paper terms:
+causal teacher pass has produced attribution labels.  The paper path is the explicit v2
+contract (`--policy.hd_attribution_protocol=v2_relative_antithetic_robust`,
+`--policy.hd_effect_weight=1`, and `--policy.ttt_writer_mode=prefix_only`).
+`hd_ttt.py` contains the pure tensor implementations of the causal terms:
 
 * `compute_hindsight_attribution` computes the leakage-safe positive credit
   (C_{i\to j}=[L^{-i}_j-L_j]_+), together with event `u` and future `rho` weights.
+  `compute_robust_hindsight_attribution` is the v2 signed/antithetic-compatible
+  primitive; it exposes positive and harmful credit separately.
 * `local_kvb_loss` is the deployable K/V writer objective; it never requires an expert action
   at test time.
 * `counterfactual_grounding_loss` matches correct-vs-wrong-memory action changes while
   enforcing invariance for low-dependency futures. Teacher tensors are always detached.
+* `action_effect_distillation_loss` matches the slot-0 true-minus-wrong action effect
+  with writer gradients intact; v2 uses a robust median-RMS scale and Huber penalty.
+
+The v2 label builder uses an antithetic `(z, -z)` replay pair, symmetric relative credit,
+adaptive top-`sqrt(n)` aggregation, and percentile normalization.  These are fixed
+algorithmic choices, not per-task knobs.  The stored top-two effect branches are an audit/
+ablation axis; the main student consumes the selected branch (axis 0).
 
 HCA intervention labels are training-only. Deployment keeps the ordinary SmolVLA flow loss,
 one update-then-apply fast-weight write per physical observation, and the recurrent state reset
 at episode boundaries.
+
+`history_teacher.py` provides an independent causal GRU-style history encoder for experiments
+that need an explicit teacher. It is not imported by the default label builders, does not add an
+input or parameter to a deployed student, and must be reported as a separate teacher ablation
+with its format/state hash if enabled.
 
 The frame-level hindsight builder stores one selected wrong-memory branch for grounding. To keep
 that branch and `hd_rho` aligned, it requires at least 64 eligible future frames by default and
@@ -46,10 +62,9 @@ event with the largest total credit. The rule is recorded as
 `grounding_event_policy=min_future_horizon_mean_else_total_credit` and the threshold as
 `grounding_min_future_frames`; override the builder CLI with
 `--grounding-min-future-frames N` and pass the same value as
-`--policy.hd_grounding_min_future_frames=N` during training. A value of `0` restores the
-pre-change mean-credit selection for an explicit ablation. HCA's all-event maximum attribution
-remains unchanged; do not replace `hd_rho` with that maximum unless the wrong branch is also
-made event-specific.
+`--policy.hd_grounding_min_future_frames=N` during training. A value of `0` is an explicit
+selection ablation, not a claim that the v2 attribution formula changed. HCA's robust v2
+aggregation and the selected grounding branch must remain separately auditable.
 Artifacts generated before this contract field was introduced are intentionally rejected by the
 strict loader; regenerate them rather than silently interpreting their terminal-event `hd_rho`.
 

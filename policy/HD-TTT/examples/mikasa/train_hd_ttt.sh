@@ -2,13 +2,19 @@
 
 # Reproducible MIKASA HD-TTT training recipe.
 #
-# The default recipe uses four deterministic, episode-balanced windows per
-# long demonstration and 150 passes.  A window-keyed HD artifact stores a
-# complete replay context for each selected window, so this cap is an exact
-# contract rather than an approximate frame-label shortcut.  For the strict
-# full-history Shuffle teacher/HD recipe, use the frame-level artifact emitted
-# by ``build_hd_labels.py`` and set ``MAX_WINDOWS_PER_EPISODE=1`` with
-# ``HISTORY_WARMUP_LENGTH=full``; the one window then covers each whole episode.
+# The compatibility defaults keep the original suffix writer and legacy HD
+# objective when HD is disabled.  When ``HD_ENABLED=true`` and the protocol is
+# not explicitly supplied, the script selects the v2 attribution protocol and
+# enables the action-effect term; this prevents the common failure mode where
+# the v2 label builder is paired with a legacy policy config.  The paper
+# commands still spell out every structural choice (including
+# ``TTT_WRITER_MODE=prefix_only``) so a checkpoint is self-auditing.
+#
+# A window-keyed HD artifact stores a complete replay context for each
+# selected window, so the window cap is an exact contract rather than an
+# approximate frame-label shortcut.  For strict full-history labels, use the
+# frame-level artifact emitted by ``build_hd_labels.py`` and set
+# ``MAX_WINDOWS_PER_EPISODE=1`` with ``HISTORY_WARMUP_LENGTH=full``.
 
 set -euo pipefail
 
@@ -43,6 +49,7 @@ fi
 TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
 REGISTER_TOKENS="${REGISTER_TOKENS:-16}"
+TTT_WRITER_MODE="${TTT_WRITER_MODE:-suffix}"
 RESIZE="${RESIZE:-[224,224]}"
 TRAINING_STAGE="${TRAINING_STAGE:-ttt_only}"
 HD_ENABLED="${HD_ENABLED:-false}"
@@ -58,6 +65,23 @@ HD_GROUNDING_WEIGHT="${HD_GROUNDING_WEIGHT:-1.0}"
 HD_INVARIANCE_WEIGHT="${HD_INVARIANCE_WEIGHT:-0.25}"
 HD_WRITE_GATE_WEIGHT="${HD_WRITE_GATE_WEIGHT:-1.0}"
 HD_COUNTERFACTUAL_MARGIN="${HD_COUNTERFACTUAL_MARGIN:-0.0}"
+# Keep the old protocol for clean/legacy runs, but make an HD run safe by
+# defaulting to the paper v2 contract.  The ``+x`` test distinguishes an
+# omitted variable from an explicit legacy ablation.
+HD_ENABLED_NORMALIZED="${HD_ENABLED,,}"
+if [[ -z "${HD_ATTRIBUTION_PROTOCOL+x}" ]]; then
+  if [[ "${HD_ENABLED_NORMALIZED}" == "true" ]]; then
+    HD_ATTRIBUTION_PROTOCOL="v2_relative_antithetic_robust"
+  else
+    HD_ATTRIBUTION_PROTOCOL="legacy_raw_hinge_max"
+  fi
+fi
+if [[ -z "${HD_EFFECT_WEIGHT+x}" ]]; then
+  HD_EFFECT_WEIGHT="0.0"
+  if [[ "${HD_ENABLED_NORMALIZED}" == "true" ]]; then
+    HD_EFFECT_WEIGHT="1.0"
+  fi
+fi
 SAVE_FREQ="${SAVE_FREQ:-500}"
 LOG_FREQ="${LOG_FREQ:-50}"
 SEED="${SEED:-1000}"
@@ -67,6 +91,33 @@ CONFIG_PATH="${CONFIG_PATH:-}"
 # ``[0,1,2]``.  This is useful for a bounded smoke run and for reproducible
 # per-shard experiments; when unset all 250 demonstrations are used.
 DATASET_EPISODES="${DATASET_EPISODES:-}"
+
+case "${TTT_WRITER_MODE}" in
+  suffix|prefix_only) ;;
+  *)
+    echo "TTT_WRITER_MODE must be 'suffix' or 'prefix_only', got '${TTT_WRITER_MODE}'" >&2
+    exit 2
+    ;;
+esac
+case "${HD_ATTRIBUTION_PROTOCOL}" in
+  legacy|legacy_raw_hinge_max)
+    HD_ATTRIBUTION_PROTOCOL="legacy_raw_hinge_max"
+    ;;
+  v2|v2_relative_antithetic_robust)
+    HD_ATTRIBUTION_PROTOCOL="v2_relative_antithetic_robust"
+    ;;
+  *)
+    echo "HD_ATTRIBUTION_PROTOCOL must be legacy or v2, got '${HD_ATTRIBUTION_PROTOCOL}'" >&2
+    exit 2
+    ;;
+esac
+if ! [[ "${HD_EFFECT_WEIGHT}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "HD_EFFECT_WEIGHT must be a non-negative number, got '${HD_EFFECT_WEIGHT}'" >&2
+  exit 2
+fi
+if [[ "${HD_ATTRIBUTION_PROTOCOL}" == "legacy_raw_hinge_max" && "${HD_EFFECT_WEIGHT}" != "0" && "${HD_EFFECT_WEIGHT}" != "0.0" ]]; then
+  echo "warning: legacy attribution labels do not contain v2 action-effect targets; HD_EFFECT_WEIGHT=${HD_EFFECT_WEIGHT} will have no effect" >&2
+fi
 
 export HF_HOME="${HF_HOME:-/workspace/hf_cache}"
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-/workspace/data_mikasa_robo}"
@@ -134,7 +185,7 @@ MAX_EPISODE_LENGTH="$("${PYTHON_BIN}" -c 'import sys; print(sys.argv[1].split()[
 STEPS_PER_EPOCH=$(( (WINDOWS + NUM_PROCESSES - 1) / NUM_PROCESSES ))
 STEPS=$(( STEPS_PER_EPOCH * EPOCHS ))
 
-echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, grounding_min_future=${HD_GROUNDING_MIN_FUTURE_FRAMES}, margin=${HD_COUNTERFACTUAL_MARGIN}, grounding_weight=${HD_GROUNDING_WEIGHT}"
+echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, writer=${TTT_WRITER_MODE}, attribution=${HD_ATTRIBUTION_PROTOCOL}, grounding_min_future=${HD_GROUNDING_MIN_FUTURE_FRAMES}, margin=${HD_COUNTERFACTUAL_MARGIN}, effect_weight=${HD_EFFECT_WEIGHT}, grounding_weight=${HD_GROUNDING_WEIGHT}"
 
 COMMON_ARGS=(
   --dataset.repo_id="${DATASET_REPO_ID}"
@@ -154,6 +205,7 @@ COMMON_ARGS=(
   --policy.ttt_second_order=false
   --policy.ttt_layer_indices="${TTT_LAYERS}"
   --policy.ttt_num_register_tokens="${REGISTER_TOKENS}"
+  --policy.ttt_writer_mode="${TTT_WRITER_MODE}"
   --policy.ttt_training_stage="${TRAINING_STAGE}"
   --policy.resize_imgs_with_padding="${RESIZE}"
   --policy.hd_ttt_enabled="${HD_ENABLED}"
@@ -165,10 +217,12 @@ COMMON_ARGS=(
   --policy.hd_attribution_threshold="${HD_ATTRIBUTION_THRESHOLD}"
   --policy.hd_hca_weight="${HD_HCA_WEIGHT}"
   --policy.hd_h2l_weight="${HD_H2L_WEIGHT}"
+  --policy.hd_effect_weight="${HD_EFFECT_WEIGHT}"
   --policy.hd_grounding_weight="${HD_GROUNDING_WEIGHT}"
   --policy.hd_invariance_weight="${HD_INVARIANCE_WEIGHT}"
   --policy.hd_write_gate_weight="${HD_WRITE_GATE_WEIGHT}"
   --policy.hd_counterfactual_margin="${HD_COUNTERFACTUAL_MARGIN}"
+  --policy.hd_attribution_protocol="${HD_ATTRIBUTION_PROTOCOL}"
   --batch_size=1
   --num_workers="${NUM_WORKERS:-4}"
   --prefetch_factor="${PREFETCH_FACTOR:-2}"
