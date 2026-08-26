@@ -3134,7 +3134,7 @@ class SmolVLATTTFlowMatching(nn.Module):
         forbidden from reading register columns by the asymmetric suffix
         mask), making them dead parameters in the paper configuration.  The
         anchors are learned expert-width vectors, valid for every observation,
-        and are concatenated after the projected causal prefix.  They do not
+        and are prepended to the projected causal prefix.  They do not
         reintroduce action/noise dependence; suffix mode keeps its original
         register-as-writer behavior unchanged.
         """

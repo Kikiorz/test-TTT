@@ -187,6 +187,14 @@ $[0.25,4]$ trust-region 截断；这是 `ttt_stable_inner_update=true` 时的实
 
 这就是本项目的 **update-then-apply**：当前 interaction 先写入 fast weights，当前 token 的 residual read 使用更新后的 $W_{t+1}$。`g_t=0` 是严格的 zero-write intervention；$g_t\in(0,1)$ 是可微插值。
 
+实现中有意区分两个表面上相同的 K/V loss：真正用于 inner update 的目标保留
+当前可学习的 $v_t$，这样 v2 action-effect loss 可以沿着
+$v\rightarrow\nabla_W\ell_{KV}\rightarrow W_{t+1}$ 形成二阶 meta-gradient；
+对外暴露、作为 H2L 辅助项的 local loss 则使用
+$\operatorname{sg}(v_t)$，避免 value projection 通过移动自己的 target 来
+co-adapt。前者训练 writer 的 effect 路径，后者提供稳定的独立 local-writer
+监督。
+
 ### 4.2 Denoising 时序
 
 默认 `num_steps=10`，$dt=-1/10$：
@@ -301,7 +309,11 @@ d_T=\operatorname{sg}(\texttt{hd\_teacher\_effect}_{0}).
 高依赖 frame 用 robust-scaled unit-beta Huber 匹配 $d_s$ 与 $d_T$，低依赖 frame
 约束 $d_s\approx0$。teacher effect 的 median non-zero RMS 只用于无量纲缩放，
 不会引入 task/action-unit 超参数；`hd_effect_weight` 仅控制该辅助项在总 loss
-中的优化权重。当前 v2 builder 只生成一个 branch，student 明确消费 event axis
+中的优化权重。为避免 TBPTT 分段改变尺度，训练器会在切 segment **之前**，从完整
+physical window 的 slot-0、active action dimensions 计算一个 detached robust
+median floor，并把同一个 floor 传给该 window 的所有 segment；只有直接调用
+`action_effect_distillation_loss` 且未显式传 floor 时，才按当前调用 batch 估计（兼容
+旧 API）。当前 v2 builder 只生成一个 branch，student 明确消费 event axis
 的第 0 项。读取旧的 K>1 artifact 仍然兼容，但额外 branch 不参与主路径；若要研究
 多事件，必须另行实现并报告独立 ablation。
 该项直接让 writer 受到最终控制效果约束，但仍不是 latent fast-weight 的逐元素
@@ -754,6 +766,10 @@ slot 0 后进入下一物理时刻。部署侧没有 teacher、未来帧或专�
 | 计算边界 | Shuffle episode 长度 145–513，full replay 很慢 | 采用预注册的 bounded `L=64, stride=64, context=128, K=4`，并明确 `history_mode=bounded_window_replay`，不能冒充 full-history。 |
 | 研究边界 | HCA 的监督对象 | 它是“删除 learned fast-weight event 后未来动作预测的退化”，不是任意历史 oracle 的真实 action value；论文应写成 control attribution under the clean teacher。 |
 | 研究边界 | effect 的覆盖范围 | 当前只消费 selected event 的 slot 0 / branch 0；全 50-slot 或多事件 effect 尚未实现，不能在论文中暗示已覆盖。 |
+| 研究边界 | effect 与完整 rollout 的差异 | label/effect 只在 deployment-matched 的首个 denoising phase（$t=1$、Gaussian input）监督已执行 slot 0；部署随后还有 9 个 read-only denoising reads。它是首步 velocity effect，不等于 10-step 积分后 action chunk 的完整 credit，需作为明确限制和 ablation。 |
+| 研究边界 | harmful credit 的使用 | v2 会计算并保存 signed/harmful attribution 供审计，但主 all-write writer 不用它抑制写入；不能宣称已实现 harmful-write rejection 或 selective suppression。 |
+| 研究边界 | prefix writer 的表征 | `prefix_only` writer 使用当前原始 VLM prefix embedding 经共享 adapter（加 static registers），不是经过完整 VLM 深层 contextualization 的 hidden state；这是当前计算/输入独立性折中，应在消融中与 suffix writer 区分。 |
+| 复现限制 | teacher/data provenance | 当前 contract 记录 config SHA、dataset id/fps/index 和协议字段，但未对 teacher 权重内容或 dataset 原始内容做完整 cryptographic hash；正式实验需额外保存 checkpoint manifest 与数据版本摘要。 |
 | 需监控 | 长 episode 的 state drift | stable update 约束每一步而非整个 episode；记录 `ttt_state_rms_ratio_*`。如果 Shuffle 越界，应先报告并做独立机制实验，不在主结果中临时加入 decay。 |
 | 尚无结论 | 正式 Color/Shuffle V2 150-epoch 和官方 SR | 旧 v1 的 `.08/.12` 只属于旧协议，不能作为 V2 提升或失败的证据。 |
 
