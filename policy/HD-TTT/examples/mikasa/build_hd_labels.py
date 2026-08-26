@@ -75,6 +75,27 @@ from torch import Tensor
 
 LOGGER = logging.getLogger("build_hd_labels")
 
+# ``legacy`` reproduces the original positive raw-loss/max aggregation.  The
+# v2 protocol is the paper path: antithetic common-random-number replay,
+# symmetric relative degradation, adaptive top-k aggregation, and robust
+# percentile normalization.  Keeping the protocol string in every artifact
+# prevents an ablation from being mistaken for the main method.
+HD_ATTRIBUTION_PROTOCOL_LEGACY = "legacy_raw_hinge_max"
+HD_ATTRIBUTION_PROTOCOL_V2 = "v2_relative_antithetic_robust"
+HD_ATTRIBUTION_PROTOCOLS = {
+    HD_ATTRIBUTION_PROTOCOL_LEGACY,
+    HD_ATTRIBUTION_PROTOCOL_V2,
+}
+# The v2 paper path stores one selected event branch.  Antithetic replay is
+# still used for attribution (the two signs above), but action-effect training
+# currently consumes only the selected event.  Older artifacts may contain
+# K>1 branches; readers intentionally consume branch zero for compatibility.
+V2_ANTITHETIC_REPLAYS = 2
+V2_EFFECT_BRANCHES = 1
+# The content/effect target intentionally stays on the deployment-matched
+# ``+noise`` replay; antithetic ``-noise`` is attribution-only.
+V2_EFFECT_TARGET = "plus_noise_full_minus_wrong"
+
 # Grounding keeps one counterfactual branch so the stored wrong velocity and
 # ``hd_rho`` always describe the same intervention.  Prefer an event with a
 # sufficiently long causal future and compare its mean credit; when an
@@ -183,11 +204,19 @@ def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
         raise ValueError(
             f"Teacher config {config_path} has empty/invalid TTT architecture fields"
         )
+    # A few early configs serialized optional extension fields as JSON null;
+    # null has the same semantics as the absent legacy suffix writer.
+    writer_mode = raw.get("ttt_writer_mode") or "suffix"
+    if writer_mode not in {"suffix", "prefix_only"}:
+        raise ValueError(
+            f"Teacher config {config_path} has invalid ttt_writer_mode={writer_mode!r}"
+        )
     return {
         "policy_type": raw.get("type"),
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "ttt_layer_indices": layer_indices,
         "ttt_num_register_tokens": register_tokens,
+        "ttt_writer_mode": writer_mode,
         "hd_ttt_enabled": teacher_hd_ttt_enabled,
         "hd_learned_write_gate": teacher_hd_learned_write_gate,
         "config_path": str(config_path),
@@ -490,8 +519,32 @@ def _flow_losses(
     actions: Tensor,
     action_is_pad: Tensor | None,
     active_dim: int,
+    *,
+    slot_mode: str = "all",
 ) -> Tensor:
-    """Per-frame flow loss used to form the positive HCA credit."""
+    """Per-frame flow loss used to form hindsight control credit.
+
+    ``slot_mode='all'`` is the historical chunk-average objective.  The v2
+    protocol uses ``slot_mode='slot0'`` because MIKASA executes the first
+    action and replans at the next observation; future chunk slots are useful
+    for imitation but should not define whether a memory event was causally
+    useful to the deployed controller.
+    """
+
+    if slot_mode not in {"all", "slot0"}:
+        raise ValueError("slot_mode must be 'all' or 'slot0'")
+    if velocity.ndim < 3 or noise.ndim < 3 or actions.ndim < 3:
+        raise ValueError("velocity, noise, and actions must have [frame, slot, feature] dimensions")
+    if slot_mode == "slot0":
+        velocity = velocity[:, :1]
+        noise = noise[:, :1]
+        actions = actions[:, :1]
+        if action_is_pad is not None:
+            action_is_pad = (
+                action_is_pad[:, :1]
+                if action_is_pad.ndim >= 2
+                else action_is_pad[:, None]
+            )
 
     target = noise[..., :active_dim].cpu() - actions[..., :active_dim].cpu()
     # Keep the action-chunk axis until padding is applied.  Near an episode
@@ -618,27 +671,80 @@ def _episode_labels(
     global_offset: int = 0,
     event_global_start_min: int | None = None,
     event_global_end_max: int | None = None,
+    attribution_protocol: str = "legacy",
 ) -> dict[str, Any]:
-    """Compute full teacher, causal interventions, and frame-aligned labels."""
+    """Compute causal teacher interventions and frame-aligned HD labels.
+
+    ``attribution_protocol='legacy'`` is bit-compatible with the original
+    positive raw-loss/max collector.  ``'v2'`` (or the full protocol constant)
+    is the paper path: each event is replayed with an antithetic ``z,-z``
+    common-random-number pair; signed *relative* degradation is averaged across
+    the pair; event/future credit uses the adaptive top-sqrt reducer; and gate
+    targets use robust percentile normalization.  The selected-event fields
+    remain present for old reader grounding, while v2 additionally emits a
+    compact selected-event action-effect target (slot 0 only) for differentiable
+    writer/content distillation.
+    """
 
     if grounding_min_future_frames < 0:
         raise ValueError("grounding_min_future_frames must be non-negative")
+    if attribution_protocol == "legacy":
+        protocol = HD_ATTRIBUTION_PROTOCOL_LEGACY
+    elif attribution_protocol == "v2":
+        protocol = HD_ATTRIBUTION_PROTOCOL_V2
+    else:
+        protocol = str(attribution_protocol)
+    if protocol not in HD_ATTRIBUTION_PROTOCOLS:
+        raise ValueError(
+            f"Unknown attribution_protocol={attribution_protocol!r}; expected 'legacy' or 'v2'"
+        )
+    robust_protocol = protocol == HD_ATTRIBUTION_PROTOCOL_V2
+    # Delayed import keeps this script's ``--merge``/unit-test path lightweight.
+    if robust_protocol:
+        from lerobot.policies.smolvla_ttt.hd_ttt import (
+            adaptive_topk_mean,
+            robust_percentile_normalize,
+            robust_signed_normalize,
+            symmetric_relative_credit,
+        )
 
+    if robust_protocol and attribution_threshold < 0:
+        raise ValueError("attribution_threshold must be non-negative")
     actions = policy.prepare_action(prepared).detach().cpu()
     action_is_pad = prepared.get("action_is_pad")
     if action_is_pad is not None:
         action_is_pad = action_is_pad.detach().cpu()
     active_dim = int(math.prod(policy.config.action_feature.shape))
 
-    full_velocity = _run_replay(
-        policy,
-        prepared,
-        noise,
-        time,
-        frame_batch_size=frame_batch_size,
-    )
-    full_loss = _flow_losses(full_velocity, noise, actions, action_is_pad, active_dim)
+    length_hint = int(actions.shape[0])
+    replay_noises = [noise, -noise] if robust_protocol else [noise]
+    slot_mode = "slot0" if robust_protocol else "all"
+    full_velocities: list[Tensor] = []
+    full_losses: list[Tensor] = []
+    for replay_noise in replay_noises:
+        velocity = _run_replay(
+            policy,
+            prepared,
+            replay_noise,
+            time,
+            frame_batch_size=frame_batch_size,
+        )
+        full_velocities.append(velocity)
+        full_losses.append(
+            _flow_losses(
+                velocity,
+                replay_noise,
+                actions,
+                action_is_pad,
+                active_dim,
+                slot_mode=slot_mode,
+            )
+        )
+    full_velocity = full_velocities[0]
+    full_loss = torch.stack(full_losses, dim=0).mean(dim=0)
     length = int(full_velocity.shape[0])
+    if length != length_hint:
+        raise ValueError(f"Teacher replay returned {length} rows, expected {length_hint}")
     if future_mask is not None:
         future_mask = future_mask.detach().cpu().bool()
         if future_mask.shape != (length,):
@@ -652,12 +758,14 @@ def _episode_labels(
         global_end_max=event_global_end_max,
     )
     credit_rows: list[Tensor] = []
-    # Keep only the currently best preferred/fallback branches rather than
-    # retaining every intervention velocity.  This bounds CPU memory for an
-    # exhaustive event pass while still allowing the final scalar selector to
-    # apply deterministic tie-breaking.
-    preferred_branch: tuple[int, Tensor, Tensor] | None = None
-    fallback_branch: tuple[int, Tensor, Tensor] | None = None
+    signed_rows: list[Tensor] = []
+    harm_rows: list[Tensor] = []
+    # Keep only a few branch tensors.  ``preferred``/``fallback`` reproduce the
+    # historical selector; ``branch_pool`` supplies the compact selected-event
+    # action-effect target without retaining every intervention.
+    preferred_branch: dict[str, Any] | None = None
+    fallback_branch: dict[str, Any] | None = None
+    branch_pool: list[dict[str, Any]] = []
     preferred_score = float("-inf")
     fallback_total = float("-inf")
     eligible_counts: list[int] = []
@@ -667,30 +775,80 @@ def _episode_labels(
     for event_index, (event_start, event_end) in enumerate(events):
         gate = torch.ones(length, dtype=torch.float32, device=noise.device)
         gate[event_start:event_end] = 0.0
-        wrong_velocity = _run_replay(
-            policy,
-            prepared,
-            noise,
-            time,
-            frame_batch_size=frame_batch_size,
-            write_gate=gate,
-        )
-        wrong_loss = _flow_losses(wrong_velocity, noise, actions, action_is_pad, active_dim)
-        row = (wrong_loss - full_loss).clamp_min(0.0)
+        wrong_velocities: list[Tensor] = []
+        wrong_losses: list[Tensor] = []
+        for replay_noise, full_variant_loss in zip(replay_noises, full_losses, strict=True):
+            wrong_velocity_variant = _run_replay(
+                policy,
+                prepared,
+                replay_noise,
+                time,
+                frame_batch_size=frame_batch_size,
+                write_gate=gate,
+            )
+            wrong_velocities.append(wrong_velocity_variant)
+            wrong_losses.append(
+                _flow_losses(
+                    wrong_velocity_variant,
+                    replay_noise,
+                    actions,
+                    action_is_pad,
+                    active_dim,
+                    slot_mode=slot_mode,
+                )
+            )
+
+        if robust_protocol:
+            signed = torch.stack(
+                [
+                    symmetric_relative_credit(full_variant_loss, wrong_variant_loss)
+                    for full_variant_loss, wrong_variant_loss in zip(
+                        full_losses, wrong_losses, strict=True
+                    )
+                ],
+                dim=0,
+            ).mean(dim=0)
+            # Keep the raw loss delta as an audit quantity, but make all
+            # training-facing credit dimensionless and robust to action/task
+            # scale.  The positive/negative split prevents harmful writes from
+            # cancelling useful-memory evidence.
+            raw_delta = torch.stack(
+                [wrong_loss - full_variant_loss for wrong_loss, full_variant_loss in zip(wrong_losses, full_losses, strict=True)],
+                dim=0,
+            ).mean(dim=0)
+            row = signed.clamp_min(0.0)
+            harm = (-signed).clamp_min(0.0)
+        else:
+            raw_delta = wrong_losses[0] - full_losses[0]
+            signed = raw_delta
+            row = raw_delta.clamp_min(0.0)
+            harm = (-raw_delta).clamp_min(0.0)
         causal = torch.zeros(length, dtype=torch.bool)
         causal[event_end:] = True
         if future_mask is not None:
             causal &= future_mask
         row = torch.where(causal, row, torch.zeros_like(row))
+        signed = torch.where(causal, signed, torch.zeros_like(signed))
+        harm = torch.where(causal, harm, torch.zeros_like(harm))
         if attribution_threshold > 0:
+            # Threshold applies to positive evidence only.  Signed/harmful
+            # diagnostics remain available even when a row is not selected.
             row = torch.where(row >= attribution_threshold, row, torch.zeros_like(row))
         credit_rows.append(row)
+        signed_rows.append(signed)
+        harm_rows.append(harm)
 
-        # Keep the historical mean score for long-enough candidates.  The
-        # minimum-horizon selector below prevents a one-frame terminal event
-        # from winning just because this denominator is tiny.
         eligible_count = int(causal.sum().item())
-        score = float(row.sum().item()) / max(eligible_count, 1) if eligible_count else float("-inf")
+        if robust_protocol:
+            # The adaptive reducer is meant to average the strongest *actual
+            # positive* future effects.  Passing the whole causal horizon
+            # would count zero-credit rows when choosing ``k`` and dilute a
+            # sparse but decisive intervention, contrary to the protocol used
+            # for ``event_u``/``rho`` below.
+            score_tensor = adaptive_topk_mean(row, causal & (row > 0), dim=0)
+            score = float(score_tensor.item()) if eligible_count else float("-inf")
+        else:
+            score = float(row.sum().item()) / max(eligible_count, 1) if eligible_count else float("-inf")
         total_credit = float(row.sum().item())
         eligible_counts.append(eligible_count)
         total_credits.append(total_credit)
@@ -698,12 +856,25 @@ def _episode_labels(
         positive_credit = eligible_count > 0 and total_credit > 0.0
         if not positive_credit:
             continue
-        branch = (event_index, wrong_velocity, gate.detach().cpu())
+        branch = {
+            "event_index": event_index,
+            "wrong_velocity": wrong_velocities[0].detach().cpu(),
+            # Content/effect supervision is phase-matched to the student's
+            # single ``+noise`` replay.  The antithetic ``-noise`` branch is
+            # used only for signed attribution/event ranking; averaging its
+            # velocity effect here would give the student a target from a
+            # distribution it never evaluates online.
+            "effect_velocity": (full_velocities[0] - wrong_velocities[0]).detach().cpu(),
+            "gate": gate.detach().cpu(),
+            "row": row.detach().cpu(),
+            "score": score,
+            "total": total_credit,
+        }
         fallback_key = (total_credit, score, -event_index)
         current_fallback_key = (
             fallback_total,
-            float("-inf") if fallback_branch is None else selection_scores[fallback_branch[0]],
-            -1 if fallback_branch is None else -fallback_branch[0],
+            float("-inf") if fallback_branch is None else float(fallback_branch["score"]),
+            -1 if fallback_branch is None else -int(fallback_branch["event_index"]),
         )
         if fallback_branch is None or fallback_key > current_fallback_key:
             fallback_total = total_credit
@@ -711,13 +882,17 @@ def _episode_labels(
         preferred_key = (score, -event_index)
         current_preferred_key = (
             preferred_score,
-            -1 if preferred_branch is None else -preferred_branch[0],
+            -1 if preferred_branch is None else -int(preferred_branch["event_index"]),
         )
         if eligible_count >= grounding_min_future_frames and (
             preferred_branch is None or preferred_key > current_preferred_key
         ):
             preferred_score = score
             preferred_branch = branch
+        if robust_protocol:
+            branch_pool.append(branch)
+            branch_pool.sort(key=lambda item: (float(item["score"]), float(item["total"]), -int(item["event_index"])), reverse=True)
+            del branch_pool[V2_EFFECT_BRANCHES:]
 
     selected_event_index, grounding_selection_mode = _select_grounding_event(
         eligible_counts,
@@ -725,15 +900,13 @@ def _episode_labels(
         selection_scores,
         min_future_frames=grounding_min_future_frames,
     )
-    selected_branch: tuple[int, Tensor, Tensor] | None
-    if preferred_branch is not None and selected_event_index == preferred_branch[0]:
+    selected_branch: dict[str, Any] | None = None
+    if preferred_branch is not None and selected_event_index == int(preferred_branch["event_index"]):
         selected_branch = preferred_branch
-    elif fallback_branch is not None and selected_event_index == fallback_branch[0]:
+    elif fallback_branch is not None and selected_event_index == int(fallback_branch["event_index"]):
         selected_branch = fallback_branch
-    else:
-        selected_branch = None
-    best_wrong = selected_branch[1] if selected_branch is not None else None
-    best_gate = selected_branch[2] if selected_branch is not None else torch.ones(
+    best_wrong = selected_branch["wrong_velocity"] if selected_branch is not None else None
+    best_gate = selected_branch["gate"] if selected_branch is not None else torch.ones(
         length, dtype=torch.float32
     )
     best_event_index = selected_event_index
@@ -743,45 +916,65 @@ def _episode_labels(
 
     if credit_rows:
         credits = torch.stack(credit_rows, dim=0)
-        # ``hd_attribution`` retains all-event max credit for HCA/write
-        # utility, while ``hd_rho`` is restricted to the selected branch used
-        # by the stored counterfactual velocity.  Keeping these distinct avoids
-        # mixing a per-future event with an episode-global wrong branch in the
-        # grounding direction target.
-        rho_hca_raw = credits.amax(dim=0)
+        signed_credits = torch.stack(signed_rows, dim=0)
+        harmful_credits = torch.stack(harm_rows, dim=0)
+        if robust_protocol:
+            positive_mask = credits > 0
+            harm_mask = harmful_credits > 0
+            rho_hca_raw = adaptive_topk_mean(credits, positive_mask, dim=0)
+            event_u_raw = adaptive_topk_mean(credits, positive_mask, dim=1)
+            harm_rho_raw = adaptive_topk_mean(harmful_credits, harm_mask, dim=0)
+            harm_u_raw = adaptive_topk_mean(harmful_credits, harm_mask, dim=1)
+        else:
+            rho_hca_raw = credits.amax(dim=0)
+            event_u_raw = credits.amax(dim=1)
+            harm_rho_raw = harmful_credits.amax(dim=0)
+            harm_u_raw = harmful_credits.amax(dim=1)
         rho_grounding_raw = (
             credits[best_event_index]
             if 0 <= best_event_index < credits.shape[0]
             else torch.zeros(length, dtype=credits.dtype)
         )
-        event_u_raw = credits.amax(dim=1)
+        signed_rho_raw = rho_hca_raw - harm_rho_raw
     else:
         credits = torch.zeros((0, length), dtype=torch.float32)
+        signed_credits = torch.zeros_like(credits)
+        harmful_credits = torch.zeros_like(credits)
         rho_hca_raw = torch.zeros(length, dtype=torch.float32)
         rho_grounding_raw = torch.zeros(length, dtype=torch.float32)
         event_u_raw = torch.zeros(0, dtype=torch.float32)
+        harm_rho_raw = torch.zeros(length, dtype=torch.float32)
+        harm_u_raw = torch.zeros(0, dtype=torch.float32)
+        signed_rho_raw = torch.zeros(length, dtype=torch.float32)
 
-    # Normalize independently per episode.  A no-dependency episode remains
-    # exactly zero instead of producing NaNs or an arbitrary write signal.
-    rho_hca_scale = rho_hca_raw.max().clamp_min(1e-8)
-    rho_grounding_scale = rho_grounding_raw.max().clamp_min(1e-8)
-    rho_hca = rho_hca_raw / rho_hca_scale if float(rho_hca_raw.max()) > 0 else rho_hca_raw
-    rho_grounding = (
-        rho_grounding_raw / rho_grounding_scale
-        if float(rho_grounding_raw.max()) > 0
-        else rho_grounding_raw
-    )
-    if event_u_raw.numel() and float(event_u_raw.max()) > 0:
-        event_u = event_u_raw / event_u_raw.max().clamp_min(1e-8)
+    if robust_protocol:
+        rho_hca = robust_percentile_normalize(rho_hca_raw, rho_hca_raw > 0, dim=0)
+        rho_grounding = robust_percentile_normalize(
+            rho_grounding_raw, rho_grounding_raw > 0, dim=0
+        )
+        event_u = robust_percentile_normalize(event_u_raw, event_u_raw > 0, dim=0)
+        harm_rho = robust_percentile_normalize(harm_rho_raw, harm_rho_raw > 0, dim=0)
+        harm_u = robust_percentile_normalize(harm_u_raw, harm_u_raw > 0, dim=0)
+        signed_rho = robust_signed_normalize(signed_rho_raw, dim=0)
     else:
-        event_u = event_u_raw
+        rho_hca_scale = rho_hca_raw.max().clamp_min(1e-8)
+        rho_grounding_scale = rho_grounding_raw.max().clamp_min(1e-8)
+        rho_hca = rho_hca_raw / rho_hca_scale if float(rho_hca_raw.max()) > 0 else rho_hca_raw
+        rho_grounding = (
+            rho_grounding_raw / rho_grounding_scale
+            if float(rho_grounding_raw.max()) > 0
+            else rho_grounding_raw
+        )
+        if event_u_raw.numel() and float(event_u_raw.max()) > 0:
+            event_u = event_u_raw / event_u_raw.max().clamp_min(1e-8)
+        else:
+            event_u = event_u_raw
+        harm_rho = harm_rho_raw / harm_rho_raw.max().clamp_min(1e-8) if float(harm_rho_raw.max()) > 0 else harm_rho_raw
+        harm_u = harm_u_raw / harm_u_raw.max().clamp_min(1e-8) if harm_u_raw.numel() and float(harm_u_raw.max()) > 0 else harm_u_raw
+        signed_rho = signed_rho_raw
+
     # Unobserved event blocks (when ``max_events`` is a positive sampling cap)
-    # retain the ordinary writer rather than being silently trained as
-    # permanent skips.  Every block is therefore either assigned its measured
-    # ``u_i`` or receives the safe default gate 1.0.  Keep a separate observed
-    # mask so the learned gate is *not* trained on that default; otherwise a
-    # capped long-horizon pass would turn missing credit into a spurious
-    # all-positive target.
+    # retain the ordinary writer rather than being silently trained as skips.
     write_gate = torch.ones(length, dtype=torch.float32)
     write_gate_observed = torch.zeros(length, dtype=torch.float32)
     for event_index, (event_start, event_end) in enumerate(events):
@@ -792,7 +985,7 @@ def _episode_labels(
         best_wrong = full_velocity.clone()
         best_gate = torch.ones(length, dtype=torch.float32)
 
-    return {
+    result: dict[str, Any] = {
         "hd_teacher_velocity": full_velocity.float(),
         "hd_teacher_true_velocity": full_velocity.float().clone(),
         "hd_teacher_wrong_velocity": best_wrong.float(),
@@ -804,8 +997,21 @@ def _episode_labels(
         "hd_write_gate_observed": write_gate_observed.float(),
         "hd_counterfactual_write_gate": best_gate.float(),
         "hd_C": credits.float(),
+        "hd_signed_C": signed_credits.float(),
+        "hd_harm_C": harmful_credits.float(),
+        "hd_harm_attribution": harm_rho.float(),
+        "hd_harm_u": harm_u.float(),
+        "hd_signed_attribution": signed_rho.float(),
         "hd_event_u": event_u.float(),
-        "hd_attribution_aggregation": "all_event_max_for_hca_selected_event_for_grounding",
+        "hd_attribution_protocol": protocol,
+        "hd_attribution_slot_mode": slot_mode,
+        "hd_attribution_replays": int(len(replay_noises)),
+        "hd_effect_target": V2_EFFECT_TARGET if robust_protocol else "none",
+        "hd_attribution_aggregation": (
+            "antithetic_relative_adaptive_top_sqrt_percentile"
+            if robust_protocol
+            else "all_event_max_for_hca_selected_event_for_grounding"
+        ),
         "hd_grounding_event_policy": GROUNDING_EVENT_POLICY,
         "hd_grounding_min_future_frames": int(grounding_min_future_frames),
         "hd_grounding_selection_mode": grounding_selection_mode,
@@ -820,6 +1026,67 @@ def _episode_labels(
         ),
         "hd_full_flow_loss": full_loss.float(),
     }
+
+    if robust_protocol:
+        # Compact action-effect target for the selected event.  Only
+        # executed slot 0 is stored: the action head replans every observation,
+        # so this is the deployment-relevant causal effect and avoids a 50x
+        # label-size multiplier.  The selected grounding event is always first
+        # when available.  Readers remain compatible with older K>1 artifacts
+        # and explicitly consume branch zero.
+        ordered_branches: list[dict[str, Any]] = []
+        if selected_branch is not None:
+            ordered_branches.append(selected_branch)
+        for branch in branch_pool:
+            if not ordered_branches or int(branch["event_index"]) != int(ordered_branches[0]["event_index"]):
+                ordered_branches.append(branch)
+            if len(ordered_branches) >= V2_EFFECT_BRANCHES:
+                break
+        effect_dim = int(full_velocity.shape[-1])
+        effect_velocity = torch.zeros(
+            length, V2_EFFECT_BRANCHES, effect_dim, dtype=full_velocity.dtype
+        )
+        effect_gate = torch.ones(length, V2_EFFECT_BRANCHES, dtype=torch.float32)
+        effect_rho = torch.zeros(length, V2_EFFECT_BRANCHES, dtype=torch.float32)
+        effect_valid = torch.zeros(length, V2_EFFECT_BRANCHES, dtype=torch.float32)
+        effect_events = torch.full((V2_EFFECT_BRANCHES, 2), -1, dtype=torch.int64)
+        for branch_index, branch in enumerate(ordered_branches[:V2_EFFECT_BRANCHES]):
+            event = events[int(branch["event_index"])]
+            effect_velocity[:, branch_index] = branch["effect_velocity"][:, 0]
+            effect_gate[:, branch_index] = branch["gate"]
+            branch_row = branch["row"]
+            if float(branch_row.max()) > 0:
+                if robust_protocol:
+                    branch_rho = robust_percentile_normalize(
+                        branch_row, branch_row > 0, dim=0
+                    )
+                else:
+                    branch_rho = branch_row / branch_row.max().clamp_min(1e-8)
+                effect_rho[:, branch_index] = branch_rho
+            # The effect target is a *future* consequence of removing this
+            # event.  Marking every frame valid would apply an invariance
+            # penalty to the event itself (and to its past), effectively
+            # leaking the counterfactual into the write that caused it.  Keep
+            # the exact half-open event boundary used by attribution and
+            # additionally respect an episode/window future mask when one is
+            # supplied.
+            causal_effect = torch.zeros(length, dtype=torch.bool)
+            causal_effect[event[1] :] = True
+            if future_mask is not None:
+                causal_effect &= future_mask
+            effect_valid[:, branch_index] = causal_effect.to(dtype=torch.float32)
+            effect_events[branch_index] = torch.tensor(event, dtype=torch.int64)
+        result.update(
+            {
+                "hd_teacher_effect": effect_velocity.float(),
+                "hd_effect_rho": effect_rho.float(),
+                "hd_effect_write_gate": effect_gate.float(),
+                "hd_effect_valid": effect_valid.float(),
+                "hd_effect_events": effect_events,
+                "hd_effect_slot": torch.tensor(0, dtype=torch.int64),
+            }
+        )
+    return result
 
 
 def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
@@ -883,6 +1150,7 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         "frame_batch_size",
     )
     reference_metadata: dict[str, Any] | None = None
+    shard_protocols: list[str] = []
     for path, payload in zip(inputs, payloads, strict=True):
         metadata = payload.get("metadata")
         if not isinstance(metadata, Mapping):
@@ -919,18 +1187,119 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
                     "the clean/all-write replay contract must be used for hindsight labels"
                 )
         copied = dict(metadata)
+        # Artifacts generated before v2 did not carry an explicit protocol;
+        # infer the legacy contract so they remain mergeable and auditable.
+        copied.setdefault("attribution_protocol", HD_ATTRIBUTION_PROTOCOL_LEGACY)
+        copied.setdefault("attribution_slot_mode", "all")
+        copied.setdefault("attribution_replays", 1)
+        # Resolve the default after normalizing the protocol: legacy artifacts
+        # have no effect axis (K=0), while old v2 artifacts may omit the field
+        # and need inference from their stored tensor.
+        copied.setdefault("effect_branches", None)
+        copied.setdefault("effect_target", "none")
+        # Explicit JSON null is how older writers represented an omitted
+        # optional field.  Normalize it before any contract comparison so it
+        # is treated as the legacy suffix mode, never as ``"None"``.
+        copied["teacher_ttt_writer_mode"] = str(
+            copied.get("teacher_ttt_writer_mode") or "suffix"
+        )
+        if copied["attribution_protocol"] in {"legacy", "v1"}:
+            copied["attribution_protocol"] = HD_ATTRIBUTION_PROTOCOL_LEGACY
+        elif copied["attribution_protocol"] == "v2":
+            copied["attribution_protocol"] = HD_ATTRIBUTION_PROTOCOL_V2
+        if copied["attribution_protocol"] not in HD_ATTRIBUTION_PROTOCOLS:
+            raise ValueError(
+                f"Shard {path} has unsupported attribution_protocol="
+                f"{copied['attribution_protocol']!r}"
+            )
+        # v2 readers consume branch zero, but preserve the declared K when
+        # merging legacy K>1 artifacts so metadata cannot claim K=1 while the
+        # concatenated tensors still carry additional event columns.  New
+        # artifacts omit no branch and therefore use the formal K=1 constant.
+        if copied["attribution_protocol"] == HD_ATTRIBUTION_PROTOCOL_V2:
+            declared_effect_branches = copied.get("effect_branches")
+            if declared_effect_branches is None:
+                effect_tensor = payload.get("hd_teacher_effect")
+                declared_effect_branches = (
+                    int(effect_tensor.shape[1])
+                    if isinstance(effect_tensor, Tensor) and effect_tensor.ndim >= 3
+                    else 1
+                )
+            if type(declared_effect_branches) is not int or declared_effect_branches < 1:
+                raise ValueError(
+                    f"Shard {path} has malformed effect_branches={declared_effect_branches!r}; "
+                    "expected a positive integer for v2"
+                )
+            effect_tensor = payload.get("hd_teacher_effect")
+            if isinstance(effect_tensor, Tensor) and effect_tensor.ndim >= 3:
+                actual_effect_branches = int(effect_tensor.shape[1])
+                if actual_effect_branches != declared_effect_branches:
+                    raise ValueError(
+                        f"Shard {path} declares effect_branches={declared_effect_branches} "
+                        f"but hd_teacher_effect has K={actual_effect_branches}"
+                    )
+            copied["effect_branches"] = declared_effect_branches
+        else:
+            copied["effect_branches"] = 0
+        shard_protocols.append(str(copied["attribution_protocol"]))
         copied["source_path"] = str(path)
         shard_metadata.append(copied)
         if reference_metadata is None:
             reference_metadata = dict(metadata)
+            reference_metadata.setdefault("attribution_protocol", copied["attribution_protocol"])
+            reference_metadata.setdefault("attribution_slot_mode", copied["attribution_slot_mode"])
+            reference_metadata.setdefault("attribution_replays", copied["attribution_replays"])
+            if reference_metadata.get("effect_branches") is None:
+                reference_metadata["effect_branches"] = copied["effect_branches"]
+            reference_metadata.setdefault("effect_target", copied["effect_target"])
+            reference_metadata["teacher_ttt_writer_mode"] = str(
+                reference_metadata.get("teacher_ttt_writer_mode")
+                or copied["teacher_ttt_writer_mode"]
+            )
         else:
             mismatches = {
-                key: (reference_metadata.get(key), metadata.get(key))
+                key: (
+                    reference_metadata.get(key),
+                    copied["teacher_ttt_writer_mode"]
+                    if key == "teacher_ttt_writer_mode"
+                    else metadata.get(key),
+                )
                 for key in metadata_contract_keys
-                if reference_metadata[key] != metadata[key]
+                if reference_metadata[key]
+                != (
+                    copied["teacher_ttt_writer_mode"]
+                    if key == "teacher_ttt_writer_mode"
+                    else metadata[key]
+                )
             }
             if mismatches:
                 raise ValueError(f"Cannot merge incompatible hindsight shards: {mismatches}")
+            reference_protocol = reference_metadata.get(
+                "attribution_protocol", HD_ATTRIBUTION_PROTOCOL_LEGACY
+            )
+            if reference_protocol != copied["attribution_protocol"]:
+                raise ValueError(
+                    "Cannot merge hindsight shards generated by different attribution protocols: "
+                    f"{reference_protocol!r} vs {copied['attribution_protocol']!r}"
+                )
+            if reference_metadata.get("teacher_ttt_writer_mode", "suffix") != copied["teacher_ttt_writer_mode"]:
+                raise ValueError(
+                    "Cannot merge hindsight shards generated with different TTT writer modes: "
+                    f"{reference_metadata.get('teacher_ttt_writer_mode', 'suffix')!r} vs "
+                    f"{copied['teacher_ttt_writer_mode']!r}"
+                )
+            if reference_metadata.get("effect_target", "none") != copied["effect_target"]:
+                raise ValueError(
+                    "Cannot merge hindsight shards with different action-effect targets: "
+                    f"{reference_metadata.get('effect_target', 'none')!r} vs "
+                    f"{copied['effect_target']!r}"
+                )
+            if reference_metadata.get("effect_branches", 0) != copied["effect_branches"]:
+                raise ValueError(
+                    "Cannot merge hindsight shards with different effect branch counts: "
+                    f"{reference_metadata.get('effect_branches', 0)!r} vs "
+                    f"{copied['effect_branches']!r}"
+                )
         declared_episodes = metadata.get("episodes")
         if isinstance(declared_episodes, Sequence) and not isinstance(
             declared_episodes, (str, bytes, bytearray)
@@ -963,6 +1332,24 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         key: torch.cat([payload[key].detach().cpu() for payload in payloads], dim=0)
         for key in required
     }
+    merged_protocol = shard_protocols[0] if shard_protocols else HD_ATTRIBUTION_PROTOCOL_LEGACY
+    if merged_protocol == HD_ATTRIBUTION_PROTOCOL_V2:
+        optional_v2 = (
+            "hd_signed_attribution",
+            "hd_harm_attribution",
+            "hd_teacher_effect",
+            "hd_effect_rho",
+            "hd_effect_write_gate",
+            "hd_effect_valid",
+        )
+        for key in optional_v2:
+            if not all(isinstance(payload, Mapping) and key in payload for payload in payloads):
+                raise ValueError(
+                    f"v2 hindsight shards must all contain {key!r}; refusing a partially merged artifact"
+                )
+            columns[key] = torch.cat(
+                [payload[key].detach().cpu() for payload in payloads], dim=0
+            )
     if all(observed_available):
         columns["hd_write_gate_observed"] = torch.cat(
             [payload["hd_write_gate_observed"].detach().cpu() for payload in payloads], dim=0
@@ -979,13 +1366,32 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         duplicates = sorted_indices[1:][sorted_indices[1:] == sorted_indices[:-1]].tolist()
         raise ValueError(f"Duplicate global indices while merging shards: {duplicates[:8]}")
     merged = {key: value.index_select(0, order) for key, value in columns.items()}
+    merged_effect_branches = (
+        int(reference_metadata.get("effect_branches", V2_EFFECT_BRANCHES))
+        if merged_protocol == HD_ATTRIBUTION_PROTOCOL_V2 and reference_metadata is not None
+        else (V2_EFFECT_BRANCHES if merged_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else 0)
+    )
     merged_metadata = {
-        "format": "hd_ttt_labels_v1",
+        "format": "hd_ttt_labels_v2" if merged_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else "hd_ttt_labels_v1",
         "merged_from": [str(path) for path in inputs],
         "num_frames": int(sorted_indices.numel()),
         "shard_metadata": shard_metadata,
         "episodes_detail": episodes_detail,
         "phase_mode": merged_phase_mode,
+        "attribution_protocol": merged_protocol,
+        "attribution_slot_mode": "slot0" if merged_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else "all",
+        "attribution_replays": V2_ANTITHETIC_REPLAYS if merged_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else 1,
+        "effect_branches": merged_effect_branches,
+        "effect_target": (
+            reference_metadata.get("effect_target", "none")
+            if reference_metadata is not None
+            else "none"
+        ),
+        "teacher_ttt_writer_mode": (
+            reference_metadata.get("teacher_ttt_writer_mode", "suffix")
+            if reference_metadata is not None
+            else "suffix"
+        ),
         "fixed_phase": {
             "noise_column": "hd_noise",
             "time_column": "hd_time",
@@ -1044,6 +1450,10 @@ def _build_shard(args: argparse.Namespace) -> None:
         device=args.device,
         pretrained_path=Path(args.checkpoint),
         ttt_training_stage="ttt_only",
+        # Replay must instantiate the teacher's actual writer path.  In
+        # particular, a prefix-only checkpoint cannot be silently converted
+        # to the legacy suffix writer by the config/checkpoint merge.
+        ttt_writer_mode=str(teacher_info.get("ttt_writer_mode", "suffix")),
     )
     policy = make_policy(config, ds_meta=metadata)
     policy.eval()
@@ -1059,24 +1469,42 @@ def _build_shard(args: argparse.Namespace) -> None:
             "generate labels with the checkpoint's native horizon"
         )
     action_dim = int(policy.config.max_action_dim)
-    columns: dict[str, list[Tensor]] = {
-        key: []
-        for key in (
-            "global_index",
-            "episode_index",
-            "frame_index",
-            "hd_teacher_velocity",
-            "hd_teacher_true_velocity",
-            "hd_teacher_wrong_velocity",
-            "hd_noise",
-            "hd_time",
-            "hd_attribution",
-            "hd_rho",
-            "hd_write_gate",
-            "hd_write_gate_observed",
-            "hd_counterfactual_write_gate",
+    attribution_protocol = getattr(args, "attribution_protocol", "legacy")
+    if attribution_protocol == "legacy":
+        attribution_protocol = HD_ATTRIBUTION_PROTOCOL_LEGACY
+    elif attribution_protocol == "v2":
+        attribution_protocol = HD_ATTRIBUTION_PROTOCOL_V2
+    if attribution_protocol not in HD_ATTRIBUTION_PROTOCOLS:
+        raise ValueError(
+            f"Unknown --attribution-protocol={attribution_protocol!r}; expected legacy or v2"
         )
-    }
+    column_names = [
+        "global_index",
+        "episode_index",
+        "frame_index",
+        "hd_teacher_velocity",
+        "hd_teacher_true_velocity",
+        "hd_teacher_wrong_velocity",
+        "hd_noise",
+        "hd_time",
+        "hd_attribution",
+        "hd_rho",
+        "hd_write_gate",
+        "hd_write_gate_observed",
+        "hd_counterfactual_write_gate",
+        "hd_signed_attribution",
+        "hd_harm_attribution",
+    ]
+    if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2:
+        column_names.extend(
+            [
+                "hd_teacher_effect",
+                "hd_effect_rho",
+                "hd_effect_write_gate",
+                "hd_effect_valid",
+            ]
+        )
+    columns: dict[str, list[Tensor]] = {key: [] for key in column_names}
     episode_metadata: dict[str, Any] = {}
 
     for episode, local_start, length in table:
@@ -1110,6 +1538,7 @@ def _build_shard(args: argparse.Namespace) -> None:
             attribution_threshold=args.attribution_threshold,
             frame_batch_size=args.frame_batch_size,
             grounding_min_future_frames=args.grounding_min_future_frames,
+            attribution_protocol=attribution_protocol,
         )
         for key in columns:
             if key == "global_index":
@@ -1119,7 +1548,12 @@ def _build_shard(args: argparse.Namespace) -> None:
             elif key == "frame_index":
                 columns[key].append(torch.tensor(frame_indices, dtype=torch.int64))
             else:
-                columns[key].append(labels[key].detach().cpu())
+                value = labels.get(key)
+                if value is None:
+                    raise ValueError(
+                        f"Attribution protocol {attribution_protocol!r} did not emit required label {key!r}"
+                    )
+                columns[key].append(value.detach().cpu())
         episode_metadata[str(episode)] = {
             "length": length,
             "global_indices": [int(value) for value in global_indices],
@@ -1135,6 +1569,10 @@ def _build_shard(args: argparse.Namespace) -> None:
             "grounding_event_policy": labels["hd_grounding_event_policy"],
             "grounding_min_future_frames": int(labels["hd_grounding_min_future_frames"]),
             "grounding_selection_mode": labels["hd_grounding_selection_mode"],
+            "attribution_protocol": labels["hd_attribution_protocol"],
+            "attribution_slot_mode": labels["hd_attribution_slot_mode"],
+            "attribution_replays": int(labels["hd_attribution_replays"]),
+            "effect_target": labels["hd_effect_target"],
         }
         del prepared, labels, noise, time
         if device.type == "cuda":
@@ -1144,7 +1582,7 @@ def _build_shard(args: argparse.Namespace) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {key: torch.cat(values, dim=0) for key, values in columns.items()}
     payload["metadata"] = {
-        "format": "hd_ttt_labels_v1",
+        "format": "hd_ttt_labels_v2" if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else "hd_ttt_labels_v1",
         "dataset_repo_id": args.dataset_repo_id,
         "dataset_root": str(args.dataset_root),
         "checkpoint": str(args.checkpoint),
@@ -1153,6 +1591,7 @@ def _build_shard(args: argparse.Namespace) -> None:
         "teacher_config_sha256": teacher_info["config_sha256"],
         "teacher_ttt_layer_indices": list(teacher_info["ttt_layer_indices"]),
         "teacher_ttt_num_register_tokens": int(teacher_info["ttt_num_register_tokens"]),
+        "teacher_ttt_writer_mode": str(teacher_info.get("ttt_writer_mode", "suffix")),
         "teacher_hd_ttt_enabled": bool(teacher_info["hd_ttt_enabled"]),
         "teacher_hd_learned_write_gate": bool(teacher_info["hd_learned_write_gate"]),
         "fps": fps,
@@ -1171,6 +1610,11 @@ def _build_shard(args: argparse.Namespace) -> None:
         "max_events": args.max_events,
         "grounding_event_policy": GROUNDING_EVENT_POLICY,
         "grounding_min_future_frames": args.grounding_min_future_frames,
+        "attribution_protocol": attribution_protocol,
+        "attribution_slot_mode": "slot0" if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else "all",
+        "attribution_replays": V2_ANTITHETIC_REPLAYS if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else 1,
+        "effect_branches": V2_EFFECT_BRANCHES if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else 0,
+        "effect_target": V2_EFFECT_TARGET if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else "none",
         "event_sampling": "all_causal_blocks" if args.max_events == 0 else "uniform",
         "unsampled_write_gate_default": 1.0,
         "write_gate_observed_column": "hd_write_gate_observed",
@@ -1219,6 +1663,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--attribution-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--attribution-protocol",
+        choices=("legacy", "v2"),
+        default="v2",
+        help=(
+            "Hindsight credit protocol. 'v2' (default) uses antithetic relative "
+            "credit, robust aggregation, and slot-0 action effects; 'legacy' "
+            "reproduces the original raw hinge/max labels."
+        ),
+    )
     parser.add_argument("--frame-batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument(

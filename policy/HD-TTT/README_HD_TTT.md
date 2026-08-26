@@ -12,7 +12,8 @@ HD-TTT 在 SmolVLA 的 action expert 中加入可跨物理时刻保存的 TTT fa
 
 1. **Hindsight Control Attribution（HCA）**：对完整成功轨迹做事件级 zero-write counterfactual，得到历史事件对未来 flow-action 预测的控制信用。
 2. **Hindsight-to-Local TTT Distillation（H2L）**：用 HCA 信用加权本地 K/V fast-weight 重构目标，并训练一个只看当前 causal prefix 的写入 gate；v2 额外匹配 memory 对已执行 action slot 的影响（action-effect distillation）。
-3. **Causal Memory Deployment**：用 true-memory / wrong-memory 两条 detached replay 分支约束 reader 真正使用记忆，并在 episode 边界显式 reset。
+3. **Causal Memory Deployment**：用 true-memory / wrong-memory 两条因果 replay 分支
+   约束 fast-weight 对动作的真实影响，并在 episode 边界显式 reset。
 
 > `hd_ttt_enabled=false` 只关闭 HD 辅助目标和 HD gate，保留 SmolVLA-TTT 的 fast-weight 路径。它不是原生无 TTT 的 SmolVLA。原生 SmolVLA 应使用单独的 baseline policy/evaluator。
 
@@ -22,7 +23,7 @@ HD-TTT 在 SmolVLA 的 action expert 中加入可跨物理时刻保存的 TTT fa
 
 v2 已实现 action-effect distillation：teacher 提供 slot-0 的 true-minus-wrong velocity effect，student 用带 writer 梯度的两条 replay 分支匹配高依赖 effect、抑制低依赖变化。它是“控制效果”监督，不是把 latent fast weights 逐元素回归到一个可解释的 content/address target；论文应明确这一区别。`history_teacher.py` 中的 `CausalHistoryTeacher` 是独立的、可选的因果历史编码器/实验工具，当前默认 label builder **不会自动调用它**，也不应把它写成现有主结果的 oracle。
 
-v2 论文 recipe 使用 `ttt_writer_mode=prefix_only`：K/V writer 的输入是当前 observation/language/state prefix，经共享投影进入 action-expert 宽度；action/noise/time suffix 只保留为 query/read path。`suffix` 仍作为兼容模式保留，旧 checkpoint/消融可能继续有 denoising-noise 依赖，必须在表格中单列。正式结果还应报告：50-slot 与实际执行 slot-0 的 attribution 口径、`max-events` 相对 exhaustive 的召回率、以及相同总训练预算的 clean-continued 对照。
+v2 论文 recipe 使用 `ttt_writer_mode=prefix_only`：K/V writer 的输入是当前 observation/language/state prefix，经共享投影进入 action-expert 宽度，并附带固定的 learned register anchors；action/noise/time suffix 只保留为 query/read path。`suffix` 仍作为兼容模式保留，旧 checkpoint/消融可能继续有 denoising-noise 依赖，必须在表格中单列。正式结果还应报告：50-slot 与实际执行 slot-0 的 attribution 口径、`max-events` 相对 exhaustive 的召回率、以及相同总训练预算的 clean-continued 对照。
 
 ## 1. 代码范围和保护边界
 
@@ -110,7 +111,7 @@ attention mask 是有意不对称的：
 | 整个 checkpoint（suffix / prefix） | 462.19M / 462.88M | 由当前 `model.safetensors` state dict 统计的约数 |
 
 `ttt_only` 下 suffix 模式实际优化约 12.14M 个新增参数；v2 prefix 模式再加约
-0.691M writer adapter 和一个很小的 prefix-context gate head，仍约占整个
+0.691M writer adapter（learned gate 仅在单独 ablation 打开），仍约占整个
 checkpoint 的 2.8% 以下。参数量随 backbone/config 改变，论文表格应以保存的
 `config.json` 和 state dict 重新统计；不要把“HD 关闭”误写成“没有 TTT 参数”。
 
@@ -127,11 +128,12 @@ q_{t,n}=Q(\operatorname{LN}(h_{t,n})).
 \]
 
 在兼容的 `suffix` 模式，$k,v,q$ 都来自 action-expert suffix；在论文的
-`prefix_only` 模式，只有写入侧改为
-$k,v=K/V(\operatorname{LN}(\operatorname{Proj}(P_t)))$，其中 $P_t$ 是当前
-image/language/state prefix，$q$ 仍来自 expert suffix 的 attention residual。
-因此 prefix writer 不读取当前 noisy action、flow noise 或 timestep；这是一项
-输入路径约束，不是把 action token 从模型中删除。
+`prefix_only` 模式，写入侧改为
+$k,v=K/V(\operatorname{LN}(\operatorname{Proj}([R,P_t])))$，其中 $P_t$ 是当前
+image/language/state prefix，$R$ 是不依赖当前噪声动作的 learned register
+anchors，$q$ 仍来自 expert suffix 的 attention residual。因此 prefix writer
+不读取当前 noisy action、flow noise 或 timestep；这是一项输入路径约束，不是把
+action token 从模型中删除。
 
 fast MLP $f_W$ 的本地目标为：
 
@@ -253,7 +255,7 @@ L_{\mathrm{gate}}=\operatorname{SmoothL1}(g_t,\operatorname{sg}(u_t)).
 ### 5.3 Action-effect distillation（仅 v2）
 
 仅当 label metadata 的 `attribution_protocol` 为
-`v2_relative_antithetic_robust` 时，builder 额外保存固定 top-two event 的
+`v2_relative_antithetic_robust` 时，builder 额外保存 selected event 的
 slot-0 effect `hd_teacher_effect`。在线训练为每个物理 frame 运行两条带 writer
 梯度的 replay（true write / selected-event zero-write），并令
 
@@ -265,22 +267,25 @@ d_T=\operatorname{sg}(\texttt{hd\_teacher\_effect}_{0}).
 高依赖 frame 用 robust-scaled unit-beta Huber 匹配 $d_s$ 与 $d_T$，低依赖 frame
 约束 $d_s\approx0$。teacher effect 的 median non-zero RMS 只用于无量纲缩放，
 不会引入 task/action-unit 超参数；`hd_effect_weight` 仅控制该辅助项在总 loss
-中的优化权重。当前 student 消费 selected branch（event axis 的第 0 项），
-第二项保留作多事件 ablation/audit，并不声称两个 branch 都已同时用于主结果。
+中的优化权重。当前 v2 builder 只生成一个 branch，student 明确消费 event axis
+的第 0 项。读取旧的 K>1 artifact 仍然兼容，但额外 branch 不参与主路径；若要研究
+多事件，必须另行实现并报告独立 ablation。
 该项直接让 writer 受到最终控制效果约束，但仍不是 latent fast-weight 的逐元素
 可解释内容监督。
 
 ### 5.4 Causal Memory Deployment / counterfactual grounding
 
-为防止模型学会“写了但不读”，训练时在同一 batch 维护三条数值 state：
+为防止模型学会“写了但不读”，训练时在同一 batch 维护 main 与 true/wrong
+两条反事实数值 state：
 
 - `main`：正常训练路径，可反向传播；
-- `true`：all-write 的 detached replay；
-- `wrong`：对 selected event 使用 zero-write 的 detached replay。
+- `true` / `wrong`：selected event 的 all-write 与 zero-write replay。
 
-这两条 detached 分支只对应 reader grounding；v2 的 action-effect 项另有两条
-带 writer 图的 replay，不能把两者的梯度路径混为一谈。所有 replay state 都在
-TBPTT segment 间携带，episode/window 结束才丢弃。
+v2 主路径直接在这两条 replay 上保留 writer-connected graph，匹配 slot-0 的
+action effect；因此不再额外叠加旧的 detached reader-grounding pair（后者只保留
+给 legacy/no-effect ablation）。所有 replay state 的数值部分都在 TBPTT segment
+间携带，episode/window 结束才丢弃；跨 segment 的 outer meta-gradient 仍按标准
+TBPTT 截断，H2L 的事件级局部 writer loss 负责在写入发生的 segment 提供信用。
 
 学生的 true/wrong velocity 差异应匹配 teacher 的差异：
 
@@ -297,11 +302,16 @@ L_{\mathrm{ground}}
  +\lambda_{\mathrm{inv}}(1-\rho)\,\|d_s\|^2.
 \]
 
-teacher velocity、wrong branch 和 intervention gate 都在 reader-only replay 中 detach；因此 grounding 主要训练 query/readout/action pathway，不会绕过部署时的 writer 规则。effect replay 则只对 action-effect 项保留 writer 梯度，并在 segment 边界 detach 数值 state，避免跨段反向图无限增长。
+legacy grounding 的 teacher velocity、wrong branch 和 intervention gate 都在
+reader-only replay 中 detach；因此它主要训练 query/readout/action pathway。v2
+effect replay 对 true/wrong writer 保留梯度，并在 segment 边界 detach 数值 state，
+以控制图规模；这与 H2L 的局部写入信用共同构成部署闭环。
 
 ### 5.5 总训练目标
 
-当前实现对 flow/HCA/grounding 使用有效 action slot mask；H2L local-writer 则使用 `hd_writer_valid`（因此可以在 history warm-up frame 上训练），总目标可写为：
+当前实现对 flow/HCA/effect 使用有效 action slot mask；H2L local-writer 则使用
+`hd_writer_valid`（因此可以在 history warm-up frame 上训练）。v2 的 HD 项按整段
+物理帧归一化，再与各 TBPTT segment 的 flow numerator 相加。总目标可写为：
 
 \[
 L = L_{\mathrm{flow}}
@@ -325,9 +335,10 @@ hd_counterfactual_margin=0.0
 ```
 
 上面的数值是兼容性默认值，不代表逐任务调参结果。论文 v2 recipe 在两个任务
-共享同一组值，并显式设置 `hd_effect_weight=1.0`、
-`hd_attribution_protocol=v2_relative_antithetic_robust` 与
-`ttt_writer_mode=prefix_only`；legacy/no-effect 仅作为对照。
+共享同一组值，并显式设置 `hd_effect_weight=1.0`、`hd_grounding_weight=0`、
+`hd_learned_write_gate=false`、`hd_attribution_protocol=v2_relative_antithetic_robust`
+与 `ttt_writer_mode=prefix_only`；legacy/no-effect、learned-gate 和 detached
+grounding 仅作为结构/训练路径对照。
 
 历史 warm-up frame 会推进 recurrent state，但 action/HCA/grounding target 被 mask；它们仍可通过 `hd_writer_valid` 参与 local writer objective。terminal repeated/padded action slots 使用原始 slot-valid mask，避免 episode 尾部重复动作放大损失。
 
@@ -395,7 +406,7 @@ v2 训练时 policy 的 `hd_attribution_protocol` 必须与 artifact 完全一�
 | `attribution_protocol` | `v2_relative_antithetic_robust` | `policy.hd_attribution_protocol` | 防止 legacy/v2 混用 |
 | `attribution_slot_mode` | `slot0` | action-effect branch | 与实际执行的第一 slot 对齐 |
 | `attribution_replays` | `2` | 固定算法常数 | common-random-number $z,-z$ |
-| `effect_branches` | `2` | `hd_effect_weight`（主路径消费 branch 0） | top-two event audit/ablation |
+| `effect_branches` | `1` | `hd_effect_weight`（主路径消费 branch 0） | selected event；旧 K>1 artifact 兼容读取但忽略额外 branch |
 | `teacher_ttt_writer_mode` | `prefix_only` | `policy.ttt_writer_mode` | 保证 teacher/student 输入路径一致 |
 | `history_mode` | `full_episode_replay`（frame）或 `bounded_window_replay`（window） | `ttt_history_warmup_length` | 防止截断历史被冒充 full history |
 
@@ -412,7 +423,7 @@ v2 训练时 policy 的 `hd_attribution_protocol` 必须与 artifact 完全一�
 | TTT fast hidden dim | `1024` |
 | fast inner learning rate | `0.1`（每层可学习 multiplier） |
 | residual effective gate init | `0.05` |
-| second-order TTT | `false`（first-order，控制显存） |
+| second-order TTT | `true`（v2 effect writer meta-gradient；clean/legacy 可用 `false`） |
 | register tokens | `16` |
 | writer mode（论文主路径） | `prefix_only` |
 | action chunk / executed steps | `50` / `1` |
@@ -426,7 +437,7 @@ v2 训练时 policy 的 `hd_attribution_protocol` 必须与 artifact 完全一�
 | train / label / eval seed | `1000` / `1729` / `7000`（eval seed 可按实验登记） |
 
 HD-v2 阶段在 clean prefix-writer checkpoint 上开启
-`hd_ttt_enabled=true`、`hd_learned_write_gate=true`、
+`hd_ttt_enabled=true`、`hd_learned_write_gate=false`、
 `hd_effect_weight=1.0`，并使用 `hd_attribution_protocol=v2_relative_antithetic_robust`、
 `hd_phase_mode=deployment`、`event_block_size=4`、`max_events=8`、
 `grounding_min_future_frames=64`、`attribution_threshold=0`。这些值构成当前两
@@ -578,7 +589,8 @@ Shuffle-Long 使用相同 label 参数，只替换 dataset、teacher 和输出�
 
 ### 8.4 第三阶段：HD-TTT training
 
-从 clean teacher checkpoint 开启新 run，不要 resume clean run 的 optimizer state（learned gate 是新参数，没有对应 optimizer slots）：
+从 clean teacher checkpoint 开启新 run，不要 resume clean run 的 optimizer state（HD
+effect 路径会新增训练状态）：
 
 ```bash
 REPO_ROOT=/workspace/test-TTT/policy/HD-TTT \
@@ -593,7 +605,8 @@ EPOCHS=150 NUM_PROCESSES=4 \
 SEQUENCE_LENGTH=64 SEQUENCE_STRIDE=64 MAX_WINDOWS_PER_EPISODE=1 \
 TBPTT_SEGMENT_LENGTH=16 HISTORY_WARMUP_LENGTH=full RESIZE='[224,224]' \
 TTT_WRITER_MODE=prefix_only HD_ATTRIBUTION_PROTOCOL=v2 HD_EFFECT_WEIGHT=1.0 \
-HD_ENABLED=true HD_LEARNED_GATE=true HD_PHASE_MODE=deployment \
+HD_ENABLED=true HD_LEARNED_GATE=false HD_GROUNDING_WEIGHT=0 \
+HD_PHASE_MODE=deployment TTT_SECOND_ORDER=true \
 HD_EVENT_BLOCK_SIZE=4 HD_MAX_EVENTS=8 \
 HD_GROUNDING_MIN_FUTURE_FRAMES=64 HD_ATTRIBUTION_THRESHOLD=0.0 \
 bash examples/mikasa/train_hd_ttt.sh
@@ -638,7 +651,7 @@ Shuffle-Long 必须使用自己的 dataset root 和 task id，不能与 Color �
 | Native SmolVLA | `evaluate_smolvla_baseline.py` | 无 TTT 的真正 baseline |
 | Clean SmolVLA-TTT | `HD_ENABLED=false` | 测试 fast weights/register 本身 |
 | No-register | `REGISTER_TOKENS=0` | 测试显式 register 的贡献 |
-| HD-TTT (v2, paper) | `HD_ENABLED=true`, `HD_LEARNED_GATE=true`, `HD_ATTRIBUTION_PROTOCOL=v2`, `HD_EFFECT_WEIGHT=1`, `TTT_WRITER_MODE=prefix_only` | 完整方法：robust HCA + local writer + effect + causal gate/grounding |
+| HD-TTT (v2, paper) | `HD_ENABLED=true`, `HD_LEARNED_GATE=false`, `HD_GROUNDING_WEIGHT=0`, `HD_ATTRIBUTION_PROTOCOL=v2`, `HD_EFFECT_WEIGHT=1`, `TTT_WRITER_MODE=prefix_only`, `TTT_SECOND_ORDER=true` | 完整方法：robust HCA + local writer + writer-connected action effect |
 | No action-effect | 同上但 `HD_EFFECT_WEIGHT=0` | 去除 writer/content-effect 对齐，保留其它 HD 项 |
 | Legacy HD | `HD_ATTRIBUTION_PROTOCOL=legacy`, `HD_EFFECT_WEIGHT=0` | 复现旧 raw-hinge/max 标签协议 |
 | Suffix writer | v2 配置但 `TTT_WRITER_MODE=suffix` | 测试 prefix-only 输入路径的结构贡献 |
@@ -690,7 +703,7 @@ examples/mikasa/
 ## 12. 可复现性和常见错误
 
 - 记录 git commit、Python/PyTorch/Transformers/LeRobot 版本、GPU、dataset root、teacher config SHA 和所有 `HD_*` 环境变量。
-- label 生成和 HD training 的 `event_block_size`、`max_events`、`grounding_min_future_frames`、phase mode、`attribution_protocol`、writer mode 必须完全一致；v2 还要核对 `attribution_slot_mode=slot0`、`attribution_replays=2` 和 `effect_branches=2`。
+- label 生成和 HD training 的 `event_block_size`、`max_events`、`grounding_min_future_frames`、phase mode、`attribution_protocol`、writer mode 必须完全一致；v2 还要核对 `attribution_slot_mode=slot0`、`attribution_replays=2` 和 `effect_branches=1`。旧的 K>1 effect artifact 可读取，但主路径始终只消费 branch 0。
 - `build_hd_labels.py` / `build_hd_window_labels.py` 的 `--attribution-protocol v2` 要与训练时 `HD_ATTRIBUTION_PROTOCOL=v2`（配置中的完整字符串 `v2_relative_antithetic_robust`）对应；不要把 builder 的 v2 默认误认为 policy config 已自动切换。
 - 不要用普通 `lerobot/smolvla_base` 直接生成 HCA labels；它没有训练好的 TTT/register fast weights，builder 会拒绝。
 - v2 labels 应由与 student 相同 `ttt_writer_mode=prefix_only` 的 clean teacher 生成；suffix teacher 只能用于明确的 suffix ablation。

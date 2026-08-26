@@ -46,7 +46,11 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_smolvla_ttt import SmolVLATTTConfig
-from .hd_ttt import counterfactual_grounding_loss, local_kvb_loss
+from .hd_ttt import (
+    action_effect_distillation_loss,
+    counterfactual_grounding_loss,
+    local_kvb_loss,
+)
 from .sequence import HD_ACTION_SLOT_VALID_KEY, HD_WRITER_VALID_KEY, SEQUENCE_SHAPE_KEY
 from .smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
 from .ttt import TTTFastState, TTTMLPLayer
@@ -78,16 +82,19 @@ _CHECKPOINT_ARCHITECTURE_FIELDS = {
     "ttt_second_order",
     "ttt_start_layer",
     "ttt_layer_indices",
+    "ttt_writer_mode",
     "ttt_num_register_tokens",
     "hd_ttt_enabled",
     "hd_hca_weight",
     "hd_h2l_weight",
+    "hd_effect_weight",
     "hd_grounding_weight",
     "hd_invariance_weight",
     "hd_event_block_size",
     "hd_max_events",
     "hd_grounding_min_future_frames",
     "hd_attribution_threshold",
+    "hd_attribution_protocol",
     "hd_attribution_topk",
     "hd_counterfactual_margin",
     "hd_phase_mode",
@@ -112,6 +119,7 @@ def _restore_checkpoint_model_fields(
         "hd_ttt_enabled",
         "hd_hca_weight",
         "hd_h2l_weight",
+        "hd_effect_weight",
         "hd_grounding_weight",
         "hd_invariance_weight",
         "hd_event_block_size",
@@ -119,6 +127,7 @@ def _restore_checkpoint_model_fields(
         "hd_grounding_min_future_frames",
         "hd_attribution_threshold",
         "hd_attribution_topk",
+        "hd_attribution_protocol",
         "hd_counterfactual_margin",
         "hd_phase_mode",
         "hd_write_gate_weight",
@@ -130,6 +139,8 @@ def _restore_checkpoint_model_fields(
         for name in hd_field_names
         if hasattr(config, name)
     }
+    requested_writer_mode = str(getattr(config, "ttt_writer_mode", None) or "suffix")
+    source_writer_mode = str(getattr(source_config, "ttt_writer_mode", None) or "suffix")
     explicit_hd_opt_in = bool(
         requested_hd.get("hd_ttt_enabled", False)
         or requested_hd.get("hd_learned_write_gate", False)
@@ -159,6 +170,12 @@ def _restore_checkpoint_model_fields(
     if explicit_hd_override:
         for field_name, value in requested_hd.items():
             setattr(config, field_name, value)
+    # A writer-mode mismatch is an intentional structural conversion in the
+    # v2 recipe (clean suffix teacher -> prefix-only student).  Preserve the
+    # caller's requested mode in that case; otherwise inherit the checkpoint
+    # mode just like the other architecture fields.
+    if requested_writer_mode != source_writer_mode:
+        config.ttt_writer_mode = requested_writer_mode
     config.__post_init__()
 
 
@@ -170,12 +187,37 @@ def _validate_checkpoint_keys(
     strict: bool,
     source_has_learned_write_gate: bool = False,
     target_has_learned_write_gate: bool | None = None,
+    source_writer_mode: str = "suffix",
+    target_writer_mode: str = "suffix",
 ) -> None:
     """Allow new TTT tensors to be absent only when converting a base SmolVLA checkpoint."""
-    allowed_base_missing = [
+    # Callers loading pre-writer-mode configs may pass the raw JSON ``null``;
+    # normalize it at this boundary as well as in ``from_pretrained`` so the
+    # compatibility rule is deterministic for direct/unit-test callers.
+    source_writer_mode = str(source_writer_mode or "suffix")
+    target_writer_mode = str(target_writer_mode or "suffix")
+    # A base SmolVLA checkpoint has no TTT tensors, so those tensors may be
+    # initialized when it is converted to SmolVLA-TTT.  Once the source already
+    # declares itself as a TTT checkpoint, omitting an existing TTT tensor is a
+    # real incompatibility and must not be hidden by the conversion allowance.
+    allowed_base_missing = (
+        [
+            key
+            for key in missing_keys
+            if key.startswith("model.ttt_layers.") or key == "model.register_tokens"
+        ]
+        if not source_is_ttt
+        else []
+    )
+    # Prefix-only adds a shared projection which is absent from legacy
+    # SmolVLA/TTT checkpoints.  It is safe to initialize it when the source
+    # uses the suffix writer; a prefix checkpoint, however, must contain its
+    # learned adapter.  Keeping this as a narrowly-scoped extension preserves
+    # strict validation for every unrelated tensor.
+    allowed_prefix_missing = [
         key
         for key in missing_keys
-        if key.startswith("model.ttt_layers.") or key == "model.register_tokens"
+        if key.startswith("model.prefix_writer_proj.") and source_writer_mode != "prefix_only"
     ]
     # Older SmolVLA-TTT checkpoints predate the optional HD gate head.  They
     # remain loadable when the caller explicitly enables that extension, while
@@ -188,13 +230,24 @@ def _validate_checkpoint_keys(
             and not source_has_learned_write_gate
         )
     ]
-    allowed_missing = set(allowed_base_missing) | set(allowed_gate_extension)
+    allowed_missing = (
+        set(allowed_base_missing)
+        | set(allowed_prefix_missing)
+        | set(allowed_gate_extension)
+    )
     disallowed_missing = [key for key in missing_keys if key not in allowed_missing]
     # A short-lived prefix-gate prototype constructed both the old
     # action-token head and the new context head.  Ignore only that known
     # obsolete tensor family when loading it into the production
     # context-only architecture; all other unexpected keys remain fatal.
     allowed_legacy_unexpected = {key for key in unexpected_keys if ".write_gate_head." in key}
+    if source_writer_mode == "prefix_only" and target_writer_mode == "suffix":
+        # Explicitly disabling the prefix writer is a supported ablation.  Its
+        # projection is unused and may safely be discarded, but no unrelated
+        # checkpoint tensor is ignored.
+        allowed_legacy_unexpected.update(
+            key for key in unexpected_keys if key.startswith("model.prefix_writer_proj.")
+        )
     # A clean/TTT ablation may intentionally disable a gate that was present
     # in the HD source checkpoint.  The optional context head is then absent
     # from the target module and appears as an unexpected tensor; it is safe
@@ -205,8 +258,12 @@ def _validate_checkpoint_keys(
         )
     disallowed_unexpected = [key for key in unexpected_keys if key not in allowed_legacy_unexpected]
     require_exact_checkpoint = source_is_ttt or strict
+    # For a TTT source (or an explicitly strict load), only known optional
+    # extensions may be absent.  For a non-strict base conversion the TTT
+    # families above are the sole intentionally missing keys.
+    required_allowed = set(allowed_prefix_missing) | set(allowed_gate_extension)
     if disallowed_unexpected or disallowed_missing or (
-        require_exact_checkpoint and any(key not in allowed_gate_extension for key in missing_keys)
+        require_exact_checkpoint and any(key not in required_allowed for key in missing_keys)
     ):
         raise RuntimeError(
             f"Incompatible SmolVLA checkpoint: missing={missing_keys}, unexpected={unexpected_keys}"
@@ -407,6 +464,14 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         for flag_name in ("hd_ttt_enabled", "hd_learned_write_gate"):
             if values.get(flag_name) is None:
                 values[flag_name] = False
+        # ``ttt_writer_mode`` was added after the original suffix writer and
+        # a few checkpoints serialized the optional field as JSON ``null``.
+        # Treat null exactly like an absent field (the legacy suffix path),
+        # while leaving any non-null invalid spelling for ``__post_init__`` to
+        # reject.  This keeps old clean/TTT checkpoints loadable without
+        # weakening validation of an explicitly malformed mode.
+        if values.get("ttt_writer_mode") is None:
+            values["ttt_writer_mode"] = "suffix"
         if config_type == "smolvla":
             # Base checkpoints often cache a full action chunk. TTT must observe
             # every environment decision and therefore executes one action at a time.
@@ -492,6 +557,10 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 raw_config.get("hd_learned_write_gate", False)
             ),
             target_has_learned_write_gate=bool(getattr(config, "hd_learned_write_gate", False)),
+            # Match ``_decode_source_config``: an explicit JSON null denotes
+            # the pre-field suffix writer, not the literal string ``"None"``.
+            source_writer_mode=str(raw_config.get("ttt_writer_mode") or "suffix"),
+            target_writer_mode=str(getattr(config, "ttt_writer_mode", "suffix")),
         )
         if missing_keys:
             logging.info(
@@ -879,20 +948,43 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
     def _hd_weighted_mean(
         values: Tensor,
         weights: Tensor | None = None,
+        denominator: float | Tensor | None = None,
     ) -> Tensor:
-        """Average an HD loss with optional non-negative weights, safely."""
+        """Average an HD loss with optional weights, safely.
+
+        ``denominator`` is an optional episode-level normalization constant.
+        TBPTT normally computes a segment-local weighted mean, which makes a
+        sparse hindsight target depend on where the segment boundary happens
+        to fall.  The v2 trainer supplies the full physical-frame
+        denominator so each segment contributes its numerator directly and
+        the sum is invariant to the TBPTT partition.  Leaving it ``None``
+        preserves the historical local-mean API for ordinary/legacy calls.
+        """
 
         if weights is None:
-            return values.mean()
-        weights = weights.to(device=values.device, dtype=values.dtype).clamp_min(0)
-        while weights.ndim < values.ndim:
-            weights = weights.unsqueeze(-1)
-        weights = torch.broadcast_to(weights, values.shape)
-        denominator = weights.sum()
-        numerator = (values * weights).sum()
-        safe_denominator = denominator.clamp_min(1e-8)
+            numerator = values.sum()
+            local_denominator = values.new_tensor(float(values.numel()))
+        else:
+            weights = weights.to(device=values.device, dtype=values.dtype).clamp_min(0)
+            while weights.ndim < values.ndim:
+                weights = weights.unsqueeze(-1)
+            weights = torch.broadcast_to(weights, values.shape)
+            local_denominator = weights.sum()
+            numerator = (values * weights).sum()
+        if denominator is None:
+            denominator_tensor = local_denominator
+        else:
+            denominator_tensor = torch.as_tensor(
+                denominator,
+                device=values.device,
+                dtype=values.dtype,
+            )
+            if denominator_tensor.numel() != 1:
+                raise ValueError("HD normalization denominator must be scalar")
+            denominator_tensor = denominator_tensor.reshape(())
+        safe_denominator = denominator_tensor.clamp_min(1e-8)
         return torch.where(
-            denominator > 1e-8,
+            denominator_tensor > 1e-8,
             numerator / safe_denominator,
             values.new_zeros(()),
         )
@@ -902,6 +994,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         values: Tensor,
         slot_valid: Tensor | None,
         step_weights: Tensor | None,
+        denominator: float | Tensor | None = None,
     ) -> Tensor:
         """Reduce a ``[B,T,S]`` grounding field without double padding weights.
 
@@ -915,7 +1008,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         """
 
         if slot_valid is None:
-            return SmolVLATTTPolicy._hd_weighted_mean(values, step_weights)
+            return SmolVLATTTPolicy._hd_weighted_mean(values, step_weights, denominator)
         if values.ndim != 3 or slot_valid.ndim != 3:
             raise ValueError(
                 "grounding slot reduction expects values and slot_valid with shape [B,T,S]"
@@ -927,7 +1020,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         per_step = (values * slot_valid).sum(dim=-1) / valid_count.clamp_min(1.0)
         if step_weights is None:
             step_weights = (valid_count > 0).to(dtype=values.dtype)
-        return SmolVLATTTPolicy._hd_weighted_mean(per_step, step_weights)
+        return SmolVLATTTPolicy._hd_weighted_mean(per_step, step_weights, denominator)
 
     @staticmethod
     def _hd_grounding_rho_weight(
@@ -978,8 +1071,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         student_velocity: Tensor,
         wrong_student_velocity: Tensor | None = None,
         grounding_student_velocity: Tensor | None = None,
+        effect_student_true: Tensor | None = None,
+        effect_student_wrong: Tensor | None = None,
         local_ttt_loss: Tensor | None = None,
         predicted_write_gate: Tensor | None = None,
+        normalization_denominator: float | Tensor | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         """Compute optional HD terms from training-only teacher/intervention labels.
 
@@ -990,7 +1086,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         Teacher/intervention velocities may use the task dimension (for example
         ``[B*T, 50, 7]`` for MIKASA) while the model internally emits padded
         ``[B*T, 50, 32]`` tensors.  Only the active task coordinates are compared;
-        per-future C/rho matrices are reduced to safe ``[B,T]`` weights.
+        per-future C/rho matrices are reduced to safe ``[B,T]`` weights.  A v2
+        artifact may additionally carry a compact slot-0 ``hd_teacher_effect``
+        target; when differentiable true/wrong branches are supplied, the
+        action-effect term trains writer content as well as the reader.  Its
+        absence leaves the legacy path unchanged.
         """
 
         if not getattr(self.config, "hd_ttt_enabled", False):
@@ -1093,7 +1193,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     if attribution_weight is None
                     else attribution_weight * valid_steps
                 )
-            hca = self._hd_weighted_mean(per_step, attribution_weight)
+            hca = self._hd_weighted_mean(
+                per_step,
+                attribution_weight,
+                normalization_denominator,
+            )
             total = total + hca_weight * hca
             metrics["hd_hca"] = float(hca.detach().item())
 
@@ -1139,7 +1243,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     if local_gate is None
                     else local_gate * writer_slot_valid_steps
                 )
-            kvb = self._hd_weighted_mean(local_loss, local_gate)
+            kvb = self._hd_weighted_mean(
+                local_loss,
+                local_gate,
+                normalization_denominator,
+            )
             total = total + h2l_weight * kvb
             metrics["hd_h2l"] = float(kvb.detach().item())
             if writer_slot_valid_steps is not None:
@@ -1240,7 +1348,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                         if gate_weights is None
                         else gate_weights * gate_observed
                     )
-                gate_loss = self._hd_weighted_mean(gate_error, gate_weights)
+                gate_loss = self._hd_weighted_mean(
+                    gate_error,
+                    gate_weights,
+                    normalization_denominator,
+                )
                 total = total + write_gate_weight * gate_loss
                 metrics["hd_gate"] = float(gate_loss.detach().item())
                 metrics["hd_gate_pred_mean"] = float(
@@ -1302,6 +1414,149 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 metrics["hd_gate_constant"] = float(constant_loss.item())
                 metrics["hd_gate_gain_vs_constant"] = float(gain_vs_constant.item())
                 metrics["hd_gate_weight_mass"] = float(diagnostic_weights.sum().item())
+
+        # ------------------------------------------------------------------
+        # v2 action-effect/content distillation
+        # ------------------------------------------------------------------
+        # The offline builder stores a selected-event axis (new v2 artifacts
+        # have K=1), and the first branch is always the selected grounding
+        # event.  Keep the online computation compatible with older K>1
+        # artifacts by consuming branch zero only; extra branches are ignored
+        # unless a separately implemented multi-event ablation is used.
+        # Crucially,
+        # this branch is only entered when the caller supplied *differentiable*
+        # true/wrong replays (see ``forward_sequence_segment`` below).  Legacy
+        # labels/checkpoints never pay the extra forward passes or receive a
+        # changed loss.
+        if (
+            effect_student_true is not None
+            and effect_student_wrong is not None
+            and batch.get("hd_teacher_effect") is not None
+        ):
+            effect_true = self._reshape_hd_field(
+                effect_student_true,
+                sequence_shape,
+                name="effect_student_true",
+            )
+            effect_wrong = self._reshape_hd_field(
+                effect_student_wrong,
+                sequence_shape,
+                name="effect_student_wrong",
+            )
+            if effect_true is None or effect_wrong is None:
+                raise RuntimeError("effect student branches unexpectedly resolved to None")
+            # ``forward_with_state`` emits [B,T,chunk,D].  Compact v2 labels
+            # target only the executed slot, so select slot 0 before comparing.
+            if effect_true.ndim < 4 or effect_wrong.ndim < 4:
+                raise ValueError(
+                    "v2 action-effect branches must include [B,T,chunk,D] dimensions"
+                )
+            effect_true = effect_true[:, :, 0, :]
+            effect_wrong = effect_wrong[:, :, 0, :]
+            teacher_effect = self._reshape_hd_field(
+                batch.get("hd_teacher_effect"),
+                sequence_shape,
+                name="hd_teacher_effect",
+            )
+            if teacher_effect is None:
+                raise RuntimeError("hd_teacher_effect unexpectedly resolved to None")
+            if teacher_effect.ndim >= 4:
+                # [B,T,K,D] -> selected branch [B,T,D].
+                teacher_effect = teacher_effect[:, :, 0, :]
+            elif teacher_effect.ndim != 3:
+                raise ValueError(
+                    "hd_teacher_effect must have [B,T,D] or [B,T,K,D] shape"
+                )
+            active_dim = self._hd_active_action_dim(effect_true, teacher_effect)
+            effect_true = effect_true[..., :active_dim]
+            effect_wrong = effect_wrong[..., :active_dim]
+            teacher_effect = teacher_effect.to(
+                device=effect_true.device,
+                dtype=effect_true.dtype,
+            )[..., :active_dim].detach()
+            effect_rho = self._reshape_hd_field(
+                batch.get("hd_effect_rho"), sequence_shape, name="hd_effect_rho"
+            )
+            if effect_rho is None:
+                effect_rho = self._hd_grounding_rho_weight(
+                    self._reshape_hd_field(batch.get("hd_rho"), sequence_shape, name="hd_rho"),
+                    (B, T),
+                    device=effect_true.device,
+                    dtype=effect_true.dtype,
+                )
+            elif effect_rho.ndim >= 3:
+                effect_rho = effect_rho[..., 0]
+            effect_rho = effect_rho.to(
+                device=effect_true.device,
+                dtype=effect_true.dtype,
+            ).clamp(0, 1)
+            effect_valid = self._reshape_hd_field(
+                batch.get("hd_effect_valid"), sequence_shape, name="hd_effect_valid"
+            )
+            if effect_valid is not None and effect_valid.ndim >= 3:
+                effect_valid = effect_valid[..., 0]
+            if effect_valid is None:
+                effect_valid = torch.ones_like(effect_rho)
+            else:
+                effect_valid = effect_valid.to(
+                    device=effect_true.device,
+                    dtype=effect_true.dtype,
+                ).clamp_min(0)
+            # Padded/warm-up interactions do not provide a valid action-effect
+            # target.  The effect compares *executed slot 0*, so use that
+            # exact slot validity rather than the all-slot mean used by HCA.
+            # ``hd_action_slot_valid`` preserves the physical mask through
+            # warm-up rows; fall back to ``action_is_pad`` for older batches.
+            slot_valid_field = (
+                HD_ACTION_SLOT_VALID_KEY
+                if batch.get(HD_ACTION_SLOT_VALID_KEY) is not None
+                else "action_is_pad"
+            )
+            effect_slot_valid = self._hd_action_slot_valid_weight(
+                batch,
+                sequence_shape,
+                device=effect_valid.device,
+                dtype=effect_valid.dtype,
+                field_name=slot_valid_field,
+            )
+            if effect_slot_valid is not None:
+                if effect_slot_valid.shape[-1] < 1:
+                    raise ValueError("action-effect validity requires at least one action slot")
+                effect_valid = effect_valid * effect_slot_valid[..., 0]
+            effect_parts = action_effect_distillation_loss(
+                effect_true,
+                effect_wrong,
+                teacher_effect=teacher_effect,
+                importance=effect_rho,
+                valid_mask=effect_valid > 0,
+                reduction="none",
+                return_components=True,
+            )
+            effect_loss = effect_parts.total
+            # ``effect_parts.total`` is [B,T] under reduction='none'.  Apply
+            # fractional writer validity without renormalizing per segment;
+            # this preserves the episode-level attribution scale across TBPTT.
+            effect_weight = effect_valid
+            local_effect_mass = effect_weight.sum().clamp_min(1e-8)
+            effect_denominator = (
+                local_effect_mass
+                if normalization_denominator is None
+                else torch.as_tensor(
+                    normalization_denominator,
+                    device=effect_loss.device,
+                    dtype=effect_loss.dtype,
+                ).clamp_min(1e-8)
+            )
+            effect_scalar = (effect_loss * effect_weight).sum() / effect_denominator
+            # Missing fields are possible when loading a pre-v2 config.  Keep
+            # that legacy path a strict no-op; v2 recipes opt in explicitly
+            # through the config field (whose default is zero).
+            hd_effect_weight = float(getattr(self.config, "hd_effect_weight", 0.0))
+            total = total + hd_effect_weight * effect_scalar
+            metrics["hd_effect"] = float(effect_scalar.detach().item())
+            metrics["hd_effect_direction"] = float(effect_parts.effect.detach().mean().item())
+            metrics["hd_effect_invariance"] = float(effect_parts.invariance.detach().mean().item())
+            metrics["hd_effect_weight_mass"] = float(local_effect_mass.detach().item())
 
         if wrong_student_velocity is not None:
             grounding_student = (
@@ -1398,6 +1653,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                     grounding_per_token,
                     slot_valid,
                     grounding_step_weights,
+                    normalization_denominator,
                 )
                 total = total + grounding_weight * grounding
                 metrics["hd_grounding"] = float(grounding.detach().item())
@@ -1503,6 +1759,8 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         time: Tensor | None = None,
         *,
         grounding_states: dict[str, TTTFastStates | None] | None = None,
+        flow_loss_weight: float | Tensor | None = None,
+        hd_normalization_denominator: float | Tensor | None = None,
     ) -> tuple[Tensor, dict, TTTFastStates]:
         """Train one contiguous TBPTT segment and return its numerical fast state.
 
@@ -1512,7 +1770,14 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         states.  This preserves full-episode causal interventions across
         TBPTT boundaries while keeping the historical three-item return API.
         The container is created and discarded by the sequence-level trainer;
-        it must never be reused across episodes/windows.
+        it must never be reused across episodes/windows.  ``flow_loss_weight``
+        and ``hd_normalization_denominator`` are optional sequence-level
+        controls used by the v2 trainer: the former weights only this segment's
+        valid-action flow numerator, while the latter normalizes every HD
+        auxiliary numerator by the full physical-frame count.  Keeping these
+        factors separate makes the objective independent of the chosen TBPTT
+        segment length; omitted values preserve the historical local-mean
+        behavior.
         """
         batch_size, sequence_length = sequence_shape
         expected_flat_batch = batch_size * sequence_length
@@ -1541,6 +1806,25 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # local K/V or counterfactual columns; phase/teacher fields are checked
         # independently below when they are actually consumed.
         hd_labels_present = hd_enabled and any(key.startswith("hd_") for key in batch)
+        # v2 compact action-effect labels are optional.  Their presence, not
+        # the HD switch alone, enables the extra differentiable true/wrong
+        # writer replays below; legacy HD artifacts therefore retain exactly
+        # the historical compute/loss path.
+        effect_labels_present = bool(
+            hd_enabled
+            and float(getattr(self.config, "hd_effect_weight", 0.0)) > 0.0
+            and batch.get("hd_teacher_effect") is not None
+            and (
+                batch.get("hd_effect_write_gate") is not None
+                or batch.get("hd_counterfactual_write_gate") is not None
+            )
+        )
+        if effect_labels_present and not bool(getattr(self.config, "ttt_second_order", True)):
+            raise ValueError(
+                "HD v2 action-effect distillation requires ttt_second_order=true: "
+                "the writer-connected effect gradient is a meta-gradient through the inner update. "
+                "Set hd_effect_weight=0 for a first-order/no-effect ablation."
+            )
         # A hindsight collector may store the exact flow phase/noise used by
         # its causal teacher.  Reusing them makes HCA distillation phase
         # matched; ordinary TTT batches continue to sample fresh values.
@@ -1634,13 +1918,26 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         if grounding_states is not None:
             grounding_states.setdefault("true", None)
             grounding_states.setdefault("wrong", None)
+            if effect_labels_present:
+                grounding_states.setdefault("effect_true", None)
+                grounding_states.setdefault("effect_wrong", None)
         if hd_enabled:
             # In the learned-gate variant hindsight ``u_i`` is a target, not
-            # an online input.  The main writer therefore uses only its local
-            # prediction; the labels remain available to the auxiliary gate
-            # distillation loss.  The legacy HD path (gate disabled) retains
-            # the direct label override for backwards compatibility.
-            writer_gate_override = None if learned_write_gate else hd_write_gate
+            # an online input.  The same is true for the v2 no-gate path: its
+            # main writer is deliberately all-write so training and
+            # deployment have identical update semantics.  Only the legacy
+            # no-effect path retains the direct label override for backwards
+            # compatibility.
+            # v2's minimal paper path has no online gate head: all writes are
+            # used during training exactly as they are at deployment, while
+            # hindsight ``hd_write_gate`` only reweights the local H2L loss.
+            # The direct label override remains solely for legacy/no-effect
+            # compatibility, where it is an explicit training ablation.
+            writer_gate_override = (
+                None
+                if learned_write_gate or effect_labels_present
+                else hd_write_gate
+            )
             forward_result = self.model.forward_with_state(
                 images,
                 img_masks,
@@ -1674,6 +1971,90 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             losses = F.mse_loss(flow_target, student_velocity, reduction="none")
             wrong_student_velocity = None
             grounding_student_velocity = None
+            effect_student_true = None
+            effect_student_wrong = None
+
+            if effect_labels_present:
+                # H2L content/effect replay.  The existing ``grounding``
+                # branches below deliberately use ``detach_writer=True`` and
+                # train only the reader.  These two branches are separate:
+                # their fast-weight updates keep the writer graph connected
+                # and use a second-order inner update so the action-effect
+                # loss can change what is written.  Numerical states are
+                # carried across TBPTT segments through the same mutable
+                # container as grounding, but detached at the boundary.
+                effect_state_store = grounding_states if grounding_states is not None else {}
+                # The main v2 branch is already the exact all-write replay
+                # used as the ``true`` intervention (same phase, prefix
+                # writer, and second-order inner update).  Reusing it avoids a
+                # third full VLM forward, removes stochastic disagreement
+                # between two nominally identical true branches, and leaves
+                # the writer-connected graph intact for the effect loss.
+                # ``fast_states`` is copied into the replay store only as a
+                # detached numerical carry; the main branch itself remains
+                # available to the flow/HCA/H2L terms below.
+                effect_student_true = student_velocity
+                effect_true_next_states = fast_states
+                effect_state_store["effect_true"] = {
+                    layer_index: effect_state.detach(requires_grad=False)
+                    for layer_index, effect_state in effect_true_next_states.items()
+                }
+                effect_gate = self._reshape_hd_field(
+                    batch.get("hd_effect_write_gate"),
+                    sequence_shape,
+                    name="hd_effect_write_gate",
+                )
+                if effect_gate is None:
+                    effect_gate = self._reshape_hd_field(
+                        batch.get("hd_counterfactual_write_gate"),
+                        sequence_shape,
+                        name="hd_counterfactual_write_gate",
+                    )
+                if effect_gate is None:
+                    effect_gate = torch.ones(
+                        batch_size,
+                        sequence_length,
+                        device=actions.device,
+                        dtype=actions.dtype,
+                    )
+                elif effect_gate.ndim >= 3:
+                    # Compact v2 labels use [B,T,K]; branch zero is the
+                    # selected event.  Keep this explicit rather than reducing
+                    # over K, which would define a different intervention.
+                    effect_gate = effect_gate[..., 0]
+                effect_gate = effect_gate.to(
+                    device=actions.device,
+                    dtype=actions.dtype,
+                ).clamp(0, 1)
+                effect_wrong_source = effect_state_store.get("effect_wrong")
+                if effect_wrong_source is None:
+                    effect_wrong_source = initial_fast_states
+                effect_wrong_initial = self._clone_fast_states(
+                    effect_wrong_source,
+                    detach=True,
+                    requires_grad=False,
+                )
+                effect_student_wrong, effect_wrong_next_states = self.model.forward_with_state(
+                    images,
+                    img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    state,
+                    actions,
+                    noise,
+                    time,
+                    sequence_shape=sequence_shape,
+                    fast_states=effect_wrong_initial,
+                    create_graph=True,
+                    write_gate=effect_gate,
+                    detach_writer=False,
+                    return_velocity=True,
+                    use_learned_write_gate=False,
+                )
+                effect_state_store["effect_wrong"] = {
+                    layer_index: effect_state.detach(requires_grad=False)
+                    for layer_index, effect_state in effect_wrong_next_states.items()
+                }
             wrong_gate = self._reshape_hd_field(
                 batch.get("hd_counterfactual_write_gate"),
                 sequence_shape,
@@ -1681,8 +2062,17 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             )
             if wrong_gate is not None:
                 wrong_gate = wrong_gate.clamp(0, 1)
+            # v2 action-effect replay already supplies the true/wrong
+            # intervention with a writer-connected graph.  Running the old
+            # detached grounding pair on top would duplicate the same
+            # counterfactual, add two full forwards, and introduce a second
+            # reader-only objective whose relative weight is a tuning knob.
+            # Keep detached grounding for legacy/no-effect artifacts and as a
+            # clearly isolated ablation.
             has_grounding_labels = (
-                wrong_gate is not None
+                not effect_labels_present
+                and float(getattr(self.config, "hd_grounding_weight", 1.0)) > 0.0
+                and wrong_gate is not None
                 and batch.get("hd_teacher_true_velocity") is not None
                 and batch.get("hd_teacher_wrong_velocity") is not None
             )
@@ -1775,8 +2165,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 student_velocity=student_velocity,
                 wrong_student_velocity=wrong_student_velocity,
                 grounding_student_velocity=grounding_student_velocity,
+                effect_student_true=effect_student_true,
+                effect_student_wrong=effect_student_wrong,
                 local_ttt_loss=local_ttt_loss,
                 predicted_write_gate=predicted_write_gate,
+                normalization_denominator=hd_normalization_denominator,
             )
         else:
             losses, fast_states = self.model.forward_with_state(
@@ -1806,6 +2199,26 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
 
         loss_dict = {"loss_per_dim": loss_per_dim.detach().cpu().tolist()}
         loss_dict.update({key: value for key, value in hd_metrics.items()})
+        # Compute the flow term before adding HD auxiliaries.  The sequence
+        # trainer may pass a global action-valid segment weight for TBPTT; HD
+        # terms already use their own episode-level denominator and must not
+        # be multiplied by that action weight (warm-up/effect rows would then
+        # disappear whenever their action target is padded).
+        if actions_is_pad is None:
+            flow_loss = losses.mean()
+        else:
+            num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
+            flow_loss = losses.sum() / num_valid
+        if flow_loss_weight is not None:
+            flow_weight = torch.as_tensor(
+                flow_loss_weight,
+                device=flow_loss.device,
+                dtype=flow_loss.dtype,
+            )
+            if flow_weight.numel() != 1:
+                raise ValueError("flow_loss_weight must be scalar")
+            flow_loss = flow_loss * flow_weight.reshape(())
+
         if reduction == "none":
             if actions_is_pad is None:
                 per_sample_loss = losses.mean(dim=(1, 2))
@@ -1818,12 +2231,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         if reduction != "mean":
             raise ValueError(f"Unsupported reduction: {reduction}")
 
-        if actions_is_pad is None:
-            loss = losses.mean()
-        else:
-            num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
-            loss = losses.sum() / num_valid
-        loss = loss + hd_aux_loss
+        loss = flow_loss + hd_aux_loss
         loss_dict["loss"] = loss.item()
         return loss, loss_dict, fast_states
 
@@ -2023,6 +2431,22 @@ class SmolVLATTTFlowMatching(nn.Module):
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
+        # Prefix-only HD writes cross the VLM/action-expert representation
+        # boundary.  A shared learned adapter is preferable to treating
+        # feature channels as a spatial axis (which would make the mapping
+        # depend on arbitrary hidden-dimension ordering).  Register the
+        # adapter only for that structural mode: suffix checkpoints then keep
+        # the exact original state-dict schema and do not acquire an unused
+        # random parameter family.
+        if getattr(config, "ttt_writer_mode", "suffix") == "prefix_only":
+            self.prefix_writer_proj: nn.Linear | None = nn.Linear(
+                self.vlm_with_expert.config.text_config.hidden_size,
+                self.vlm_with_expert.expert_hidden_size,
+                bias=False,
+            )
+            nn.init.xavier_uniform_(self.prefix_writer_proj.weight)
+        else:
+            self.prefix_writer_proj = None
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
 
@@ -2112,6 +2536,11 @@ class SmolVLATTTFlowMatching(nn.Module):
             parameter.requires_grad_(True)
         if self.register_tokens is not None:
             self.register_tokens.requires_grad_(True)
+        if (
+            getattr(self.config, "ttt_writer_mode", "suffix") == "prefix_only"
+            and self.prefix_writer_proj is not None
+        ):
+            self.prefix_writer_proj.requires_grad_(True)
         for layer in self.ttt_layers.values():
             layer.gate.requires_grad_(self.config.trains_gate)
 
@@ -2138,6 +2567,10 @@ class SmolVLATTTFlowMatching(nn.Module):
             self.action_time_mlp_out,
         ):
             module.train(mode and self.config.trains_action_head)
+        if self.prefix_writer_proj is not None:
+            self.prefix_writer_proj.train(
+                mode and getattr(self.config, "ttt_writer_mode", "suffix") == "prefix_only"
+            )
         self.ttt_layers.train(mode)
         return self
 
@@ -2172,13 +2605,14 @@ class SmolVLATTTFlowMatching(nn.Module):
         predicted_write_gate: Tensor | None = None
         gate_context: Tensor | None = None
         writer_inputs: Tensor | None = None
+        writer_mask: Tensor | None = None
 
         def set_gate_context(context: Tensor) -> None:
             nonlocal gate_context
             gate_context = context
 
-        def set_writer_inputs(inputs: Tensor) -> None:
-            nonlocal writer_inputs
+        def set_writer_inputs(inputs: Tensor, mask: Tensor | None = None) -> None:
+            nonlocal writer_inputs, writer_mask
             if inputs.ndim != 3:
                 raise ValueError(
                     "prefix writer inputs must be flattened [B*T,N,D], "
@@ -2189,6 +2623,15 @@ class SmolVLATTTFlowMatching(nn.Module):
                     "prefix writer inputs must have the flattened sequence batch size "
                     f"{batch_size * sequence_length}, got {inputs.shape[0]}"
                 )
+            if mask is not None:
+                if mask.ndim != 2 or mask.shape != inputs.shape[:2]:
+                    raise ValueError(
+                        "prefix writer mask must have shape [B*T,N] matching writer inputs, "
+                        f"got {tuple(mask.shape)} for {tuple(inputs.shape)}"
+                    )
+                writer_mask = mask
+            else:
+                writer_mask = None
             writer_inputs = inputs
 
         def apply_ttt(layer_index: int, hidden_states: Tensor) -> Tensor:
@@ -2257,6 +2700,11 @@ class SmolVLATTTFlowMatching(nn.Module):
                         if writer_inputs is not None
                         else None
                     )
+                ),
+                writer_mask=(
+                    None
+                    if writer_mask is None
+                    else writer_mask.reshape(batch_size, sequence_length, writer_mask.shape[1])
                 ),
                 update=update,
                 create_graph=create_graph,
@@ -2396,14 +2844,11 @@ class SmolVLATTTFlowMatching(nn.Module):
     ) -> Tensor:
         """Build deterministic observation-prefix inputs for the K/V writer.
 
-        The VLM prefix and action expert can have different widths.  To keep
-        the prefix-only writer checkpoint-compatible and avoid a second
-        learned adapter, adapt the feature axis with a fixed adaptive-average
-        resampling map.  Unlike truncation, every source feature participates
-        when the expert is narrower.  Padding tokens are zeroed so they do
-        not create bias-free K/V updates.  The returned tensor is flattened
-        like expert hidden states and is installed on the callback once per
-        physical observation.
+        The VLM prefix and action expert have different widths.  The shared
+        learned adapter maps the semantic VLM embedding into the expert TTT
+        space; padding tokens are returned separately to the callback so they
+        cannot update fast weights.  The returned tensor is flattened like
+        expert hidden states and is installed once per physical observation.
         """
         if prefix_embs.ndim != 3 or prefix_pad_masks.ndim != 2:
             raise ValueError(
@@ -2415,16 +2860,55 @@ class SmolVLATTTFlowMatching(nn.Module):
                 "prefix embeddings and padding mask must share [B,P], got "
                 f"{tuple(prefix_embs.shape)} and {tuple(prefix_pad_masks.shape)}"
             )
-        expert_dim = self.vlm_with_expert.expert_hidden_size
-        prefix_dim = prefix_embs.shape[-1]
-        if prefix_dim == expert_dim:
-            writer = prefix_embs
-        else:
+        projection = getattr(self, "prefix_writer_proj", None)
+        if projection is None:
+            # Low-level callers that construct a partially initialized flow
+            # object (and old suffix-only ablations) have no learned adapter.
+            # Keep a deterministic shape-compatible fallback for that test
+            # boundary; production prefix-only models always take the learned
+            # semantic projection above.
+            expert_dim = int(self.vlm_with_expert.expert_hidden_size)
             writer = F.adaptive_avg_pool1d(
-                prefix_embs.reshape(-1, 1, prefix_dim), expert_dim
-            ).reshape(*prefix_embs.shape[:2], expert_dim)
-        writer = writer * prefix_pad_masks.to(dtype=writer.dtype, device=writer.device).unsqueeze(-1)
-        return writer
+                prefix_embs.reshape(-1, 1, prefix_embs.shape[-1]), expert_dim
+            ).reshape(prefix_embs.shape[0], prefix_embs.shape[1], expert_dim)
+        else:
+            writer = projection(prefix_embs.to(projection.weight.dtype))
+        # Zeroing is redundant with ``writer_mask`` in the normal callback,
+        # but makes this helper safe for standalone callers and guarantees a
+        # padded prefix can never inject a bias-free K/V signal by accident.
+        return writer * prefix_pad_masks.to(device=writer.device, dtype=writer.dtype).unsqueeze(-1)
+
+    def _prefix_writer_inputs_with_registers(
+        self, prefix_embs: Tensor, prefix_pad_masks: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Add static register anchors to the observation-only writer stream.
+
+        Prefix-only HD writing intentionally excludes the current noisy action
+        and timestep.  Without this explicit path, the prepended registers
+        would be invisible to the prefix writer (and action queries are
+        forbidden from reading register columns by the asymmetric suffix
+        mask), making them dead parameters in the paper configuration.  The
+        anchors are learned expert-width vectors, valid for every observation,
+        and are concatenated after the projected causal prefix.  They do not
+        reintroduce action/noise dependence; suffix mode keeps its original
+        register-as-writer behavior unchanged.
+        """
+
+        writer = self._make_prefix_writer_inputs(prefix_embs, prefix_pad_masks)
+        register_tokens = getattr(self, "register_tokens", None)
+        if register_tokens is None:
+            return writer, prefix_pad_masks
+        register = register_tokens.to(device=writer.device, dtype=writer.dtype)
+        register = register.unsqueeze(0).expand(writer.shape[0], -1, -1)
+        register_mask = torch.ones(
+            writer.shape[0],
+            register.shape[1],
+            dtype=prefix_pad_masks.dtype,
+            device=prefix_pad_masks.device,
+        )
+        return torch.cat([register, writer], dim=1), torch.cat(
+            [register_mask, prefix_pad_masks], dim=1
+        )
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed action/time tokens and optional learned registers for the expert."""
@@ -2585,7 +3069,10 @@ class SmolVLATTTFlowMatching(nn.Module):
                 set_writer_inputs = getattr(expert_layer_callback, "set_writer_inputs", None)
                 if set_writer_inputs is None:
                     raise RuntimeError("prefix_only writer requires a callback writer-input setter")
-                set_writer_inputs(self._make_prefix_writer_inputs(prefix_embs, prefix_pad_masks))
+                writer_inputs, writer_mask = self._prefix_writer_inputs_with_registers(
+                    prefix_embs, prefix_pad_masks
+                )
+                set_writer_inputs(writer_inputs, writer_mask)
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -2762,7 +3249,10 @@ class SmolVLATTTFlowMatching(nn.Module):
                     set_writer_inputs = getattr(expert_layer_callback, "set_writer_inputs", None)
                     if set_writer_inputs is None:
                         raise RuntimeError("prefix_only writer requires a callback writer-input setter")
-                    set_writer_inputs(self._make_prefix_writer_inputs(prefix_embs, prefix_pad_masks))
+                    writer_inputs, writer_mask = self._prefix_writer_inputs_with_registers(
+                        prefix_embs, prefix_pad_masks
+                    )
+                    set_writer_inputs(writer_inputs, writer_mask)
 
             def denoise_step_partial_call(
                 input_x_t,

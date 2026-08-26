@@ -226,14 +226,33 @@ def _load_policy(args: argparse.Namespace):
         learned_gate = False
     if learned_gate and not hd_enabled:
         raise ValueError("--hd-learned-write-gate requires --hd-ttt-enabled")
+    if args.hd_ttt_enabled is False:
+        # A clean-memory evaluation is a structural opt-out, not an HD
+        # checkpoint with one boolean flipped.  In particular, v2's effect
+        # weight is validated as requiring ``hd_ttt_enabled``; leaving the
+        # source value at 1.0 would make the paired clean ablation fail before
+        # the policy is even constructed.
+        hd_kwargs["hd_effect_weight"] = 0.0
     hd_kwargs["hd_ttt_enabled"] = hd_enabled
     hd_kwargs["hd_learned_write_gate"] = learned_gate
+    # ``ttt_writer_mode`` is structural rather than an HD loss switch.  It
+    # therefore is not included in ``hd_kwargs`` above, but it must follow the
+    # checkpoint during evaluation: a prefix-only checkpoint evaluated with
+    # the default suffix writer would silently discard its prefix adapter and
+    # report a different policy.  JSON null denotes the legacy suffix mode.
+    source_writer_mode = str(source_config.get("ttt_writer_mode") or "suffix")
+    if source_writer_mode not in {"suffix", "prefix_only"}:
+        raise ValueError(
+            "Checkpoint has unsupported ttt_writer_mode="
+            f"{source_writer_mode!r}; expected 'suffix' or 'prefix_only'"
+        )
     # ``make_policy`` first projects the dataset schema into policy features;
     # constructing ``from_pretrained`` directly would leave input_features
     # empty and silently drop the two MIKASA cameras.
     config = SmolVLATTTConfig(
         device=args.device,
         pretrained_path=Path(args.checkpoint),
+        ttt_writer_mode=source_writer_mode,
         **hd_kwargs,
     )
     policy = make_policy(config, ds_meta=metadata)

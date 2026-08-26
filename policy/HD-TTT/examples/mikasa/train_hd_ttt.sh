@@ -53,7 +53,10 @@ TTT_WRITER_MODE="${TTT_WRITER_MODE:-suffix}"
 RESIZE="${RESIZE:-[224,224]}"
 TRAINING_STAGE="${TRAINING_STAGE:-ttt_only}"
 HD_ENABLED="${HD_ENABLED:-false}"
-HD_LEARNED_GATE="${HD_LEARNED_GATE:-${HD_ENABLED}}"
+# The core v2 method distills hindsight into writer content/effect; it does
+# not rely on a separately tuned online gate.  The learned prefix gate stays
+# available as an explicit ablation via HD_LEARNED_GATE=true.
+HD_LEARNED_GATE="${HD_LEARNED_GATE:-false}"
 HD_PHASE_MODE="${HD_PHASE_MODE:-deployment}"
 HD_EVENT_BLOCK_SIZE="${HD_EVENT_BLOCK_SIZE:-4}"
 HD_MAX_EVENTS="${HD_MAX_EVENTS:-0}"
@@ -61,7 +64,7 @@ HD_GROUNDING_MIN_FUTURE_FRAMES="${HD_GROUNDING_MIN_FUTURE_FRAMES:-64}"
 HD_ATTRIBUTION_THRESHOLD="${HD_ATTRIBUTION_THRESHOLD:-0.0}"
 HD_HCA_WEIGHT="${HD_HCA_WEIGHT:-1.0}"
 HD_H2L_WEIGHT="${HD_H2L_WEIGHT:-1.0}"
-HD_GROUNDING_WEIGHT="${HD_GROUNDING_WEIGHT:-1.0}"
+HD_GROUNDING_WEIGHT="${HD_GROUNDING_WEIGHT:-}"
 HD_INVARIANCE_WEIGHT="${HD_INVARIANCE_WEIGHT:-0.25}"
 HD_WRITE_GATE_WEIGHT="${HD_WRITE_GATE_WEIGHT:-1.0}"
 HD_COUNTERFACTUAL_MARGIN="${HD_COUNTERFACTUAL_MARGIN:-0.0}"
@@ -80,6 +83,28 @@ if [[ -z "${HD_EFFECT_WEIGHT+x}" ]]; then
   HD_EFFECT_WEIGHT="0.0"
   if [[ "${HD_ENABLED_NORMALIZED}" == "true" ]]; then
     HD_EFFECT_WEIGHT="1.0"
+  fi
+fi
+if [[ -z "${HD_GROUNDING_WEIGHT}" ]]; then
+  # v2 effect replay already supplies the causal true/wrong intervention;
+  # detached reader grounding is retained for legacy/no-effect runs and
+  # explicit ablations, not stacked into the paper objective.
+  if [[ "${HD_ENABLED_NORMALIZED}" == "true" && "${HD_EFFECT_WEIGHT}" != "0" && "${HD_EFFECT_WEIGHT}" != "0.0" ]]; then
+    HD_GROUNDING_WEIGHT="0.0"
+  else
+    HD_GROUNDING_WEIGHT="1.0"
+  fi
+fi
+# The action-effect term differentiates through the inner fast-weight update.
+# Select the required second-order path automatically for the v2 paper run;
+# clean/legacy runs keep the cheaper first-order default.  An explicit value
+# remains available for ablations, but v2 with effect supervision is rejected
+# by the policy if it is set to false rather than silently changing the method.
+if [[ -z "${TTT_SECOND_ORDER+x}" ]]; then
+  if [[ "${HD_ENABLED_NORMALIZED}" == "true" && "${HD_EFFECT_WEIGHT}" != "0" && "${HD_EFFECT_WEIGHT}" != "0.0" ]]; then
+    TTT_SECOND_ORDER="true"
+  else
+    TTT_SECOND_ORDER="false"
   fi
 fi
 SAVE_FREQ="${SAVE_FREQ:-500}"
@@ -185,7 +210,7 @@ MAX_EPISODE_LENGTH="$("${PYTHON_BIN}" -c 'import sys; print(sys.argv[1].split()[
 STEPS_PER_EPOCH=$(( (WINDOWS + NUM_PROCESSES - 1) / NUM_PROCESSES ))
 STEPS=$(( STEPS_PER_EPOCH * EPOCHS ))
 
-echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, writer=${TTT_WRITER_MODE}, attribution=${HD_ATTRIBUTION_PROTOCOL}, grounding_min_future=${HD_GROUNDING_MIN_FUTURE_FRAMES}, margin=${HD_COUNTERFACTUAL_MARGIN}, effect_weight=${HD_EFFECT_WEIGHT}, grounding_weight=${HD_GROUNDING_WEIGHT}"
+echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, writer=${TTT_WRITER_MODE}, attribution=${HD_ATTRIBUTION_PROTOCOL}, second_order=${TTT_SECOND_ORDER}, grounding_min_future=${HD_GROUNDING_MIN_FUTURE_FRAMES}, margin=${HD_COUNTERFACTUAL_MARGIN}, effect_weight=${HD_EFFECT_WEIGHT}, grounding_weight=${HD_GROUNDING_WEIGHT}"
 
 COMMON_ARGS=(
   --dataset.repo_id="${DATASET_REPO_ID}"
@@ -202,7 +227,7 @@ COMMON_ARGS=(
   --policy.tbptt_segment_length="${TBPTT_SEGMENT_LENGTH}"
   --policy.ttt_history_warmup_length="${HISTORY_WARMUP_ARG}"
   --policy.ttt_hidden_dim="${TTT_HIDDEN_DIM}"
-  --policy.ttt_second_order=false
+  --policy.ttt_second_order="${TTT_SECOND_ORDER}"
   --policy.ttt_layer_indices="${TTT_LAYERS}"
   --policy.ttt_num_register_tokens="${REGISTER_TOKENS}"
   --policy.ttt_writer_mode="${TTT_WRITER_MODE}"

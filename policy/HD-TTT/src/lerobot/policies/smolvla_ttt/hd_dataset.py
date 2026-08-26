@@ -17,6 +17,8 @@ first dimension), for example::
         "hd_rho": Tensor[N],
         "hd_write_gate": Tensor[N],
         "hd_counterfactual_write_gate": Tensor[N],
+        "hd_teacher_effect": Tensor[N, K, action_dim],  # v2, executed slot 0
+        "hd_effect_rho": Tensor[N, K],
     }
 
 For convenience, records with ``episode_index``/``frame_index`` (or a global
@@ -50,6 +52,17 @@ _LABEL_ALIASES = {
     "teacher_velocity": "hd_teacher_velocity",
     "teacher_true_velocity": "hd_teacher_true_velocity",
     "teacher_wrong_velocity": "hd_teacher_wrong_velocity",
+    "teacher_effect": "hd_teacher_effect",
+    "action_effect": "hd_teacher_effect",
+    "effect": "hd_teacher_effect",
+    "effect_rho": "hd_effect_rho",
+    "effect_weight": "hd_effect_rho",
+    "effect_write_gate": "hd_effect_write_gate",
+    "effect_valid": "hd_effect_valid",
+    "signed_attribution": "hd_signed_attribution",
+    "signed_C": "hd_signed_C",
+    "harm_attribution": "hd_harm_attribution",
+    "harm_C": "hd_harm_C",
     "attribution": "hd_attribution",
     "hd_C": "hd_attribution",
     "rho": "hd_rho",
@@ -171,6 +184,8 @@ class HindsightLabelDataset(Dataset):
         self.label_metadata: dict[str, Any] = {}
         self.hd_window_local = False
         self.hd_window_keyed = False
+        self.hd_attribution_protocol = "legacy_raw_hinge_max"
+        self.hd_teacher_writer_mode = "suffix"
         self._episode_locations = self._build_episode_locations(dataset)
         self._absolute_frame_indices = self._build_absolute_frame_indices(dataset)
         self._source_to_local = (
@@ -191,6 +206,18 @@ class HindsightLabelDataset(Dataset):
         if isinstance(payload, Mapping) and isinstance(payload.get("metadata"), Mapping):
             self.label_metadata = dict(payload["metadata"])
             self.hd_window_local = bool(self.label_metadata.get("window_local", False))
+            protocol = self.label_metadata.get("attribution_protocol", "legacy_raw_hinge_max")
+            if protocol in {"legacy", "v1"}:
+                protocol = "legacy_raw_hinge_max"
+            elif protocol == "v2":
+                protocol = "v2_relative_antithetic_robust"
+            self.hd_attribution_protocol = str(protocol)
+            # Older artifacts may encode an absent optional field as JSON
+            # null.  Treat it as the legacy suffix writer instead of the
+            # misleading literal string ``"None"``.
+            self.hd_teacher_writer_mode = str(
+                self.label_metadata.get("teacher_ttt_writer_mode") or "suffix"
+            )
         if isinstance(payload, Mapping) and "windows" in payload:
             # A structural window list is unambiguous evidence of the
             # window-local protocol.  Infer the flag for early artifacts that

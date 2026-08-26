@@ -30,6 +30,11 @@ from torch import Tensor
 
 try:  # Direct ``python examples/mikasa/...py`` invocation.
     from build_hd_labels import (
+        HD_ATTRIBUTION_PROTOCOL_LEGACY,
+        HD_ATTRIBUTION_PROTOCOL_V2,
+        HD_ATTRIBUTION_PROTOCOLS,
+        V2_EFFECT_TARGET,
+        V2_EFFECT_BRANCHES,
         GROUNDING_EVENT_POLICY,
         _episode_labels,
         _episode_table,
@@ -40,6 +45,11 @@ try:  # Direct ``python examples/mikasa/...py`` invocation.
     )
 except ImportError:  # Package-style invocation.
     from .build_hd_labels import (
+        HD_ATTRIBUTION_PROTOCOL_LEGACY,
+        HD_ATTRIBUTION_PROTOCOL_V2,
+        HD_ATTRIBUTION_PROTOCOLS,
+        V2_EFFECT_TARGET,
+        V2_EFFECT_BRANCHES,
         GROUNDING_EVENT_POLICY,
         _episode_labels,
         _episode_table,
@@ -63,6 +73,15 @@ _FRAME_LABEL_KEYS = (
     "hd_write_gate",
     "hd_write_gate_observed",
     "hd_counterfactual_write_gate",
+    "hd_signed_attribution",
+    "hd_harm_attribution",
+)
+
+_V2_FRAME_LABEL_KEYS = (
+    "hd_teacher_effect",
+    "hd_effect_rho",
+    "hd_effect_write_gate",
+    "hd_effect_valid",
 )
 
 
@@ -134,7 +153,10 @@ def _window_record(
 ) -> dict[str, Any]:
     context_length = context_end - context_start
     record_labels: dict[str, Tensor] = {}
-    for key in _FRAME_LABEL_KEYS:
+    frame_keys = list(_FRAME_LABEL_KEYS)
+    if labels.get("hd_attribution_protocol") == HD_ATTRIBUTION_PROTOCOL_V2:
+        frame_keys.extend(_V2_FRAME_LABEL_KEYS)
+    for key in frame_keys:
         value = labels.get(key)
         if not isinstance(value, Tensor) or value.ndim == 0 or value.shape[0] != context_length:
             raise ValueError(
@@ -155,6 +177,8 @@ def _window_record(
         "hd_event_total_credits",
         "hd_full_flow_loss",
         "hd_event_selection_scores",
+        "hd_effect_events",
+        "hd_effect_slot",
     ):
         value = labels.get(key)
         if isinstance(value, Tensor):
@@ -205,6 +229,9 @@ def _build_shard(args: argparse.Namespace) -> None:
         device=args.device,
         pretrained_path=Path(args.checkpoint),
         ttt_training_stage="ttt_only",
+        # Keep offline replay on the exact writer path serialized by the
+        # teacher checkpoint (prefix-only vs legacy suffix).
+        ttt_writer_mode=str(teacher_info.get("ttt_writer_mode", "suffix")),
     )
     policy = make_policy(config, ds_meta=metadata)
     policy.eval()
@@ -220,6 +247,15 @@ def _build_shard(args: argparse.Namespace) -> None:
             f"{args.action_chunk_size}"
         )
     action_dim = int(policy.config.max_action_dim)
+    attribution_protocol = getattr(args, "attribution_protocol", "v2")
+    if attribution_protocol == "legacy":
+        attribution_protocol = HD_ATTRIBUTION_PROTOCOL_LEGACY
+    elif attribution_protocol == "v2":
+        attribution_protocol = HD_ATTRIBUTION_PROTOCOL_V2
+    if attribution_protocol not in HD_ATTRIBUTION_PROTOCOLS:
+        raise ValueError(
+            f"Unknown --attribution-protocol={attribution_protocol!r}; expected legacy or v2"
+        )
 
     windows: list[dict[str, Any]] = []
     episode_details: dict[str, Any] = {}
@@ -274,6 +310,7 @@ def _build_shard(args: argparse.Namespace) -> None:
                 grounding_min_future_frames=args.grounding_min_future_frames,
                 future_mask=future_mask,
                 global_offset=context_start,
+                attribution_protocol=attribution_protocol,
             )
             record = _window_record(
                 labels=labels,
@@ -323,7 +360,7 @@ def _build_shard(args: argparse.Namespace) -> None:
     payload = {
         "windows": windows,
         "metadata": {
-            "format": "hd_ttt_labels_v1",
+            "format": "hd_ttt_labels_v2" if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else "hd_ttt_labels_v1",
             "window_local": True,
             "window_keyed": True,
             "window_key": "target_global_index",
@@ -335,6 +372,7 @@ def _build_shard(args: argparse.Namespace) -> None:
             "teacher_config_sha256": teacher_info["config_sha256"],
             "teacher_ttt_layer_indices": list(teacher_info["ttt_layer_indices"]),
             "teacher_ttt_num_register_tokens": int(teacher_info["ttt_num_register_tokens"]),
+            "teacher_ttt_writer_mode": str(teacher_info.get("ttt_writer_mode", "suffix")),
             "teacher_hd_ttt_enabled": bool(teacher_info["hd_ttt_enabled"]),
             "teacher_hd_learned_write_gate": bool(teacher_info["hd_learned_write_gate"]),
             "fps": fps,
@@ -347,6 +385,11 @@ def _build_shard(args: argparse.Namespace) -> None:
             "max_events": args.max_events,
             "grounding_event_policy": GROUNDING_EVENT_POLICY,
             "grounding_min_future_frames": args.grounding_min_future_frames,
+            "attribution_protocol": attribution_protocol,
+            "attribution_slot_mode": "slot0" if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else "all",
+            "attribution_replays": 2 if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else 1,
+            "effect_branches": V2_EFFECT_BRANCHES if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else 0,
+            "effect_target": V2_EFFECT_TARGET if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2 else "none",
             "attribution_threshold": args.attribution_threshold,
             "seed": args.seed,
             "frame_batch_size": args.frame_batch_size,
@@ -357,7 +400,11 @@ def _build_shard(args: argparse.Namespace) -> None:
                 if args.phase_mode == "deployment"
                 else "random_flow_interpolation_with_expert_action_chunk"
             ),
-            "attribution_aggregation": "all_event_max_for_hca_selected_event_for_grounding",
+            "attribution_aggregation": (
+                "antithetic_relative_adaptive_top_sqrt_percentile"
+                if attribution_protocol == HD_ATTRIBUTION_PROTOCOL_V2
+                else "all_event_max_for_hca_selected_event_for_grounding"
+            ),
             "action_chunk_size": int(policy.config.chunk_size),
             "max_action_dim": action_dim,
             "episodes_detail": episode_details,
@@ -411,6 +458,47 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
         if not isinstance(shard_meta, Mapping):
             raise ValueError(f"Shard {path} is missing metadata")
         shard_meta = dict(shard_meta)
+        protocol = shard_meta.get("attribution_protocol", HD_ATTRIBUTION_PROTOCOL_LEGACY)
+        if protocol in {"legacy", "v1"}:
+            protocol = HD_ATTRIBUTION_PROTOCOL_LEGACY
+        elif protocol == "v2":
+            protocol = HD_ATTRIBUTION_PROTOCOL_V2
+        if protocol not in HD_ATTRIBUTION_PROTOCOLS:
+            raise ValueError(f"Shard {path} has unsupported attribution_protocol={protocol!r}")
+        shard_meta["attribution_protocol"] = protocol
+        # Normalize JSON null from early shards to the legacy suffix mode;
+        # ``setdefault`` alone leaves an explicit null untouched.
+        shard_meta["teacher_ttt_writer_mode"] = str(
+            shard_meta.get("teacher_ttt_writer_mode") or "suffix"
+        )
+        # New v2 windows use one selected event branch.  Preserve/validate a
+        # larger K from older artifacts so merge metadata remains truthful;
+        # the online reader still consumes branch zero only.
+        declared_effect_branches = shard_meta.get(
+            "effect_branches", 1 if protocol == HD_ATTRIBUTION_PROTOCOL_V2 else 0
+        )
+        if protocol == HD_ATTRIBUTION_PROTOCOL_V2:
+            if type(declared_effect_branches) is not int or declared_effect_branches < 1:
+                raise ValueError(
+                    f"Shard {path} has malformed effect_branches={declared_effect_branches!r}; "
+                    "expected a positive integer for v2"
+                )
+            for window in payload["windows"]:
+                effect_tensor = (
+                    window.get("labels", {}).get("hd_teacher_effect")
+                    if isinstance(window, Mapping)
+                    else None
+                )
+                if isinstance(effect_tensor, Tensor) and effect_tensor.ndim >= 3:
+                    actual_effect_branches = int(effect_tensor.shape[1])
+                    if actual_effect_branches != declared_effect_branches:
+                        raise ValueError(
+                            f"Shard {path} declares effect_branches={declared_effect_branches} "
+                            f"but a window stores K={actual_effect_branches}"
+                        )
+        else:
+            declared_effect_branches = 0
+        shard_meta["effect_branches"] = declared_effect_branches
         missing_metadata = sorted(set(contract_keys) - set(shard_meta))
         if missing_metadata:
             raise ValueError(
@@ -450,6 +538,19 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
             }
             if mismatches:
                 raise ValueError(f"Cannot merge incompatible window shards: {mismatches}")
+            if reference.get("attribution_protocol") != protocol:
+                raise ValueError(
+                    "Cannot merge window shards generated by different attribution protocols: "
+                    f"{reference.get('attribution_protocol')!r} vs {protocol!r}"
+                )
+            if reference.get("teacher_ttt_writer_mode", "suffix") != shard_meta.get("teacher_ttt_writer_mode", "suffix"):
+                raise ValueError(
+                    "Cannot merge window shards generated with different TTT writer modes"
+                )
+            if reference.get("effect_branches", 0) != shard_meta.get("effect_branches", 0):
+                raise ValueError(
+                    "Cannot merge window shards with different effect branch counts"
+                )
         for window in payload["windows"]:
             target = int(window["target_global_index"])
             if target in seen_targets:
@@ -510,6 +611,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--attribution-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--attribution-protocol",
+        choices=("legacy", "v2"),
+        default="v2",
+        help=(
+            "Hindsight credit protocol: v2 uses antithetic relative credit, "
+            "robust aggregation, and slot-0 effects; legacy reproduces v1."
+        ),
+    )
     parser.add_argument("--frame-batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--phase-mode", choices=("random", "deployment"), default="deployment")

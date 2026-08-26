@@ -244,9 +244,27 @@ class TTTMLPLayer(nn.Module):
         state: TTTFastState,
         create_graph: bool,
         write_gate: Tensor | None = None,
+        writer_mask: Tensor | None = None,
         detach_writer: bool = False,
         return_loss: bool = False,
     ) -> TTTFastState | tuple[TTTFastState, Tensor]:
+        if writer_mask is not None:
+            if writer_mask.ndim != 2 or writer_mask.shape != keys.shape[:2]:
+                raise ValueError(
+                    "writer_mask must have shape [batch, writer_tokens] matching keys, "
+                    f"got {tuple(writer_mask.shape)} for keys {tuple(keys.shape)}"
+                )
+            writer_mask = writer_mask.to(device=keys.device, dtype=keys.dtype).detach()
+
+        def trajectory_loss(prediction: Tensor, target: Tensor) -> Tensor:
+            """Reduce writer-token errors without letting padding update state."""
+
+            per_token = F.mse_loss(prediction, target, reduction="none").mean(dim=-1)
+            if writer_mask is None:
+                return per_token.mean(dim=1)
+            denominator = writer_mask.sum(dim=1).clamp_min(1.0)
+            return (per_token * writer_mask).sum(dim=1) / denominator
+
         if detach_writer:
             # Grounding is a reader-only objective.  The numerical fast-weight
             # update is still carried out so the correct/wrong branches see
@@ -262,11 +280,7 @@ class TTTMLPLayer(nn.Module):
             detached_values = values.detach()
             with torch.enable_grad():
                 prediction = self._fast_mlp(detached_keys, detached_state)
-                per_trajectory_loss = F.mse_loss(
-                    prediction,
-                    detached_values,
-                    reduction="none",
-                ).mean(dim=(1, 2))
+                per_trajectory_loss = trajectory_loss(prediction, detached_values)
                 gradients = torch.autograd.grad(
                     per_trajectory_loss.sum(),
                     detached_state.tensors(),
@@ -306,7 +320,7 @@ class TTTMLPLayer(nn.Module):
             return (next_state, per_trajectory_loss) if return_loss else next_state
 
         prediction = self._fast_mlp(keys, state)
-        per_trajectory_loss = F.mse_loss(prediction, values, reduction="none").mean(dim=(1, 2))
+        per_trajectory_loss = trajectory_loss(prediction, values)
         gradients = torch.autograd.grad(
             per_trajectory_loss.sum(),
             state.tensors(),
@@ -363,6 +377,7 @@ class TTTMLPLayer(nn.Module):
         state: TTTFastState | None = None,
         *,
         writer_inputs: Tensor | None = None,
+        writer_mask: Tensor | None = None,
         update: bool = True,
         create_graph: bool | None = None,
         write_gate: Tensor | None = None,
@@ -416,6 +431,20 @@ class TTTMLPLayer(nn.Module):
                 # A read-only denoising step must not accidentally alter the
                 # state based on an unused writer tensor.
                 writer_inputs = None
+                writer_mask = None
+        elif writer_mask is not None:
+            raise ValueError("writer_mask requires writer_inputs")
+        if writer_mask is not None:
+            if writer_mask.ndim != 3 or writer_mask.shape[:2] != inputs.shape[:2]:
+                raise ValueError(
+                    "writer_mask must have shape [batch, timesteps, writer_tokens] "
+                    f"with matching batch/timesteps, got {tuple(writer_mask.shape)}"
+                )
+            if writer_mask.shape[2] != writer_inputs.shape[2]:
+                raise ValueError(
+                    "writer_mask token axis must match writer_inputs, got "
+                    f"{writer_mask.shape[2]} and {writer_inputs.shape[2]}"
+                )
         if state is not None and state.batch_size != inputs.shape[0]:
             raise ValueError(
                 f"Fast-state batch size {state.batch_size} does not match input batch size {inputs.shape[0]}"
@@ -506,8 +535,25 @@ class TTTMLPLayer(nn.Module):
             for timestep_index, timestep_inputs in enumerate(projected_inputs.unbind(dim=1)):
                 normalized_inputs = F.layer_norm(timestep_inputs, (self.dim,))
                 timestep_position = state.position + 1 if update else state.position.clamp_min(0)
+                # Queries and writer keys must share one physical-position
+                # coordinate system.  The legacy suffix path has identical
+                # token counts on both sides, so this is bit-compatible
+                # there.  In prefix-only mode the observation prefix is
+                # usually much longer than the action suffix; using
+                # ``timestep_position * writer_tokens`` for keys and
+                # ``timestep_position * query_tokens`` for queries would
+                # otherwise rotate the same interaction into different RoPE
+                # phases and make the fast-weight read depend on an arbitrary
+                # token-count mismatch.  A shared stride keeps every physical
+                # step disjoint while preserving a common phase origin.
+                writer_token_count = (
+                    normalized_inputs.shape[1]
+                    if projected_writer_inputs is None
+                    else projected_writer_inputs.shape[2]
+                )
+                token_stride = max(normalized_inputs.shape[1], writer_token_count)
                 token_positions = (
-                    timestep_position[:, None] * timestep_inputs.shape[1]
+                    timestep_position[:, None] * token_stride
                     + torch.arange(timestep_inputs.shape[1], device=inputs.device)[None, :]
                 )
                 queries = self._apply_rope(self.q_proj(normalized_inputs), token_positions)
@@ -521,7 +567,7 @@ class TTTMLPLayer(nn.Module):
                         )
                     )
                     writer_token_positions = (
-                        timestep_position[:, None] * writer_timestep_inputs.shape[1]
+                        timestep_position[:, None] * token_stride
                         + torch.arange(
                             writer_timestep_inputs.shape[1], device=inputs.device
                         )[None, :]
@@ -542,12 +588,16 @@ class TTTMLPLayer(nn.Module):
                         )
                         values = self.v_proj(writer_timestep_inputs)
                     timestep_gate = None if write_gate is None else write_gate[:, timestep_index]
+                    timestep_writer_mask = (
+                        None if writer_mask is None else writer_mask[:, timestep_index]
+                    )
                     update_result = self._update(
                         keys,
                         values,
                         state,
                         create_graph=create_graph,
                         write_gate=timestep_gate,
+                        writer_mask=timestep_writer_mask,
                         detach_writer=detach_writer,
                         return_loss=return_local_loss,
                     )

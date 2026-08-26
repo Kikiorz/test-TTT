@@ -1,5 +1,6 @@
 """Pure tests for the offline selected-event grounding contract."""
 
+import json
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,29 @@ def test_selected_grounding_event_rejects_terminal_one_frame_winner() -> None:
     )
     assert selected == 0
     assert mode == "min_future_horizon_mean"
+
+
+def test_teacher_checkpoint_contract_preserves_prefix_writer_mode(tmp_path) -> None:
+    builder = _load_builder()
+    checkpoint = tmp_path / "prefix_teacher"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "smolvla_ttt",
+                "hd_ttt_enabled": False,
+                "hd_learned_write_gate": False,
+                "ttt_layer_indices": [12, 13, 14, 15],
+                "ttt_num_register_tokens": 16,
+                "ttt_writer_mode": "prefix_only",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    info = builder._validate_teacher_checkpoint(checkpoint)
+
+    assert info["ttt_writer_mode"] == "prefix_only"
 
 
 def test_selected_grounding_event_uses_total_credit_for_short_episode() -> None:
@@ -107,3 +131,66 @@ def test_episode_label_replay_keeps_rho_and_wrong_branch_on_same_event() -> None
     assert labels["hd_selected_event"].tolist() == [0, 4]
     assert labels["hd_grounding_selection_mode"] == "total_credit_fallback"
     assert int((labels["hd_rho"] > 0).sum()) > 1
+
+
+def test_v2_effect_validity_starts_after_event_end() -> None:
+    """Action-effect labels must not supervise an event from its own frame."""
+
+    builder = _load_builder()
+
+    class _Policy:
+        config = SimpleNamespace(
+            action_feature=SimpleNamespace(shape=(1,)),
+            max_action_dim=1,
+            chunk_size=1,
+        )
+
+        @staticmethod
+        def prepare_action(prepared):
+            return prepared["actions"]
+
+    original_replay = builder._run_replay
+
+    def fake_replay(policy, prepared, noise, time, *, frame_batch_size, write_gate=None):
+        del policy, noise, time, frame_batch_size
+        length = int(prepared["actions"].shape[0])
+        velocity = torch.zeros(length, 1, 1)
+        if write_gate is not None:
+            zeros = torch.nonzero(write_gate.reshape(-1) == 0).flatten()
+            if zeros.numel():
+                event_start = int(zeros[0])
+                # Removing an event changes only its causal future.
+                velocity[event_start + 4 :, 0, 0] = 1.0
+        return velocity
+
+    builder._run_replay = fake_replay
+    try:
+        length = 12
+        labels = builder._episode_labels(
+            _Policy(),
+            {"actions": torch.zeros(length, 1, 1)},
+            torch.zeros(length, 1, 1),
+            torch.ones(length),
+            event_block_size=4,
+            max_events=0,
+            attribution_threshold=0.0,
+            frame_batch_size=4,
+            grounding_min_future_frames=0,
+            attribution_protocol="v2",
+        )
+    finally:
+        builder._run_replay = original_replay
+
+    assert labels["hd_attribution_protocol"] == builder.HD_ATTRIBUTION_PROTOCOL_V2
+    events = labels["hd_effect_events"]
+    valid = labels["hd_effect_valid"]
+    # The selected event is branch zero and must be represented by a causal
+    # mask whose first valid row is exactly the exclusive event end.
+    selected_start, selected_end = events[0].tolist()
+    assert selected_start == 0
+    assert selected_end == 4
+    assert torch.all(valid[:selected_end, 0] == 0)
+    assert torch.all(valid[selected_end:, 0] == 1)
+    # New v2 artifacts use one selected branch.  Older K>1 artifacts remain
+    # readable, but their extra branches are intentionally ignored online.
+    assert events.shape[0] == builder.V2_EFFECT_BRANCHES == 1

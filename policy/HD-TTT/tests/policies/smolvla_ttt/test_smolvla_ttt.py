@@ -9,10 +9,15 @@ from torch.utils.data import Dataset
 from lerobot.policies.factory import get_policy_class, make_policy_config
 from lerobot.policies.smolvla_ttt.configuration_smolvla_ttt import SmolVLATTTConfig
 from lerobot.policies.smolvla_ttt.hd_ttt import (
+    action_effect_distillation_loss,
+    adaptive_topk_mean,
     build_episode_event_block_mask,
     compute_hindsight_attribution,
+    compute_robust_hindsight_attribution,
     counterfactual_grounding_loss,
     local_kvb_loss,
+    robust_percentile_normalize,
+    symmetric_relative_credit,
 )
 from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import (
     SmolVLATTTFlowMatching,
@@ -82,17 +87,30 @@ def test_grounding_min_future_horizon_is_non_negative() -> None:
         SmolVLATTTConfig(hd_grounding_min_future_frames=-1)
 
 
+def test_hd_attribution_protocol_aliases_serialize_canonically() -> None:
+    assert (
+        SmolVLATTTConfig(hd_attribution_protocol="legacy").hd_attribution_protocol
+        == "legacy_raw_hinge_max"
+    )
+    assert (
+        SmolVLATTTConfig(hd_attribution_protocol="v2").hd_attribution_protocol
+        == "v2_relative_antithetic_robust"
+    )
+
+
 def test_legacy_null_hd_flags_decode_as_clean_checkpoint() -> None:
     source = SmolVLATTTPolicy._decode_source_config(
         {
             "type": "smolvla_ttt",
             "hd_ttt_enabled": None,
             "hd_learned_write_gate": None,
+            "ttt_writer_mode": None,
         }
     )
 
     assert source.hd_ttt_enabled is False
     assert source.hd_learned_write_gate is False
+    assert source.ttt_writer_mode == "suffix"
 
 
 def test_config_allows_disabling_register_tokens_and_rejects_negative_count() -> None:
@@ -104,6 +122,31 @@ def test_config_allows_disabling_register_tokens_and_rejects_negative_count() ->
 def test_learned_gate_requires_hd_objective() -> None:
     with pytest.raises(ValueError, match="hd_learned_write_gate requires hd_ttt_enabled"):
         SmolVLATTTConfig(hd_learned_write_gate=True)
+
+
+def test_v2_effect_contract_rejects_incompatible_gate_and_order() -> None:
+    with pytest.raises(ValueError, match="requires hd_ttt_enabled"):
+        SmolVLATTTConfig(hd_effect_weight=1.0)
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        SmolVLATTTConfig(
+            hd_ttt_enabled=True,
+            hd_effect_weight=1.0,
+            hd_learned_write_gate=True,
+            ttt_second_order=True,
+        )
+    with pytest.raises(ValueError, match="requires ttt_second_order=True"):
+        SmolVLATTTConfig(
+            hd_ttt_enabled=True,
+            hd_effect_weight=1.0,
+            ttt_second_order=False,
+        )
+    with pytest.raises(ValueError, match="requires hd_attribution_protocol"):
+        SmolVLATTTConfig(
+            hd_ttt_enabled=True,
+            hd_effect_weight=1.0,
+            ttt_second_order=True,
+            hd_attribution_protocol="legacy",
+        )
 
 
 def test_config_rejects_layers_without_a_reduced_expert_layer() -> None:
@@ -258,6 +301,40 @@ def test_fast_state_carries_across_detached_tbptt_segments() -> None:
     assert split_state.position.tolist() == joint_state.position.tolist() == [5]
 
 
+def test_prefix_writer_and_query_share_rope_physical_stride() -> None:
+    """A prefix/query token-count mismatch must not create a phase mismatch."""
+
+    layer = TTTMLPLayer(
+        dim=8,
+        hidden_dim=16,
+        effective_gate_init=0.05,
+        second_order=False,
+    )
+    inputs = torch.randn(1, 2, 2, 8)
+    writer_inputs = torch.randn(1, 2, 5, 8)
+    captured: list[torch.Tensor] = []
+
+    # Keep the original method's shape contract while recording its positions.
+    def capture_rope(values: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        captured.append(positions.detach().clone())
+        return values
+
+    layer._apply_rope = capture_rope  # type: ignore[method-assign]
+    layer(
+        inputs,
+        writer_inputs=writer_inputs,
+        update=True,
+        create_graph=False,
+    )
+
+    # Each timestep records q then k.  The common stride is max(2, 5)=5.
+    assert len(captured) == 4
+    torch.testing.assert_close(captured[0], torch.tensor([[0, 1]]), rtol=0, atol=0)
+    torch.testing.assert_close(captured[1], torch.tensor([[0, 1, 2, 3, 4]]), rtol=0, atol=0)
+    torch.testing.assert_close(captured[2], torch.tensor([[5, 6]]), rtol=0, atol=0)
+    torch.testing.assert_close(captured[3], torch.tensor([[5, 6, 7, 8, 9]]), rtol=0, atol=0)
+
+
 def test_grounding_branches_carry_their_own_state_across_tbptt_segments() -> None:
     """An early blocked write must remain absent in every later segment."""
 
@@ -374,6 +451,126 @@ def test_grounding_branches_carry_their_own_state_across_tbptt_segments() -> Non
     ]
     assert grounding_states["true"][0].position.tolist() == [3]
     assert grounding_states["wrong"][0].position.tolist() == [3]
+
+
+def test_effect_branches_carry_detached_writer_state_across_tbptt_segments() -> None:
+    """The differentiable true/wrong replays share no fresh-state reset."""
+
+    class _ReplayState:
+        def __init__(self, position: int) -> None:
+            self.position = torch.tensor([position], dtype=torch.int64)
+
+        def clone(self, *, detach: bool = False, requires_grad: bool = True):
+            del detach, requires_grad
+            return _ReplayState(int(self.position.item()))
+
+        def detach(self, requires_grad: bool = True):
+            del requires_grad
+            return _ReplayState(int(self.position.item()))
+
+    class _EffectReplayModel:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, bool | None, bool, bool]] = []
+
+        def forward_with_state(
+            self,
+            *args,
+            sequence_shape,
+            fast_states=None,
+            create_graph=None,
+            detach_writer=False,
+            write_gate=None,
+            return_local_loss=False,
+            **kwargs,
+        ):
+            del args, kwargs
+            sequence_length = sequence_shape[1]
+            previous_position = (
+                -1
+                if fast_states is None
+                else int(next(iter(fast_states.values())).position.item())
+            )
+            self.calls.append(
+                (previous_position, create_graph, detach_writer, write_gate is None)
+            )
+            velocity = torch.zeros(sequence_length, 1, 1, requires_grad=True)
+            next_states = {0: _ReplayState(previous_position + sequence_length)}
+            if return_local_loss:
+                local_loss = torch.zeros(1, sequence_length, requires_grad=True)
+                return velocity, next_states, local_loss
+            return velocity, next_states
+
+    policy = SmolVLATTTPolicy.__new__(SmolVLATTTPolicy)
+    policy.config = SimpleNamespace(
+        adapt_to_pi_aloha=False,
+        action_feature=SimpleNamespace(shape=(1,)),
+        hd_ttt_enabled=True,
+        hd_effect_weight=1.0,
+        hd_learned_write_gate=False,
+        hd_phase_mode="deployment",
+    )
+    policy.model = _EffectReplayModel()
+    policy.prepare_images = lambda batch: (
+        [torch.zeros(2, 1, 1, 1)],
+        [torch.ones(2, 1, dtype=torch.bool)],
+    )
+    policy.prepare_state = lambda batch: torch.zeros(2, 1)
+    policy.prepare_action = lambda batch: batch["action"]
+    policy._hd_auxiliary_losses = lambda *args, **kwargs: (
+        torch.zeros((), requires_grad=True),
+        {},
+    )
+
+    def segment_batch() -> dict[str, torch.Tensor]:
+        return {
+            "action": torch.zeros(2, 1, 1),
+            "observation.state": torch.zeros(2, 1),
+            "observation.language.tokens": torch.zeros(2, 1, dtype=torch.long),
+            "observation.language.attention_mask": torch.ones(2, 1, dtype=torch.bool),
+            "action_is_pad": torch.zeros(2, 1, dtype=torch.bool),
+            "hd_teacher_effect": torch.zeros(2, 1, 1),
+            "hd_effect_rho": torch.ones(2),
+            "hd_effect_write_gate": torch.ones(2),
+            "hd_effect_valid": torch.ones(2),
+            "hd_write_gate": torch.zeros(2),
+            # Keep legacy grounding labels present; v2 effect replay should
+            # supersede that detached pair instead of adding two redundant
+            # forwards.
+            "hd_teacher_true_velocity": torch.zeros(2, 1, 1),
+            "hd_teacher_wrong_velocity": torch.zeros(2, 1, 1),
+            "hd_counterfactual_write_gate": torch.zeros(2),
+        }
+
+    grounding_states = {"true": None, "wrong": None}
+    noise = torch.zeros(2, 1, 1)
+    time = torch.ones(2)
+    _, _, main_states = policy.forward_sequence_segment(
+        segment_batch(),
+        (1, 2),
+        noise=noise,
+        time=time,
+        grounding_states=grounding_states,
+    )
+    _, _, _ = policy.forward_sequence_segment(
+        segment_batch(),
+        (1, 2),
+        fast_states={index: state.detach() for index, state in main_states.items()},
+        noise=noise,
+        time=time,
+        grounding_states=grounding_states,
+    )
+
+    # The main all-write branch is reused as the differentiable true replay;
+    # only the wrong branch needs an additional VLM forward.  The second
+    # segment starts the effect branches at their own position=1.
+    assert policy.model.calls == [
+        (-1, None, False, True),
+        (-1, True, False, False),
+        (1, None, False, True),
+        (1, True, False, False),
+    ]
+    assert grounding_states["effect_true"][0].position.tolist() == [3]
+    assert grounding_states["effect_wrong"][0].position.tolist() == [3]
 
 
 def test_frozen_teacher_still_computes_local_fast_weight_updates() -> None:
@@ -642,6 +839,21 @@ def test_prefix_writer_fixed_resampling_has_expert_width_and_masks_padding() -> 
     assert writer[0, 0, -1] > writer[0, 0, 0]
 
 
+def test_prefix_writer_keeps_registers_alive_without_action_dependency() -> None:
+    flow = SmolVLATTTFlowMatching.__new__(SmolVLATTTFlowMatching)
+    torch.nn.Module.__init__(flow)
+    flow.vlm_with_expert = SimpleNamespace(expert_hidden_size=3)
+    flow.register_tokens = torch.nn.Parameter(torch.ones(2, 3))
+    prefix = torch.randn(1, 2, 4)
+    prefix_mask = torch.tensor([[True, False]])
+    writer, writer_mask = flow._prefix_writer_inputs_with_registers(prefix, prefix_mask)
+
+    assert writer.shape == (1, 4, 3)
+    assert writer_mask.tolist() == [[True, True, True, False]]
+    torch.testing.assert_close(writer[0, :2], torch.ones(2, 3))
+    assert torch.count_nonzero(writer[0, -1]) == 0
+
+
 def test_flow_forward_with_state_forwards_optional_local_loss() -> None:
     """FlowMatching returns one local loss per physical sequence timestep."""
 
@@ -777,6 +989,208 @@ def test_hindsight_attribution_is_causal_and_counterfactual_reader_is_teacher_de
     loss.backward()
     assert teacher_true.grad is None and teacher_wrong.grad is None
     assert student_true.grad is not None and student_wrong.grad is not None
+
+
+def test_v2_relative_credit_is_scale_free_and_signed() -> None:
+    full = torch.tensor([1.0, 2.0, 4.0])
+    masked = torch.tensor([2.0, 1.0, 4.0])
+    credit = symmetric_relative_credit(full, masked)
+    # Doubling both losses leaves the relative credit unchanged; swapping
+    # branches changes only its sign.
+    torch.testing.assert_close(credit, symmetric_relative_credit(full * 7, masked * 7))
+    torch.testing.assert_close(credit, -symmetric_relative_credit(masked, full))
+    assert credit[0] > 0 and credit[1] < 0 and credit[2] == 0
+
+
+def test_v2_robust_attribution_keeps_harmful_component_and_causal_mask() -> None:
+    # Explicit event/future mask uses non-consecutive block ends, as emitted by
+    # the MIKASA builder.  The large outlier should not rescale every row via a
+    # raw episode maximum.
+    full = torch.ones(3, 5)
+    masked = full.clone()
+    masked[0, 2] = 100.0
+    masked[0, 3] = 3.0
+    masked[1, 4] = 0.5
+    pair_mask = torch.zeros(3, 5, dtype=torch.bool)
+    pair_mask[0, 2:] = True
+    pair_mask[1, 4:] = True
+    result = compute_robust_hindsight_attribution(full, masked, pair_mask=pair_mask)
+    assert result.robust
+    assert result.signed_C[0, 2] > 0
+    assert result.harm_C[1, 4] > 0
+    assert torch.all(result.C[~pair_mask] == 0)
+    assert torch.all((result.u >= 0) & (result.u <= 1))
+    assert torch.all((result.rho >= 0) & (result.rho <= 1))
+    # Adaptive top-sqrt aggregation is deliberately less sensitive than max.
+    assert adaptive_topk_mean(torch.tensor([1.0, 2.0, 100.0])) < 100.0
+    assert robust_percentile_normalize(torch.tensor([1.0, 2.0, 100.0])).shape == (3,)
+
+
+def test_v2_reducer_counts_only_nonzero_signed_evidence() -> None:
+    # One positive pair among four causal pairs should retain its full signed
+    # relative magnitude (2.0 for a 0->1 loss change); counting causal zeros
+    # when choosing top-sqrt(k) would incorrectly dilute it to 1.0.
+    full = torch.zeros(1, 1, 4)
+    masked = full.clone()
+    masked[0, 0, 2] = 1.0
+    pair_mask = torch.ones(1, 1, 4, dtype=torch.bool)
+    result = compute_robust_hindsight_attribution(full, masked, pair_mask=pair_mask)
+    assert result.row_importance_raw is not None
+    torch.testing.assert_close(result.row_importance_raw, torch.full((1, 1), 2.0))
+
+
+def test_action_effect_distillation_trains_both_student_branches_only() -> None:
+    student_true = torch.randn(2, 3, 4, requires_grad=True)
+    student_wrong = torch.randn(2, 3, 4, requires_grad=True)
+    teacher_effect = torch.randn(2, 3, 4, requires_grad=True)
+    valid = torch.tensor([[True, True, False], [True, False, True]])
+    parts = action_effect_distillation_loss(
+        student_true,
+        student_wrong,
+        teacher_effect=teacher_effect,
+        importance=torch.ones(2, 3),
+        valid_mask=valid,
+        return_components=True,
+    )
+    parts.total.backward()
+    assert student_true.grad is not None and student_wrong.grad is not None
+    assert teacher_effect.grad is None
+    assert torch.isfinite(parts.total)
+
+
+def test_action_effect_valid_mask_broadcasts_over_event_axis() -> None:
+    """Per-frame validity masks must work with an explicit event axis."""
+
+    student_true = torch.randn(2, 3, 2, 4, requires_grad=True)
+    student_wrong = torch.randn(2, 3, 2, 4, requires_grad=True)
+    teacher_effect = torch.randn(2, 3, 2, 4)
+    # [B,T] is the natural collated form; it should cover both event branches.
+    parts = action_effect_distillation_loss(
+        student_true,
+        student_wrong,
+        teacher_effect=teacher_effect,
+        importance=torch.ones(2, 3),
+        valid_mask=torch.tensor([[True, True, False], [True, False, True]]),
+        reduction="none",
+        return_components=True,
+    )
+    assert parts.total.shape == (2, 3, 2)
+    parts.total.sum().backward()
+    assert torch.isfinite(student_true.grad).all()
+    assert torch.isfinite(student_wrong.grad).all()
+
+
+def test_action_effect_numeric_valid_mask_is_normalized_to_bool() -> None:
+    """JSON/NumPy 0-1 masks follow the same public contract as bool masks."""
+
+    student_true = torch.randn(2, 3, 4, requires_grad=True)
+    student_wrong = torch.randn(2, 3, 4, requires_grad=True)
+    teacher_effect = torch.randn(2, 3, 4)
+    parts = action_effect_distillation_loss(
+        student_true,
+        student_wrong,
+        teacher_effect=teacher_effect,
+        importance=torch.ones(2, 3),
+        valid_mask=torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]]),
+        return_components=True,
+    )
+    assert torch.isfinite(parts.total)
+    parts.total.backward()
+    assert student_true.grad is not None and torch.isfinite(student_true.grad).all()
+
+
+def test_action_effect_zero_teacher_uses_finite_unit_scale() -> None:
+    """An empty causal effect must not turn the invariance term into Inf."""
+
+    student_true = torch.full((2, 3, 4), 100.0, requires_grad=True)
+    student_wrong = torch.full((2, 3, 4), -100.0, requires_grad=True)
+    teacher_effect = torch.zeros(2, 3, 4, requires_grad=True)
+    loss = action_effect_distillation_loss(
+        student_true,
+        student_wrong,
+        teacher_effect=teacher_effect,
+        importance=torch.zeros(2, 3),
+        # Keep a singleton event axis as some collators do; the loss should
+        # interpret this as a per-frame prefix mask.
+        valid_mask=torch.ones(2, 3, 1, dtype=torch.bool),
+    )
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(student_true.grad).all()
+    assert torch.isfinite(student_wrong.grad).all()
+    # Unit-beta Huber + unit scale bounds the per-feature gradient; an eps
+    # scale (the old behavior) would produce gradients around 1e8 here.
+    assert float(student_true.grad.abs().max()) < 1.0
+    assert float(student_wrong.grad.abs().max()) < 1.0
+    assert teacher_effect.grad is None
+
+
+def test_action_effect_target_is_scale_invariant_in_normalized_coordinates() -> None:
+    """Changing action units should not change the v2 effect objective."""
+
+    torch.manual_seed(41)
+    true = torch.randn(2, 3, 4)
+    wrong = torch.randn(2, 3, 4)
+    target = torch.randn(2, 3, 4)
+    importance = torch.tensor([[1.0, 0.4, 0.0], [0.8, 0.2, 1.0]])
+    base = action_effect_distillation_loss(
+        true,
+        wrong,
+        teacher_effect=target,
+        importance=importance,
+    )
+    scale = 17.0
+    scaled = action_effect_distillation_loss(
+        true * scale,
+        wrong * scale,
+        teacher_effect=target * scale,
+        importance=importance,
+    )
+    torch.testing.assert_close(base, scaled, rtol=1e-5, atol=1e-5)
+
+
+def test_action_effect_backpropagates_through_differentiable_ttt_writer() -> None:
+    """The v2 term must reach K/V/inner-update parameters, not only the head."""
+
+    torch.manual_seed(31)
+    layer = TTTMLPLayer(
+        dim=8,
+        hidden_dim=16,
+        effective_gate_init=0.1,
+        gate_trainable=True,
+        second_order=True,
+    )
+    inputs = torch.randn(1, 2, 3, 8)
+    true_output, _ = layer(
+        inputs,
+        state=layer.initial_state(1),
+        update=True,
+        create_graph=True,
+    )
+    wrong_output, _ = layer(
+        inputs,
+        state=layer.initial_state(1),
+        update=True,
+        write_gate=torch.zeros(1, 2),
+        create_graph=True,
+    )
+    teacher_effect = torch.randn_like(true_output)
+    loss = action_effect_distillation_loss(
+        true_output,
+        wrong_output,
+        teacher_effect=teacher_effect,
+        importance=torch.ones(1, 2, 3),
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert layer.k_proj.weight.grad is not None
+    assert layer.v_proj.weight.grad is not None
+    assert layer.log_inner_lr_multiplier.grad is not None
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in (layer.k_proj.weight, layer.v_proj.weight, layer.log_inner_lr_multiplier)
+    )
 
 
 def test_local_kvb_writer_stops_gradient_into_value_target() -> None:
@@ -1142,6 +1556,22 @@ def test_grounding_slot_reduction_does_not_square_terminal_padding_weight() -> N
     )
 
     torch.testing.assert_close(reduced, torch.tensor(1.5))
+
+
+def test_hd_global_denominator_makes_segment_sum_partition_invariant() -> None:
+    values = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    weights = torch.tensor([[1.0, 0.0, 1.0, 1.0]])
+    first = SmolVLATTTPolicy._hd_weighted_mean(
+        values[:, :2], weights[:, :2], denominator=4.0
+    )
+    second = SmolVLATTTPolicy._hd_weighted_mean(
+        values[:, 2:], weights[:, 2:], denominator=4.0
+    )
+    whole = SmolVLATTTPolicy._hd_weighted_mean(values, weights)
+    # The fixed episode denominator gives (1 + 3 + 4) / 4 == 2 no matter
+    # where the TBPTT split falls.  The legacy local mean remains 8/3.
+    torch.testing.assert_close(first + second, torch.tensor(2.0))
+    torch.testing.assert_close(whole, torch.tensor(8.0 / 3.0))
 
 
 def test_grounding_rho_preserves_episode_scale_across_tbptt_segments() -> None:

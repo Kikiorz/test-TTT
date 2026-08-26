@@ -212,6 +212,78 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             "HD label artifacts must include guarded provenance metadata; "
             "regenerate labels with build_hd_labels.py"
         )
+    # v2 hindsight artifacts carry an explicit causal-credit protocol.  Legacy
+    # files predate this field and are interpreted as the raw-hinge protocol;
+    # this keeps old checkpoints loadable while preventing a silent mix of
+    # slot-0/antithetic labels with the legacy all-slot objective.
+    artifact_attribution_protocol = str(
+        metadata.get("attribution_protocol", "legacy_raw_hinge_max")
+    )
+    if artifact_attribution_protocol in {"legacy", "v1"}:
+        artifact_attribution_protocol = "legacy_raw_hinge_max"
+    elif artifact_attribution_protocol == "v2":
+        artifact_attribution_protocol = "v2_relative_antithetic_robust"
+    if artifact_attribution_protocol not in {
+        "legacy_raw_hinge_max",
+        "v2_relative_antithetic_robust",
+    }:
+        raise ValueError(
+            "HD labels have unsupported attribution_protocol="
+            f"{artifact_attribution_protocol!r}"
+        )
+    expected_attribution_protocol = getattr(
+        policy_cfg, "hd_attribution_protocol", artifact_attribution_protocol
+    )
+    if expected_attribution_protocol in {"legacy", "v1"}:
+        expected_attribution_protocol = "legacy_raw_hinge_max"
+    elif expected_attribution_protocol == "v2":
+        expected_attribution_protocol = "v2_relative_antithetic_robust"
+    if str(expected_attribution_protocol) != artifact_attribution_protocol:
+        raise ValueError(
+            "HD attribution protocol mismatch: artifact uses "
+            f"{artifact_attribution_protocol!r}, policy.hd_attribution_protocol="
+            f"{expected_attribution_protocol!r}"
+        )
+    # A few early artifacts serialized the optional writer field as JSON null;
+    # normalize it exactly like checkpoint configs before comparing protocol
+    # strings.  Never turn null into the literal string ``"None"``.
+    artifact_writer_mode = str(metadata.get("teacher_ttt_writer_mode") or "suffix")
+    expected_writer_mode = str(getattr(policy_cfg, "ttt_writer_mode", None) or "suffix")
+    if artifact_attribution_protocol == "v2_relative_antithetic_robust" and artifact_writer_mode != expected_writer_mode:
+        raise ValueError(
+            "HD v2 writer-mode mismatch: artifact teacher uses "
+            f"{artifact_writer_mode!r}, policy.ttt_writer_mode={expected_writer_mode!r}; "
+            "regenerate labels with the same prefix/suffix writer protocol"
+        )
+    if artifact_attribution_protocol == "v2_relative_antithetic_robust":
+        if artifact_writer_mode not in {"suffix", "prefix_only"}:
+            raise ValueError(
+                "HD v2 labels must declare teacher_ttt_writer_mode='suffix' or 'prefix_only'"
+            )
+        required_v2_labels = {
+            "hd_teacher_effect",
+            "hd_effect_rho",
+            "hd_effect_write_gate",
+            "hd_effect_valid",
+        }
+        missing_v2_labels = sorted(required_v2_labels - set(labeled_dataset.label_keys))
+        if missing_v2_labels:
+            raise ValueError(
+                "HD v2 label artifact is missing action-effect columns: "
+                f"{missing_v2_labels}"
+            )
+        # The formal builder emits one selected event branch.  Keep the reader
+        # backward-compatible with older K>1 artifacts, but reject malformed
+        # zero/negative declarations before the model indexes branch zero.
+        declared_effect_branches = metadata.get("effect_branches", 1)
+        if (
+            type(declared_effect_branches) is not int
+            or declared_effect_branches < 1
+        ):
+            raise ValueError(
+                "HD v2 label metadata effect_branches must be a positive integer; "
+                f"got {declared_effect_branches!r}"
+            )
     common_required_metadata = {
         "phase_mode",
         "history_mode",
@@ -432,8 +504,10 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             "use a window-keyed artifact for overlapping windows"
         )
     logging.info(
-        "HD label contract: phase=%s, window_local=%s, teacher=%s (config_sha256=%s)",
+        "HD label contract: phase=%s, attribution=%s, writer=%s, window_local=%s, teacher=%s (config_sha256=%s)",
         artifact_phase,
+        artifact_attribution_protocol,
+        expected_writer_mode,
         labeled_dataset.hd_window_local,
         metadata.get("checkpoint", "unknown"),
         current_teacher_hash,
@@ -668,20 +742,43 @@ def update_policy_tbptt(
     unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
     batch_size, sequence_length = sequence_shape
     fast_states = None
+    policy_config = getattr(unwrapped_policy, "config", None)
+    # v2 HD batches contain per-frame action-effect targets.  Their auxiliary
+    # terms are normalized by the complete physical window inside the policy,
+    # so the trainer must weight only the flow numerator per segment.  This is
+    # deliberately inferred from the artifact/protocol rather than exposed as
+    # another user knob: changing TBPTT length cannot silently change the
+    # hindsight objective.
+    use_global_hd_normalization = bool(
+        getattr(policy_config, "hd_ttt_enabled", False)
+        and str(getattr(policy_config, "hd_attribution_protocol", ""))
+        in {"v2", "v2_relative_antithetic_robust"}
+        and batch.get("hd_teacher_effect") is not None
+    )
     # Hindsight grounding has two detached counterfactual trajectories.  Keep
     # them across TBPTT segments of this one sequence so an early zero-write
     # intervention remains present in later reads.  Ordinary TTT/clean batches
     # do not carry these fields and retain the original call path.
     grounding_states = None
-    if bool(getattr(getattr(unwrapped_policy, "config", None), "hd_ttt_enabled", False)) and all(
-        batch.get(key) is not None
-        for key in (
-            "hd_counterfactual_write_gate",
-            "hd_teacher_true_velocity",
-            "hd_teacher_wrong_velocity",
+    if bool(getattr(getattr(unwrapped_policy, "config", None), "hd_ttt_enabled", False)):
+        has_reader_grounding = all(
+            batch.get(key) is not None
+            for key in (
+                "hd_counterfactual_write_gate",
+                "hd_teacher_true_velocity",
+                "hd_teacher_wrong_velocity",
+            )
         )
-    ):
-        grounding_states = {"true": None, "wrong": None}
+        has_effect_grounding = all(
+            batch.get(key) is not None
+            for key in ("hd_teacher_effect", "hd_effect_write_gate")
+        )
+        if has_reader_grounding or has_effect_grounding:
+            # The model adds ``effect_true/effect_wrong`` lazily when v2
+            # labels are present.  Keeping one container preserves both the
+            # historical detached reader branches and the new
+            # writer-gradient effect branches across TBPTT segments.
+            grounding_states = {"true": None, "wrong": None}
     total_loss = torch.zeros((), device=accelerator.device)
     loss_per_dim = None
     num_segments = 0
@@ -693,10 +790,20 @@ def update_policy_tbptt(
         weight_by_valid_actions=(
             getattr(unwrapped_policy, "tbptt_loss_weighting", None) == "valid_actions"
         ),
-        include_writer_valid=bool(
-            getattr(getattr(unwrapped_policy, "config", None), "hd_ttt_enabled", False)
-            and "hd_writer_valid" in batch
+        # With v2's separate flow/HD paths, flow is weighted only by valid
+        # action slots.  Legacy/ordinary calls retain the prior union with
+        # writer-valid warm-up frames.
+        include_writer_valid=(
+            False
+            if use_global_hd_normalization
+            else bool(
+                getattr(policy_config, "hd_ttt_enabled", False)
+                and "hd_writer_valid" in batch
+            )
         ),
+    )
+    hd_normalization_denominator = (
+        float(batch_size * sequence_length) if use_global_hd_normalization else None
     )
 
     for segment_index, segment_start in enumerate(range(0, sequence_length, segment_length)):
@@ -719,12 +826,18 @@ def update_policy_tbptt(
                 # Only SmolVLA-TTT exposes the optional grounding container;
                 # PI0/PI05 sequence policies keep their historical signature.
                 segment_kwargs["grounding_states"] = grounding_states
+            if use_global_hd_normalization:
+                segment_kwargs["flow_loss_weight"] = segment_loss_weights[segment_index]
+                segment_kwargs["hd_normalization_denominator"] = hd_normalization_denominator
             segment_loss, segment_output, fast_states = unwrapped_policy.forward_sequence_segment(
                 segment_batch,
                 **segment_kwargs,
             )
             segment_weight = segment_loss_weights[segment_index]
-            weighted_segment_loss = segment_loss * segment_weight
+            # In the v2 path the policy has already separated and normalized
+            # the two objectives.  Multiplying the combined scalar here would
+            # attenuate warm-up/effect supervision by the action-valid mask.
+            weighted_segment_loss = segment_loss if use_global_hd_normalization else segment_loss * segment_weight
 
         accelerator.backward(weighted_segment_loss)
         total_loss += weighted_segment_loss.detach()
@@ -737,9 +850,17 @@ def update_policy_tbptt(
             loss_per_dim += segment_loss_per_dim * segment_weight
         for metric_name, metric_value in segment_output.items():
             if metric_name.startswith("hd_"):
+                additive_metric = metric_name in {
+                    "hd_hca",
+                    "hd_h2l",
+                    "hd_effect",
+                    "hd_grounding",
+                    "hd_gate",
+                }
+                metric_weight = 1.0 if use_global_hd_normalization and additive_metric else segment_weight
                 auxiliary_metric_sums[metric_name] = auxiliary_metric_sums.get(metric_name, 0.0) + float(
                     metric_value
-                ) * segment_weight
+                ) * metric_weight
         fast_states = {
             layer_index: fast_state.detach() for layer_index, fast_state in fast_states.items()
         }
@@ -753,18 +874,22 @@ def update_policy_tbptt(
             device=accelerator.device,
         )
         gradient_presence = accelerator.reduce(gradient_presence, reduction="sum")
-        inconsistent = (gradient_presence != 0) & (gradient_presence != accelerator.num_processes)
-        if inconsistent.any().item():
-            inconsistent_indices = inconsistent.nonzero(as_tuple=False).flatten().cpu().tolist()
-            raise RuntimeError(
-                "TTT policy produced inconsistent gradients across data-parallel workers for "
-                f"trainable parameter indices {inconsistent_indices}"
-            )
-
+        # HD replay and optional ablations contain genuinely conditional
+        # branches (for example an all-zero effect-valid window).  A parameter
+        # can therefore be unused on one rank while receiving a gradient on
+        # another rank.  Treat that as a sparse data-parallel gradient and
+        # contribute an explicit zero on the rank where autograd produced
+        # ``None``.  Raising here made an otherwise valid episode composition
+        # fail nondeterministically and, more importantly, turned a data-mask
+        # detail into a hidden hyperparameter constraint.
         for parameter, presence_count in zip(trainable_parameters, gradient_presence.tolist(), strict=True):
             if presence_count == 0:
                 continue
-            reduced_gradient = accelerator.reduce(parameter.grad, reduction="mean")
+            local_gradient = parameter.grad
+            if local_gradient is None:
+                local_gradient = torch.zeros_like(parameter)
+                parameter.grad = local_gradient
+            reduced_gradient = accelerator.reduce(local_gradient, reduction="mean")
             parameter.grad.copy_(reduced_gradient)
 
         total_loss = accelerator.reduce(total_loss, reduction="mean")
@@ -1159,6 +1284,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         for metric_name in (
             "hd_hca",
             "hd_h2l",
+            "hd_effect",
             "hd_gate",
             "hd_grounding",
             "hd_gate_pred_mean",
@@ -1186,6 +1312,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             "hd_grounding_student_delta_rms",
             "hd_grounding_delta_ratio",
             "hd_grounding_margin_active_fraction",
+            "hd_effect_direction",
+            "hd_effect_invariance",
+            "hd_effect_weight_mass",
         ):
             train_metrics[metric_name] = AverageMeter(metric_name, ":.5f")
 
@@ -1252,6 +1381,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             for metric_name in (
                 "hd_hca",
                 "hd_h2l",
+                "hd_effect",
                 "hd_gate",
                 "hd_grounding",
                 "hd_gate_pred_mean",
@@ -1272,6 +1402,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "hd_grounding_student_delta_rms",
                 "hd_grounding_delta_ratio",
                 "hd_grounding_margin_active_fraction",
+                "hd_effect_direction",
+                "hd_effect_invariance",
+                "hd_effect_weight_mass",
             ):
                 if metric_name in output_dict:
                     setattr(train_tracker, metric_name, output_dict[metric_name])

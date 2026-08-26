@@ -27,7 +27,8 @@ TTT-KVB update, layer placement, denoising schedule, and losses unchanged.
 The optional HD-TTT objectives are enabled with `--policy.hd_ttt_enabled=true` after a
 causal teacher pass has produced attribution labels.  The paper path is the explicit v2
 contract (`--policy.hd_attribution_protocol=v2_relative_antithetic_robust`,
-`--policy.hd_effect_weight=1`, and `--policy.ttt_writer_mode=prefix_only`).
+`--policy.hd_effect_weight=1`, `--policy.hd_grounding_weight=0`, and
+`--policy.ttt_writer_mode=prefix_only`).
 `hd_ttt.py` contains the pure tensor implementations of the causal terms:
 
 * `compute_hindsight_attribution` computes the leakage-safe positive credit
@@ -43,8 +44,9 @@ contract (`--policy.hd_attribution_protocol=v2_relative_antithetic_robust`,
 
 The v2 label builder uses an antithetic `(z, -z)` replay pair, symmetric relative credit,
 adaptive top-`sqrt(n)` aggregation, and percentile normalization.  These are fixed
-algorithmic choices, not per-task knobs.  The stored top-two effect branches are an audit/
-ablation axis; the main student consumes the selected branch (axis 0).
+algorithmic choices, not per-task knobs.  The formal path stores one selected effect branch;
+the main student consumes branch 0.  Older artifacts with K>1 branches remain readable, but
+extra branches are ignored unless a separately implemented multi-event ablation is enabled.
 
 HCA intervention labels are training-only. Deployment keeps the ordinary SmolVLA flow loss,
 one update-then-apply fast-weight write per physical observation, and the recurrent state reset
@@ -68,9 +70,10 @@ aggregation and the selected grounding branch must remain separately auditable.
 Artifacts generated before this contract field was introduced are intentionally rejected by the
 strict loader; regenerate them rather than silently interpreting their terminal-event `hd_rho`.
 
-### Causal local write gate
+### Optional causal local write gate
 
-For the paper HD-TTT run, enable the learned gate as well:
+The learned gate is an optional ablation. It is not needed by the minimal paper
+objective, because H2L and action-effect distillation already train the writer:
 
 ```bash
 --policy.hd_ttt_enabled=true --policy.hd_learned_write_gate=true
@@ -85,9 +88,9 @@ same gate is used by every selected TTT layer. The offline
 supplied at deployment. The first denoising step advances the fast state with
 the predicted gate and later denoising steps only read it. A context-free
 `TTTMLPLayer` can still be instantiated for an explicit action-conditioned
-unit-test ablation, but production HD checkpoints always construct the
-prefix-context head. `hd_ttt_enabled=false` does not construct or call this
-head when loading a clean/base checkpoint, preserving the ordinary TTT path.
+unit-test ablation. The minimal paper checkpoint leaves this optional head
+disabled; `hd_ttt_enabled=false` also does not construct or call it when
+loading a clean/base checkpoint, preserving the ordinary TTT path.
 
 History warm-up frames carry a separate `hd_writer_valid` mask. Their action
 targets remain masked, while the local K/V and gate losses still train on the
@@ -97,9 +100,9 @@ unsampled blocks; the safe default gate of 1.0 is never treated as measured
 credit.
 
 When initializing HD-TTT from an existing clean TTT checkpoint, start a new run with
-`--policy.pretrained_path=<checkpoint>` and the two HD flags above. Do not resume the
-old optimizer state: the learned gate head is new and has no corresponding optimizer
-slots in the clean checkpoint.
+`--policy.pretrained_path=<checkpoint>` and the HD flags above. Do not resume the old
+optimizer state when changing the effect objective; its inner-update graph is a new
+training path.
 
 ### Loading offline labels
 

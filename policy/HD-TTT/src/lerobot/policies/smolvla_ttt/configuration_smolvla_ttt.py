@@ -155,6 +155,9 @@ class SmolVLATTTConfig(PreTrainedConfig):
     hd_ttt_enabled: bool = False
     hd_hca_weight: float = 1.0
     hd_h2l_weight: float = 1.0
+    # v2 compact action-effect/content distillation.  Zero preserves the
+    # legacy HD objective unless a v2 recipe opts in explicitly.
+    hd_effect_weight: float = 0.0
     hd_grounding_weight: float = 1.0
     hd_invariance_weight: float = 0.25
     hd_event_block_size: int = 4
@@ -172,6 +175,10 @@ class SmolVLATTTConfig(PreTrainedConfig):
     hd_grounding_min_future_frames: int = 64
     hd_attribution_threshold: float = 0.0
     hd_attribution_topk: int = 8
+    # Label provenance selector.  Keep legacy as the serialization default so
+    # old HD artifacts/checkpoints remain loadable; v2 experiments pass the
+    # explicit protocol string.
+    hd_attribution_protocol: str = "legacy_raw_hinge_max"
     # Flow velocities in MIKASA's normalized action space are often much
     # smaller than 0.05.  A non-zero dead-zone would therefore erase most of
     # the counterfactual grounding signal before it reaches the reader.  Keep
@@ -240,9 +247,23 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("ttt_training_stage must be 'ttt_only' or 'action_head'")
         if self.hd_learned_write_gate and not self.hd_ttt_enabled:
             raise ValueError("hd_learned_write_gate requires hd_ttt_enabled=True")
+        if self.hd_effect_weight > 0 and not self.hd_ttt_enabled:
+            raise ValueError("hd_effect_weight requires hd_ttt_enabled=True")
+        if self.hd_effect_weight > 0 and self.hd_learned_write_gate:
+            raise ValueError(
+                "hd_effect_weight and hd_learned_write_gate cannot be enabled together: "
+                "v2 action-effect replay is all-write so its writer distribution matches deployment; "
+                "use the learned-gate path as a separate ablation"
+            )
+        if self.hd_effect_weight > 0 and not self.ttt_second_order:
+            raise ValueError(
+                "hd_effect_weight>0 requires ttt_second_order=True because v2 action-effect "
+                "distillation differentiates through the fast-weight inner update"
+            )
         for name in (
             "hd_hca_weight",
             "hd_h2l_weight",
+            "hd_effect_weight",
             "hd_grounding_weight",
             "hd_invariance_weight",
             "hd_attribution_threshold",
@@ -261,6 +282,26 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("hd_grounding_min_future_frames must be non-negative")
         if self.hd_attribution_topk < 0:
             raise ValueError("hd_attribution_topk must be non-negative")
+        # Accept the short CLI spellings used by the offline builders, then
+        # serialize one canonical protocol string into checkpoints.  This
+        # avoids a brittle mismatch when a recipe passes ``v2`` directly while
+        # preserving the explicit legacy default for old artifacts.
+        if self.hd_attribution_protocol in {"legacy", "v1"}:
+            self.hd_attribution_protocol = "legacy_raw_hinge_max"
+        elif self.hd_attribution_protocol == "v2":
+            self.hd_attribution_protocol = "v2_relative_antithetic_robust"
+        if self.hd_attribution_protocol not in {
+            "legacy_raw_hinge_max",
+            "v2_relative_antithetic_robust",
+        }:
+            raise ValueError(
+                "hd_attribution_protocol must be 'legacy_raw_hinge_max' or "
+                "'v2_relative_antithetic_robust'"
+            )
+        if self.hd_effect_weight > 0 and self.hd_attribution_protocol != "v2_relative_antithetic_robust":
+            raise ValueError(
+                "hd_effect_weight>0 requires hd_attribution_protocol='v2_relative_antithetic_robust'"
+            )
         if self.hd_phase_mode not in {"random", "deployment"}:
             raise ValueError("hd_phase_mode must be 'random' or 'deployment'")
         if self.compile_model:
