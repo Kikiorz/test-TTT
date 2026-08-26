@@ -132,6 +132,11 @@ class SmolVLATTTConfig(PreTrainedConfig):
     ttt_effective_gate_init: float = 0.05
     ttt_rope_theta: float = 10_000.0
     ttt_second_order: bool = True
+    # Optional v2 numerical stabilization.  When enabled, the inner update
+    # uses a bounded learned log-lr and an RMS-relative step with a finite
+    # fallback.  ``False`` preserves the original RoboTTT update exactly for
+    # clean/legacy checkpoints; the v2 recipe opts in explicitly.
+    ttt_stable_inner_update: bool = False
     ttt_start_layer: int = 12
     ttt_layer_indices: list[int] | None = field(default=None)
     # ``suffix`` preserves the original RoboTTT writer (the current expert
@@ -217,6 +222,11 @@ class SmolVLATTTConfig(PreTrainedConfig):
             self.hd_effect_weight = 0.0
         if self.hd_attribution_protocol is None:
             self.hd_attribution_protocol = "legacy_raw_hinge_max"
+        # A few pre-v2 config writers emitted newly added booleans as JSON
+        # ``null``.  Treat that spelling as the compatibility/legacy value so
+        # the generic draccus path and the custom checkpoint loader agree.
+        if self.ttt_stable_inner_update is None:
+            self.ttt_stable_inner_update = False
 
         """Input validation (not exhaustive)."""
         if self.n_action_steps > self.chunk_size:
@@ -252,6 +262,8 @@ class SmolVLATTTConfig(PreTrainedConfig):
             raise ValueError("ttt_hidden_dim must be positive")
         if self.ttt_base_inner_lr <= 0:
             raise ValueError("ttt_base_inner_lr must be positive")
+        if type(self.ttt_stable_inner_update) is not bool:
+            raise ValueError("ttt_stable_inner_update must be a boolean")
         if not 0 <= self.ttt_effective_gate_init < 1:
             raise ValueError("ttt_effective_gate_init must be in [0, 1)")
         if self.ttt_rope_theta <= 0:

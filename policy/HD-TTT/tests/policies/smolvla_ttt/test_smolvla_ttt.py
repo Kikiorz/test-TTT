@@ -28,6 +28,7 @@ from lerobot.policies.smolvla_ttt.modeling_smolvla_ttt import (
     _hd_loss_balance_metrics,
     _hd_ttt_parameter_range_metrics,
     _restore_checkpoint_model_fields,
+    _ttt_state_scale_metrics,
     _validate_checkpoint_keys,
 )
 from lerobot.policies.smolvla_ttt.sequence import (
@@ -36,7 +37,7 @@ from lerobot.policies.smolvla_ttt.sequence import (
     TailPreservingSequenceDataset,
 )
 from lerobot.policies.smolvla_ttt.smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
-from lerobot.policies.smolvla_ttt.ttt import TTTMLPLayer
+from lerobot.policies.smolvla_ttt.ttt import TTTFastState, TTTMLPLayer
 from lerobot.scripts.lerobot_train import _tbptt_segment_loss_weights
 
 
@@ -86,6 +87,16 @@ def test_default_ttt_layers_match_last_four_smolvla_expert_layers() -> None:
     assert config.hd_grounding_min_future_frames == 64
 
 
+def test_stable_inner_update_flag_is_serialized_and_defaults_off(tmp_path: Path) -> None:
+    assert SmolVLATTTConfig().ttt_stable_inner_update is False
+    config = SmolVLATTTConfig(ttt_stable_inner_update=True)
+    assert config.ttt_stable_inner_update is True
+
+    config._save_pretrained(tmp_path)
+    payload = json.loads((tmp_path / "config.json").read_text())
+    assert payload["ttt_stable_inner_update"] is True
+
+
 def test_hd_loss_balance_diagnostics_are_scale_explicit_and_zero_safe() -> None:
     """Loss-balance logs are detached observations, including empty-flow windows."""
 
@@ -132,6 +143,21 @@ def test_hd_ttt_parameter_range_diagnostics_read_selected_layers_only() -> None:
     assert all(not isinstance(value, torch.Tensor) for value in metrics.values())
 
 
+def test_ttt_state_scale_diagnostics_measure_long_horizon_drift() -> None:
+    layer = TTTMLPLayer(dim=4, hidden_dim=8, stable_inner_update=True)
+    state = layer.initial_state(2)
+    doubled = TTTFastState(
+        *(tensor * 2 for tensor in state.tensors()),
+        position=state.position,
+    )
+
+    metrics = _ttt_state_scale_metrics(torch.nn.ModuleDict({"3": layer}), {3: doubled})
+
+    assert metrics["ttt_state_rms_ratio_min"] == pytest.approx(2.0, rel=1e-5)
+    assert metrics["ttt_state_rms_ratio_mean"] == pytest.approx(2.0, rel=1e-5)
+    assert metrics["ttt_state_rms_ratio_max"] == pytest.approx(2.0, rel=1e-5)
+
+
 def test_grounding_min_future_horizon_is_non_negative() -> None:
     assert SmolVLATTTConfig(hd_grounding_min_future_frames=0).hd_grounding_min_future_frames == 0
     with pytest.raises(ValueError, match="hd_grounding_min_future_frames must be non-negative"):
@@ -158,6 +184,7 @@ def test_legacy_null_hd_flags_decode_as_clean_checkpoint() -> None:
             "hd_effect_weight": None,
             "hd_attribution_protocol": None,
             "ttt_writer_mode": None,
+            "ttt_stable_inner_update": None,
         }
     )
 
@@ -166,6 +193,7 @@ def test_legacy_null_hd_flags_decode_as_clean_checkpoint() -> None:
     assert source.hd_effect_weight == 0.0
     assert source.hd_attribution_protocol == "legacy_raw_hinge_max"
     assert source.ttt_writer_mode == "suffix"
+    assert source.ttt_stable_inner_update is False
 
 
 def test_pretrained_config_accepts_null_v2_fields(tmp_path: Path) -> None:
@@ -180,6 +208,7 @@ def test_pretrained_config_accepts_null_v2_fields(tmp_path: Path) -> None:
                 "hd_effect_weight": None,
                 "hd_attribution_protocol": None,
                 "ttt_writer_mode": None,
+                "ttt_stable_inner_update": None,
             }
         )
     )
@@ -192,6 +221,7 @@ def test_pretrained_config_accepts_null_v2_fields(tmp_path: Path) -> None:
     assert loaded.hd_effect_weight == 0.0
     assert loaded.hd_attribution_protocol == "legacy_raw_hinge_max"
     assert loaded.ttt_writer_mode == "suffix"
+    assert loaded.ttt_stable_inner_update is False
 
 
 def test_pretrained_config_clean_opt_out_zeros_stale_effect_weight(tmp_path: Path) -> None:
@@ -442,6 +472,82 @@ def test_fast_state_carries_across_detached_tbptt_segments() -> None:
     for split_tensor, joint_tensor in zip(split_state.tensors(), joint_state.tensors(), strict=True):
         torch.testing.assert_close(split_tensor, joint_tensor, rtol=0, atol=0)
     assert split_state.position.tolist() == joint_state.position.tolist() == [5]
+
+
+def test_stable_inner_update_bounds_lr_and_limits_state_scale() -> None:
+    torch.manual_seed(11)
+    layer = TTTMLPLayer(
+        dim=4,
+        hidden_dim=8,
+        base_inner_lr=0.1,
+        stable_inner_update=True,
+        second_order=False,
+    )
+    with torch.no_grad():
+        layer.log_inner_lr_multiplier.fill_(100.0)
+    # Stable mode clamps the learned multiplier to a fixed four-fold window.
+    assert layer.inner_lr.item() == pytest.approx(0.4, abs=1e-6)
+    with torch.no_grad():
+        layer.log_inner_lr_multiplier.fill_(-100.0)
+    assert layer.inner_lr.item() == pytest.approx(0.025, abs=1e-6)
+
+    initial = layer.initial_state(1)
+    # A state that has drifted far from initialization must still use the
+    # fixed trust-region scale rather than making the next step proportional
+    # to its unbounded RMS.
+    weights = tuple(tensor * 1_000.0 for tensor in initial.tensors())
+    gradients = tuple(torch.ones_like(tensor) for tensor in weights)
+    updated = layer._stable_inner_update(weights, gradients, detach_inner_lr=True)
+    assert all(torch.isfinite(tensor).all() for tensor in updated)
+    for weight, next_weight in zip(weights, updated, strict=True):
+        assert (next_weight - weight).abs().max().item() < weight.abs().max().item()
+
+    # A tiny writer gradient must remain tiny.  Normalizing by its own RMS
+    # would incorrectly turn this into an O(lr) jump; the fixed initial-RMS
+    # trust scale keeps the update proportional to the raw gradient.
+    tiny_gradients = tuple(torch.full_like(tensor, 1e-12) for tensor in initial.tensors())
+    tiny_updated = layer._stable_inner_update(
+        initial.tensors(), tiny_gradients, detach_inner_lr=True
+    )
+    for weight, next_weight in zip(initial.tensors(), tiny_updated, strict=True):
+        assert (next_weight - weight).abs().max().item() < 1e-6
+
+
+def test_stable_inner_update_keeps_second_order_gradient_and_finite_fallback() -> None:
+    torch.manual_seed(12)
+    layer = TTTMLPLayer(
+        dim=4,
+        hidden_dim=8,
+        stable_inner_update=True,
+        second_order=True,
+    )
+    inputs = torch.randn(1, 3, 2, 4, requires_grad=True)
+    outputs, state = layer(inputs, update=True, create_graph=True)
+    loss = outputs.square().mean()
+    loss.backward()
+
+    assert torch.isfinite(outputs).all()
+    assert all(torch.isfinite(tensor).all() for tensor in state.tensors())
+    assert layer.log_inner_lr_multiplier.grad is not None
+    assert torch.isfinite(layer.log_inner_lr_multiplier.grad).all()
+
+    # Non-finite fast state/gradient inputs are converted to a finite no-op
+    # fallback instead of contaminating the next recurrent state.
+    bad_weights = tuple(torch.full_like(tensor, float("nan")) for tensor in state.tensors())
+    bad_gradients = tuple(torch.full_like(tensor, float("inf")) for tensor in state.tensors())
+    recovered = layer._stable_inner_update(bad_weights, bad_gradients, detach_inner_lr=True)
+    assert all(torch.isfinite(tensor).all() for tensor in recovered)
+    assert bool(layer.nonfinite_seen.item()) is True
+
+    layer.clear_nonfinite_diagnostic()
+    assert bool(layer.nonfinite_seen.item()) is False
+
+    # Read-path sanitization is stable-mode only and protects inference from a
+    # malformed upstream activation without changing the legacy path.
+    extreme = torch.full((1, 2, 2, 4), 1e30)
+    extreme_output, extreme_state = layer(extreme, update=True, create_graph=False)
+    assert torch.isfinite(extreme_output).all()
+    assert all(torch.isfinite(tensor).all() for tensor in extreme_state.tensors())
 
 
 def test_prefix_writer_and_query_share_rope_physical_stride() -> None:
@@ -1464,6 +1570,7 @@ def test_checkpoint_restore_uses_source_ttt_model_fields_but_keeps_training_stag
         ttt_effective_gate_init=0.02,
         ttt_rope_theta=5_000.0,
         ttt_second_order=True,
+        ttt_stable_inner_update=True,
         ttt_start_layer=4,
         ttt_layer_indices=[4, 5],
         ttt_num_register_tokens=3,
@@ -1475,6 +1582,7 @@ def test_checkpoint_restore_uses_source_ttt_model_fields_but_keeps_training_stag
         ttt_effective_gate_init=0.1,
         ttt_rope_theta=20_000.0,
         ttt_second_order=False,
+        ttt_stable_inner_update=True,
         ttt_layer_indices=[1],
         ttt_num_register_tokens=0,
         ttt_training_stage="action_head",
@@ -1487,6 +1595,7 @@ def test_checkpoint_restore_uses_source_ttt_model_fields_but_keeps_training_stag
             "ttt_effective_gate_init",
             "ttt_rope_theta",
             "ttt_second_order",
+            "ttt_stable_inner_update",
             "ttt_start_layer",
             "ttt_layer_indices",
             "ttt_num_register_tokens",
@@ -1515,6 +1624,21 @@ def test_checkpoint_restore_preserves_explicit_hd_opt_in_over_clean_ttt_source()
     assert target.hd_learned_write_gate is True
 
 
+def test_checkpoint_restore_preserves_explicit_stable_opt_in_over_clean_source() -> None:
+    """The v2 recipe can opt into stable recurrence when the source is legacy."""
+
+    source = SmolVLATTTConfig(ttt_stable_inner_update=False)
+    target = SmolVLATTTConfig(ttt_stable_inner_update=True)
+    raw_config = {
+        "type": "smolvla_ttt",
+        "ttt_stable_inner_update": False,
+    }
+
+    _restore_checkpoint_model_fields(target, source, raw_config)
+
+    assert target.ttt_stable_inner_update is True
+
+
 def test_checkpoint_restore_keeps_second_order_for_v2_effect_conversion() -> None:
     """Enabling v2 from a first-order teacher must not be overwritten by source fields."""
 
@@ -1525,6 +1649,7 @@ def test_checkpoint_restore_keeps_second_order_for_v2_effect_conversion() -> Non
     )
     target = SmolVLATTTConfig(
         ttt_second_order=True,
+        ttt_stable_inner_update=True,
         hd_ttt_enabled=True,
         hd_effect_weight=1.0,
         hd_attribution_protocol="v2_relative_antithetic_robust",

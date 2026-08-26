@@ -683,6 +683,11 @@ class HindsightLabelDataset(Dataset):
         record = self._records.setdefault(index, {})
         for key, value in values.items():
             tensor = _as_cpu_tensor(value)
+            if self.strict and tensor.is_floating_point() and not bool(torch.isfinite(tensor).all().item()):
+                raise ValueError(
+                    f"HD label {key!r} at index {index} contains non-finite values; "
+                    "regenerate the artifact instead of treating them as zero credit"
+                )
             if key in record and tuple(record[key].shape) != tuple(tensor.shape):
                 raise ValueError(
                     f"Conflicting HD label shapes for {key!r} at index {index}: "
@@ -739,6 +744,11 @@ class HindsightLabelDataset(Dataset):
                         f"{tensor.shape[0]}, expected {row_count}"
                     )
                 labels[key] = tensor
+                if self.strict and tensor.is_floating_point() and not bool(torch.isfinite(tensor).all().item()):
+                    raise ValueError(
+                        f"Window-local label {key!r} in record {position} contains non-finite values; "
+                        "regenerate the artifact"
+                    )
                 if key not in self._templates:
                     self._templates[key] = tensor[0]
             if target_source not in set(int(value) for value in source_tensor.tolist()):

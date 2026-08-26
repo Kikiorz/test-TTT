@@ -50,6 +50,11 @@ TTT_HIDDEN_DIM="${TTT_HIDDEN_DIM:-1024}"
 TTT_LAYERS="${TTT_LAYERS:-[12,13,14,15]}"
 REGISTER_TOKENS="${REGISTER_TOKENS:-16}"
 TTT_WRITER_MODE="${TTT_WRITER_MODE:-suffix}"
+# The formal HD/v2 recipe uses the bounded inner update by default.  Set this
+# to ``false`` only for an explicit legacy/clean ablation; v2 action-effect
+# supervision below rejects that combination because its labels must match the
+# student's recurrence.
+TTT_STABLE_INNER_UPDATE="${TTT_STABLE_INNER_UPDATE:-true}"
 RESIZE="${RESIZE:-[224,224]}"
 TRAINING_STAGE="${TRAINING_STAGE:-ttt_only}"
 HD_ENABLED="${HD_ENABLED:-false}"
@@ -124,6 +129,15 @@ case "${TTT_WRITER_MODE}" in
     exit 2
     ;;
 esac
+case "${TTT_STABLE_INNER_UPDATE,,}" in
+  true|false)
+    TTT_STABLE_INNER_UPDATE="${TTT_STABLE_INNER_UPDATE,,}"
+    ;;
+  *)
+    echo "TTT_STABLE_INNER_UPDATE must be true or false, got '${TTT_STABLE_INNER_UPDATE}'" >&2
+    exit 2
+    ;;
+esac
 case "${HD_ATTRIBUTION_PROTOCOL}" in
   legacy|legacy_raw_hinge_max)
     HD_ATTRIBUTION_PROTOCOL="legacy_raw_hinge_max"
@@ -138,6 +152,12 @@ case "${HD_ATTRIBUTION_PROTOCOL}" in
 esac
 if ! [[ "${HD_EFFECT_WEIGHT}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "HD_EFFECT_WEIGHT must be a non-negative number, got '${HD_EFFECT_WEIGHT}'" >&2
+  exit 2
+fi
+if [[ "${HD_ATTRIBUTION_PROTOCOL}" == "v2_relative_antithetic_robust" \
+      && ! "${HD_EFFECT_WEIGHT}" =~ ^0*([.]0*)?$ \
+      && "${TTT_STABLE_INNER_UPDATE}" != "true" ]]; then
+  echo "v2 action-effect training requires TTT_STABLE_INNER_UPDATE=true; got '${TTT_STABLE_INNER_UPDATE}'" >&2
   exit 2
 fi
 if [[ "${HD_ATTRIBUTION_PROTOCOL}" == "legacy_raw_hinge_max" && "${HD_EFFECT_WEIGHT}" != "0" && "${HD_EFFECT_WEIGHT}" != "0.0" ]]; then
@@ -210,7 +230,7 @@ MAX_EPISODE_LENGTH="$("${PYTHON_BIN}" -c 'import sys; print(sys.argv[1].split()[
 STEPS_PER_EPOCH=$(( (WINDOWS + NUM_PROCESSES - 1) / NUM_PROCESSES ))
 STEPS=$(( STEPS_PER_EPOCH * EPOCHS ))
 
-echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, writer=${TTT_WRITER_MODE}, attribution=${HD_ATTRIBUTION_PROTOCOL}, second_order=${TTT_SECOND_ORDER}, grounding_min_future=${HD_GROUNDING_MIN_FUTURE_FRAMES}, margin=${HD_COUNTERFACTUAL_MARGIN}, effect_weight=${HD_EFFECT_WEIGHT}, grounding_weight=${HD_GROUNDING_WEIGHT}"
+echo "MIKASA HD-TTT: windows=${WINDOWS}, episode_length=${MIN_EPISODE_LENGTH}..${MAX_EPISODE_LENGTH}, steps/epoch=${STEPS_PER_EPOCH}, epochs=${EPOCHS}, steps=${STEPS}, resume=${RESUME}, writer=${TTT_WRITER_MODE}, stable_inner_update=${TTT_STABLE_INNER_UPDATE}, attribution=${HD_ATTRIBUTION_PROTOCOL}, second_order=${TTT_SECOND_ORDER}, grounding_min_future=${HD_GROUNDING_MIN_FUTURE_FRAMES}, margin=${HD_COUNTERFACTUAL_MARGIN}, effect_weight=${HD_EFFECT_WEIGHT}, grounding_weight=${HD_GROUNDING_WEIGHT}"
 
 COMMON_ARGS=(
   --dataset.repo_id="${DATASET_REPO_ID}"
@@ -228,6 +248,7 @@ COMMON_ARGS=(
   --policy.ttt_history_warmup_length="${HISTORY_WARMUP_ARG}"
   --policy.ttt_hidden_dim="${TTT_HIDDEN_DIM}"
   --policy.ttt_second_order="${TTT_SECOND_ORDER}"
+  --policy.ttt_stable_inner_update="${TTT_STABLE_INNER_UPDATE}"
   --policy.ttt_layer_indices="${TTT_LAYERS}"
   --policy.ttt_num_register_tokens="${REGISTER_TOKENS}"
   --policy.ttt_writer_mode="${TTT_WRITER_MODE}"

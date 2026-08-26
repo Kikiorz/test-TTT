@@ -240,7 +240,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         orig_config_file = config_file
         if config_type == "smolvla_ttt":
             config_for_probe = dict(config)
-            for flag_name in ("hd_ttt_enabled", "hd_learned_write_gate"):
+            for flag_name in (
+                "hd_ttt_enabled",
+                "hd_learned_write_gate",
+                "ttt_stable_inner_update",
+            ):
                 if config_for_probe.get(flag_name) is None:
                     config_for_probe[flag_name] = False
             if config_for_probe.get("hd_effect_weight") is None:
@@ -308,7 +312,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         # nondeterministic even though downstream ``bool(None)`` happens to
         # disable the feature.  Normalize only this policy family.
         if getattr(orig_config, "type", None) == "smolvla_ttt":
-            for field_name in ("hd_ttt_enabled", "hd_learned_write_gate"):
+            for field_name in (
+                "hd_ttt_enabled",
+                "hd_learned_write_gate",
+                "ttt_stable_inner_update",
+            ):
                 if getattr(parsed_config, field_name, None) is None:
                     setattr(parsed_config, field_name, False)
         return parsed_config

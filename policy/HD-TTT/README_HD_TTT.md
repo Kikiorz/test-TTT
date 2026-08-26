@@ -4,14 +4,17 @@
 
 ## 先看结论
 
-HD-TTT 在 SmolVLA 的 action expert 中加入可跨物理时刻保存的 TTT fast weights，并用成功示范的完整历史离线计算“某段过去是否影响未来控制”的信用，再把这个信用蒸馏为部署时可计算的局部写入/读取目标和因果写入 gate。论文主路径（v2）还用一个与动作效果对齐的 true/wrong writer replay 训练 fast-weight 的写入内容；这不是把未来信息带到部署端。
+HD-TTT 在 SmolVLA 的 action expert 中加入可跨物理时刻保存的 TTT fast weights，并用成功示范的完整历史离线计算“某段过去是否影响未来控制”的信用，再把这个信用蒸馏为部署时可计算的局部写入/读取目标。论文主路径（v2）用与动作效果对齐的 true/wrong writer replay 训练 fast-weight 的写入内容；learned write gate 只保留为 legacy/no-effect 消融，不是 v2 的必要模块。这不是把未来信息带到部署端。
 
 部署时只需要当前 observation、language、proprioception、fast weights，以及模型内部采样的 Gaussian action noise：没有 hindsight teacher、未来 observation、专家 action 或离线标签。
 
 当前实现的三个方法组件是：
 
 1. **Hindsight Control Attribution（HCA）**：对完整成功轨迹做事件级 zero-write counterfactual，得到历史事件对未来 flow-action 预测的控制信用。
-2. **Hindsight-to-Local TTT Distillation（H2L）**：用 HCA 信用加权本地 K/V fast-weight 重构目标，并训练一个只看当前 causal prefix 的写入 gate；v2 额外匹配 memory 对已执行 action slot 的影响（action-effect distillation）。
+2. **Hindsight-to-Local TTT Distillation（H2L）**：用 HCA 信用加权本地 K/V fast-weight
+   写入目标；v2 进一步用 memory 对已执行 action slot 的影响（action-effect
+   distillation）约束写入内容。只看当前 causal prefix 的 learned write gate 是
+   legacy/no-effect 的可选消融，不是 v2 主路径。
 3. **Causal Memory Deployment**：用 true-memory / wrong-memory 两条因果 replay 分支
    约束 fast-weight 对动作的真实影响，并在 episode 边界显式 reset。
 
@@ -117,6 +120,18 @@ checkpoint 的 2.8% 以下。参数量随 backbone/config 改变，论文表格�
 
 ## 4. TTT 的单步机制
 
+### 4.0 数值稳健的内循环（v2 实现约束）
+
+v2 保留 `ttt_base_inner_lr` 和每层可学习 multiplier 作为底层参数，但不让
+它们把结果变成单点调参：`ttt_stable_inner_update=true` 时，inner gradient
+先按每个 trajectory/fast-tensor 的 RMS 做无量纲相对化，learned multiplier
+在固定对称范围内生效，并对非有限 candidate 做安全的 no-op 回退。该层还在
+float32 中完成 inner arithmetic；外层仍可使用 bf16。这样参数改变的是记忆
+写入强度，而不是数值尺度/动作单位，且同一机制可用于 clean teacher、HD student
+和部署。这个稳定器是实现层的数值不变性，不是额外的 memory head，也不构成
+论文的独立贡献；v2 recipe 强制打开它，legacy `false` 保留旧 checkpoint 的
+逐位兼容路径。训练日志同时审计实际 inner-lr、gate、state/gradient 的有限性。
+
 ### 4.1 局部 K/V inner update
 
 在选中的层，对该层 attention residual 的 token 表示 $h_{t,n}$ 做归一化并投影：
@@ -144,10 +159,18 @@ fast MLP $f_W$ 的本地目标为：
 先做 inner gradient update，再用更新后的 state 读取 query：
 
 \[
-\widehat W_t=W_t-\eta_t\nabla_W\ell_{\mathrm{KV}}(W_t;t),
+\widehat W_t=W_t-\eta_t\,s_t\,
+\frac{\nabla_W\ell_{\mathrm{KV}}(W_t;t)}
+{\max(\operatorname{RMS}(\nabla_W\ell_{\mathrm{KV}}),r_0)+\epsilon},
 \qquad
 W_{t+1}=W_t+g_t(\widehat W_t-W_t),
 \]
+
+其中 $r_0=\operatorname{RMS}(W_0)$，$s_t$ 是当前 state RMS 相对 $r_0$ 的
+$[0.25,4]$ trust-region 截断；这是 `ttt_stable_inner_update=true` 时的实际
+更新。上式中的 RMS、截断边界和有限值回退都是统一的数值实现细节，不是新的
+任务相关超参数。关闭 stable mode 时保留原始的 $W_t-\eta_t\nabla_W\ell$ 路径，
+便于 legacy/clean ablation 与旧 checkpoint 逐位兼容。
 
 \[
 \operatorname{TTT}(h_t)=h_t+\tanh(\gamma)\,f_{W_{t+1}}(q_t).
@@ -242,7 +265,9 @@ L_{\mathrm{H2L}}
 
 实现直接从每个 TTT layer 的当前 inner K/V prediction loss 计算该项，不要求预先存储 `hd_local_*` 张量；旧格式的 projected local K/V 字段只作为兼容 fallback。
 
-同时，在最早的选中 TTT 层预测一个共享 gate：
+旧的 learned-gate/no-effect 消融会在最早的选中 TTT 层预测一个共享 gate；正式
+v2 关闭该预测头（`hd_learned_write_gate=false`），由 all-write 的局部目标和
+action-effect distillation 约束写入内容：
 
 \[
 g_t=\sigma\bigl(h_\phi(\operatorname{Pool}(P_t))\bigr),
@@ -422,6 +447,7 @@ v2 训练时 policy 的 `hd_attribution_protocol` 必须与 artifact 完全一�
 | TTT layers | `[12, 13, 14, 15]` |
 | TTT fast hidden dim | `1024` |
 | fast inner learning rate | `0.1`（每层可学习 multiplier） |
+| stable inner update（v2） | `true`（RMS-relative、bounded multiplier、finite fallback） |
 | residual effective gate init | `0.05` |
 | second-order TTT | `true`（v2 effect writer meta-gradient；clean/legacy 可用 `false`） |
 | register tokens | `16` |

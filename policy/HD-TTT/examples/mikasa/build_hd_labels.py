@@ -144,6 +144,7 @@ def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
         )
     teacher_hd_ttt_enabled = raw.get("hd_ttt_enabled", False)
     teacher_hd_learned_write_gate = raw.get("hd_learned_write_gate", False)
+    teacher_ttt_stable_inner_update = raw.get("ttt_stable_inner_update", False)
     # Early SmolVLA-TTT checkpoints serialized the newly introduced learned
     # gate as JSON ``null``.  That value means "field absent" for those clean
     # checkpoints, not an enabled HD gate; normalize it to the explicit clean
@@ -152,16 +153,20 @@ def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
         teacher_hd_ttt_enabled = False
     if teacher_hd_learned_write_gate is None:
         teacher_hd_learned_write_gate = False
+    if teacher_ttt_stable_inner_update is None:
+        teacher_ttt_stable_inner_update = False
     # Generated draccus configs use JSON booleans.  Reject malformed values
     # instead of allowing e.g. the string ``"false"`` to become truthy and
     # bypass the clean-teacher guard.
     if (
         type(teacher_hd_ttt_enabled) is not bool
         or type(teacher_hd_learned_write_gate) is not bool
+        or type(teacher_ttt_stable_inner_update) is not bool
     ):
         raise ValueError(
             f"Teacher config {config_path} has malformed HD switches; "
-            "hd_ttt_enabled and hd_learned_write_gate must be JSON booleans"
+            "hd_ttt_enabled, hd_learned_write_gate, and "
+            "ttt_stable_inner_update must be JSON booleans"
         )
     if teacher_hd_ttt_enabled or teacher_hd_learned_write_gate:
         raise ValueError(
@@ -219,6 +224,7 @@ def _validate_teacher_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
         "ttt_writer_mode": writer_mode,
         "hd_ttt_enabled": teacher_hd_ttt_enabled,
         "hd_learned_write_gate": teacher_hd_learned_write_gate,
+        "ttt_stable_inner_update": teacher_ttt_stable_inner_update,
         "config_path": str(config_path),
     }
 
@@ -456,6 +462,9 @@ def _run_replay(
     from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
     model = policy.model
+    clear_diagnostics = getattr(model, "clear_ttt_diagnostics", None)
+    if clear_diagnostics is not None:
+        clear_diagnostics()
     images, img_masks = policy.prepare_images(prepared)
     state = policy.prepare_state(prepared)
     actions = policy.prepare_action(prepared)
@@ -501,6 +510,15 @@ def _run_replay(
                 create_graph=False,
                 write_gate=chunk_gate,
                 return_velocity=True,
+            )
+        nonfinite_seen = getattr(model, "ttt_nonfinite_seen", None)
+        if nonfinite_seen is not None and bool(nonfinite_seen().detach().item()):
+            raise FloatingPointError(
+                "Teacher replay encountered a non-finite TTT value; refusing to emit labels"
+            )
+        if not bool(torch.isfinite(velocity).all().item()):
+            raise FloatingPointError(
+                "Teacher replay returned non-finite velocity; refusing to emit labels"
             )
         expected_shape = (end - start, int(policy.config.chunk_size), int(policy.config.max_action_dim))
         if tuple(velocity.shape) != expected_shape:
@@ -740,6 +758,11 @@ def _episode_labels(
                 slot_mode=slot_mode,
             )
         )
+    for replay_index, (velocity, loss) in enumerate(zip(full_velocities, full_losses, strict=True)):
+        if not bool(torch.isfinite(velocity).all().item()) or not bool(torch.isfinite(loss).all().item()):
+            raise FloatingPointError(
+                f"Non-finite full-history teacher replay at branch {replay_index}; refusing labels"
+            )
     full_velocity = full_velocities[0]
     full_loss = torch.stack(full_losses, dim=0).mean(dim=0)
     length = int(full_velocity.shape[0])
@@ -797,6 +820,13 @@ def _episode_labels(
                     slot_mode=slot_mode,
                 )
             )
+
+        for replay_index, (velocity, loss) in enumerate(zip(wrong_velocities, wrong_losses, strict=True)):
+            if not bool(torch.isfinite(velocity).all().item()) or not bool(torch.isfinite(loss).all().item()):
+                raise FloatingPointError(
+                    f"Non-finite counterfactual teacher replay for event {event_index}, "
+                    f"branch {replay_index}; refusing labels"
+                )
 
         if robust_protocol:
             signed = torch.stack(
@@ -1134,6 +1164,7 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
         "teacher_config_sha256",
         "teacher_ttt_layer_indices",
         "teacher_ttt_num_register_tokens",
+        "teacher_ttt_stable_inner_update",
         "teacher_hd_ttt_enabled",
         "teacher_hd_learned_write_gate",
         "seed",
@@ -1157,6 +1188,14 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
             raise ValueError(
                 f"Shard {path} is missing metadata; refusing to merge an unprovenanced HD artifact"
             )
+        # The robust inner-update flag was added after the first HD label
+        # format.  A missing/explicit-null value in a legacy artifact means
+        # the original clean update, so canonicalize it before enforcing the
+        # common metadata contract; malformed non-boolean values remain an
+        # error below.
+        metadata = dict(metadata)
+        if metadata.get("teacher_ttt_stable_inner_update") is None:
+            metadata["teacher_ttt_stable_inner_update"] = False
         missing_metadata = sorted(set(metadata_contract_keys) - set(metadata))
         if missing_metadata:
             raise ValueError(
@@ -1175,13 +1214,17 @@ def _merge_shards(inputs: Sequence[Path], output: Path) -> None:
                 f"Shard {path} has malformed grounding_min_future_frames; "
                 "expected a non-negative int"
             )
-        for flag_name in ("teacher_hd_ttt_enabled", "teacher_hd_learned_write_gate"):
+        for flag_name in (
+            "teacher_hd_ttt_enabled",
+            "teacher_hd_learned_write_gate",
+            "teacher_ttt_stable_inner_update",
+        ):
             flag_value = metadata[flag_name]
             if type(flag_value) is not bool:
                 raise ValueError(
                     f"Shard {path} has malformed {flag_name}; expected a JSON boolean"
                 )
-            if flag_value:
+            if flag_name != "teacher_ttt_stable_inner_update" and flag_value:
                 raise ValueError(
                     f"Shard {path} was generated with an HD teacher; "
                     "the clean/all-write replay contract must be used for hindsight labels"
@@ -1454,6 +1497,9 @@ def _build_shard(args: argparse.Namespace) -> None:
         # particular, a prefix-only checkpoint cannot be silently converted
         # to the legacy suffix writer by the config/checkpoint merge.
         ttt_writer_mode=str(teacher_info.get("ttt_writer_mode", "suffix")),
+        # Keep the offline recurrence identical to the checkpoint whose
+        # provenance is attached to every generated label.
+        ttt_stable_inner_update=bool(teacher_info.get("ttt_stable_inner_update", False)),
     )
     policy = make_policy(config, ds_meta=metadata)
     policy.eval()
@@ -1591,6 +1637,9 @@ def _build_shard(args: argparse.Namespace) -> None:
         "teacher_config_sha256": teacher_info["config_sha256"],
         "teacher_ttt_layer_indices": list(teacher_info["ttt_layer_indices"]),
         "teacher_ttt_num_register_tokens": int(teacher_info["ttt_num_register_tokens"]),
+        "teacher_ttt_stable_inner_update": bool(
+            teacher_info.get("ttt_stable_inner_update", False)
+        ),
         "teacher_ttt_writer_mode": str(teacher_info.get("ttt_writer_mode", "suffix")),
         "teacher_hd_ttt_enabled": bool(teacher_info["hd_ttt_enabled"]),
         "teacher_hd_learned_write_gate": bool(teacher_info["hd_learned_write_gate"]),

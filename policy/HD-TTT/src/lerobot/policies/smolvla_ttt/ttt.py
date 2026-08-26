@@ -68,6 +68,14 @@ class TTTFastState:
 class TTTMLPLayer(nn.Module):
     """RoboTTT update-then-apply layer with a two-layer GeLU fast MLP."""
 
+    # Stable-mode constants are intentionally private and fixed.  Keeping one
+    # boolean mode (rather than exposing several optimizer knobs) makes the
+    # v2 recipe auditable while bounding the learned inner-loop control.
+    _STABLE_LOG_LR_LIMIT = math.log(4.0)
+    _STABLE_RMS_EPS = 1e-6
+    _STABLE_STATE_MIN_RATIO = 0.25
+    _STABLE_STATE_MAX_RATIO = 4.0
+
     def __init__(
         self,
         dim: int,
@@ -78,6 +86,7 @@ class TTTMLPLayer(nn.Module):
         gate_trainable: bool = False,
         rope_theta: float = 10_000.0,
         second_order: bool = True,
+        stable_inner_update: bool = False,
         learned_write_gate: bool = False,
         write_gate_init: float = 0.95,
         write_gate_token_index: int = 0,
@@ -104,6 +113,7 @@ class TTTMLPLayer(nn.Module):
         self.base_inner_lr = base_inner_lr
         self.rope_theta = rope_theta
         self.second_order = second_order
+        self.stable_inner_update = bool(stable_inner_update)
         self.learned_write_gate = learned_write_gate
         self.write_gate_token_index = write_gate_token_index
         self.write_gate_init = write_gate_init
@@ -134,6 +144,15 @@ class TTTMLPLayer(nn.Module):
         self.log_inner_lr_multiplier = nn.Parameter(torch.zeros(()))
         raw_gate = math.atanh(effective_gate_init)
         self.gate = nn.Parameter(torch.full((dim,), raw_gate), requires_grad=gate_trainable)
+        # This non-persistent flag is an observability channel for the stable
+        # recurrence.  Candidate updates may use a finite fallback, but an
+        # upstream non-finite value must remain visible to the trainer rather
+        # than being silently converted into a plausible zero activation.
+        self.register_buffer(
+            "_nonfinite_seen",
+            torch.zeros((), dtype=torch.bool),
+            persistent=False,
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -162,11 +181,150 @@ class TTTMLPLayer(nn.Module):
 
     @property
     def inner_lr(self) -> Tensor:
-        return self.base_inner_lr * self.log_inner_lr_multiplier.exp()
+        if not self.stable_inner_update:
+            # Preserve the original RoboTTT parameterization bit-for-bit for
+            # clean/legacy checkpoints and ordinary TTT ablations.
+            return self.base_inner_lr * self.log_inner_lr_multiplier.exp()
+        # A bounded, finite log multiplier prevents one outer optimizer step
+        # from turning the recurrent update into an unbounded explosion.  The
+        # nan/inf fallback is deliberately deterministic: a malformed outer
+        # value temporarily falls back to the configured base lr and remains
+        # visible through the detached diagnostics.
+        bounded_log_multiplier = torch.nan_to_num(
+            self.log_inner_lr_multiplier,
+            nan=0.0,
+            posinf=self._STABLE_LOG_LR_LIMIT,
+            neginf=-self._STABLE_LOG_LR_LIMIT,
+        ).clamp(-self._STABLE_LOG_LR_LIMIT, self._STABLE_LOG_LR_LIMIT)
+        return self.base_inner_lr * bounded_log_multiplier.exp()
 
     @property
     def effective_gate(self) -> Tensor:
         return torch.tanh(self.gate)
+
+    def clear_nonfinite_diagnostic(self) -> None:
+        """Clear the stable-inner-loop non-finite marker for one outer call."""
+
+        self._nonfinite_seen.zero_()
+
+    @property
+    def nonfinite_seen(self) -> Tensor:
+        """Return a scalar marker consumed by the sequence trainer."""
+
+        return self._nonfinite_seen
+
+    def _record_nonfinite(self, *values: Tensor | None) -> None:
+        """Record malformed stable-path values without synchronizing the host."""
+
+        if not self.stable_inner_update:
+            return
+        for value in values:
+            if not isinstance(value, Tensor):
+                continue
+            if not (value.is_floating_point() or value.is_complex()):
+                continue
+            bad = (~torch.isfinite(value.detach())).any()
+            self._nonfinite_seen.logical_or_(bad.to(device=self._nonfinite_seen.device))
+
+    @staticmethod
+    def _stable_rms(value: Tensor, *, per_trajectory: bool) -> Tensor:
+        """Compute a finite RMS, reducing fast-weight dimensions per sample."""
+
+        value = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if per_trajectory and value.ndim > 1:
+            reduce_dims = tuple(range(1, value.ndim))
+            scale = value.abs().amax(dim=reduce_dims, keepdim=True)
+            normalized = value / scale.clamp_min(TTTMLPLayer._STABLE_RMS_EPS)
+            rms = scale * normalized.square().mean(dim=reduce_dims, keepdim=True).sqrt()
+        else:
+            scale = value.abs().amax().clamp_min(TTTMLPLayer._STABLE_RMS_EPS)
+            normalized = value / scale
+            rms = scale * normalized.square().mean().sqrt()
+        return torch.nan_to_num(rms, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _stable_inner_update(
+        self,
+        weights: tuple[Tensor, ...],
+        gradients: tuple[Tensor, ...],
+        *,
+        detach_inner_lr: bool,
+    ) -> tuple[Tensor, ...]:
+        """Apply a bounded RMS-relative update with a finite fallback.
+
+        The update magnitude is tied to the initial fast-weight scale rather
+        than an ever-growing recurrent state.  Current-state RMS is still
+        used as a bounded trust-region scale (0.25x--4x of the initial RMS),
+        while gradient RMS removes sensitivity to raw K/V activation scale.
+        All constants are fixed implementation details; callers select this
+        path with one config boolean.
+        """
+
+        self._record_nonfinite(*weights, *gradients, self.log_inner_lr_multiplier)
+        inner_lr = self.inner_lr.detach() if detach_inner_lr else self.inner_lr
+        initial_weights = (
+            self.fast_w1_init,
+            self.fast_b1_init,
+            self.fast_w2_init,
+            self.fast_b2_init,
+        )
+        updated: list[Tensor] = []
+        for weight, gradient, initial_weight in zip(
+            weights,
+            gradients,
+            initial_weights,
+            strict=True,
+        ):
+            compute_dtype = torch.float32
+            safe_weight = torch.nan_to_num(
+                weight.to(dtype=compute_dtype),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            safe_gradient = torch.nan_to_num(
+                gradient.to(dtype=compute_dtype),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            state_rms = self._stable_rms(safe_weight, per_trajectory=True)
+            gradient_rms = self._stable_rms(safe_gradient, per_trajectory=True)
+            initial_rms = self._stable_rms(
+                initial_weight.detach().to(dtype=compute_dtype),
+                per_trajectory=False,
+            ).clamp_min(self._STABLE_RMS_EPS)
+            state_scale = state_rms.clamp(
+                min=self._STABLE_STATE_MIN_RATIO * initial_rms,
+                max=self._STABLE_STATE_MAX_RATIO * initial_rms,
+            ).detach()
+            # Do not normalize tiny gradients by their own RMS: that would
+            # turn an almost-zero writer error into an O(learning-rate)
+            # parameter jump.  ``initial_rms`` is a fixed trust scale, so the
+            # small-gradient regime reduces to a raw relative update while
+            # large gradients are clipped to a bounded RMS step.  Detaching
+            # both scales also keeps amax/clamp from introducing fragile
+            # higher-order derivatives; the numerator and bounded learned
+            # inner lr remain differentiable for the v2 effect objective.
+            gradient_scale = torch.maximum(gradient_rms, initial_rms).clamp_min(
+                self._STABLE_RMS_EPS
+            ).detach()
+            normalized_gradient = safe_gradient / gradient_scale
+            step = inner_lr.to(device=safe_weight.device, dtype=compute_dtype) * state_scale * normalized_gradient
+            candidate = safe_weight - step
+            self._record_nonfinite(candidate)
+
+            # Non-finite inputs become a zero/no-op update; a finite state is
+            # preserved if the candidate overflows.  ``where`` keeps the
+            # ordinary finite path differentiable for second-order v2 loss.
+            finite_candidate = torch.isfinite(candidate)
+            finite_fallback = torch.where(
+                torch.isfinite(weight),
+                weight.to(dtype=compute_dtype),
+                torch.zeros_like(safe_weight),
+            )
+            safe_candidate = torch.where(finite_candidate, candidate, finite_fallback)
+            updated.append(safe_candidate.to(dtype=weight.dtype))
+        return tuple(updated)
 
     def initial_state(self, batch_size: int) -> TTTFastState:
         if batch_size <= 0:
@@ -256,8 +414,12 @@ class TTTMLPLayer(nn.Module):
                 )
             writer_mask = writer_mask.to(device=keys.device, dtype=keys.dtype).detach()
 
+        self._record_nonfinite(keys, values, *state.tensors())
+
         def trajectory_loss(prediction: Tensor, target: Tensor) -> Tensor:
             """Reduce writer-token errors without letting padding update state."""
+
+            self._record_nonfinite(prediction, target)
 
             per_token = F.mse_loss(prediction, target, reduction="none").mean(dim=-1)
             if writer_mask is None:
@@ -287,11 +449,21 @@ class TTTMLPLayer(nn.Module):
                     create_graph=False,
                     retain_graph=return_loss,
                 )
-            inner_lr = self.inner_lr.detach()
-            updated_tensors = tuple(
-                (weight - inner_lr * gradient).detach().requires_grad_(True)
-                for weight, gradient in zip(detached_state.tensors(), gradients, strict=True)
-            )
+            if self.stable_inner_update:
+                updated_tensors = tuple(
+                    tensor.detach().requires_grad_(True)
+                    for tensor in self._stable_inner_update(
+                        detached_state.tensors(),
+                        gradients,
+                        detach_inner_lr=True,
+                    )
+                )
+            else:
+                inner_lr = self.inner_lr.detach()
+                updated_tensors = tuple(
+                    (weight - inner_lr * gradient).detach().requires_grad_(True)
+                    for weight, gradient in zip(detached_state.tensors(), gradients, strict=True)
+                )
             if write_gate is not None:
                 # Labels/gates are intervention controls, never writer
                 # parameters in this branch.
@@ -299,6 +471,9 @@ class TTTMLPLayer(nn.Module):
                     dtype=updated_tensors[0].dtype,
                     device=updated_tensors[0].device,
                 )
+                if self.stable_inner_update:
+                    self._record_nonfinite(gate)
+                    gate = torch.nan_to_num(gate, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
                 if gate.ndim == 0:
                     gate = gate.expand(detached_state.batch_size)
                 updated_tensors = tuple(
@@ -331,14 +506,24 @@ class TTTMLPLayer(nn.Module):
             # backpropagate the returned local loss.
             retain_graph=create_graph or return_loss,
         )
-        updated_tensors = tuple(
-            weight - self.inner_lr * gradient
-            for weight, gradient in zip(state.tensors(), gradients, strict=True)
-        )
+        if self.stable_inner_update:
+            updated_tensors = self._stable_inner_update(
+                state.tensors(),
+                gradients,
+                detach_inner_lr=False,
+            )
+        else:
+            updated_tensors = tuple(
+                weight - self.inner_lr * gradient
+                for weight, gradient in zip(state.tensors(), gradients, strict=True)
+            )
         if write_gate is not None:
             # Interpolation keeps a learned H2L gate differentiable; a zero gate
             # is still an exact HCA event-skip intervention.
             gate = write_gate.to(dtype=updated_tensors[0].dtype, device=updated_tensors[0].device)
+            if self.stable_inner_update:
+                self._record_nonfinite(gate)
+                gate = torch.nan_to_num(gate, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
             if gate.ndim == 0:
                 gate = gate.expand(state.batch_size)
             updated_tensors = tuple(
@@ -533,6 +718,7 @@ class TTTMLPLayer(nn.Module):
             state_trace: list[TTTFastState] = []
             local_losses: list[Tensor] = []
             for timestep_index, timestep_inputs in enumerate(projected_inputs.unbind(dim=1)):
+                self._record_nonfinite(timestep_inputs)
                 normalized_inputs = F.layer_norm(timestep_inputs, (self.dim,))
                 timestep_position = state.position + 1 if update else state.position.clamp_min(0)
                 # Queries and writer keys must share one physical-position
@@ -557,6 +743,7 @@ class TTTMLPLayer(nn.Module):
                     + torch.arange(timestep_inputs.shape[1], device=inputs.device)[None, :]
                 )
                 queries = self._apply_rope(self.q_proj(normalized_inputs), token_positions)
+                self._record_nonfinite(queries)
                 if update:
                     writer_timestep_inputs = (
                         normalized_inputs
@@ -566,6 +753,7 @@ class TTTMLPLayer(nn.Module):
                             (self.dim,),
                         )
                     )
+                    self._record_nonfinite(writer_timestep_inputs)
                     writer_token_positions = (
                         timestep_position[:, None] * token_stride
                         + torch.arange(
@@ -613,7 +801,15 @@ class TTTMLPLayer(nn.Module):
 
                 ttt_output = self._fast_mlp(queries, state)
                 residual_gate = self.effective_gate.detach() if detach_writer else self.effective_gate
-                outputs.append(timestep_inputs + residual_gate * ttt_output)
+                if self.stable_inner_update:
+                    self._record_nonfinite(residual_gate, ttt_output)
+                    residual_gate = torch.nan_to_num(
+                        residual_gate, nan=0.0, posinf=1.0, neginf=-1.0
+                    ).clamp(-1.0, 1.0)
+                    ttt_output = torch.nan_to_num(ttt_output, nan=0.0, posinf=0.0, neginf=0.0)
+                output_step = timestep_inputs + residual_gate * ttt_output
+                self._record_nonfinite(output_step)
+                outputs.append(output_step)
                 if return_state_trace:
                     state_trace.append(state.clone(detach=False, requires_grad=False))
 

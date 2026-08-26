@@ -129,6 +129,57 @@ def _hd_ttt_parameter_range_metrics(ttt_layers: nn.ModuleDict | None) -> dict[st
     return metrics
 
 
+def _ttt_state_scale_metrics(
+    ttt_layers: nn.ModuleDict | None,
+    fast_states: TTTFastStates | None,
+) -> dict[str, float]:
+    """Report recurrent-state RMS relative to each layer's initialization.
+
+    The stable update bounds each *step*, so a long episode could still drift
+    through many aligned writes.  These detached diagnostics make that failure
+    mode measurable without projecting or decaying the memory state before an
+    experiment shows it is necessary.
+    """
+
+    if ttt_layers is None or not fast_states:
+        return {}
+
+    def rms(value: Tensor, reduce_dims: tuple[int, ...]) -> Tensor:
+        value = value.detach().float()
+        scale = value.abs().amax(dim=reduce_dims, keepdim=True)
+        normalized = value / scale.clamp_min(1e-12)
+        return scale * normalized.square().mean(dim=reduce_dims, keepdim=True).sqrt()
+
+    ratios: list[Tensor] = []
+    for layer_index, state in fast_states.items():
+        layer_key = str(layer_index)
+        if layer_key not in ttt_layers:
+            continue
+        layer = ttt_layers[layer_key]
+        initial_tensors = (
+            layer.fast_w1_init,
+            layer.fast_b1_init,
+            layer.fast_w2_init,
+            layer.fast_b2_init,
+        )
+        for state_tensor, initial_tensor in zip(
+            state.tensors(), initial_tensors, strict=True
+        ):
+            state_dims = tuple(range(1, state_tensor.ndim))
+            initial_dims = tuple(range(initial_tensor.ndim))
+            state_rms = rms(state_tensor, state_dims).reshape(-1)
+            initial_rms = rms(initial_tensor, initial_dims).reshape(()).clamp_min(1e-12)
+            ratios.append(state_rms / initial_rms)
+    if not ratios:
+        return {}
+    values = torch.cat(ratios)
+    return {
+        "ttt_state_rms_ratio_min": float(values.amin().item()),
+        "ttt_state_rms_ratio_mean": float(values.mean().item()),
+        "ttt_state_rms_ratio_max": float(values.amax().item()),
+    }
+
+
 _CHECKPOINT_ARCHITECTURE_FIELDS = {
     "n_obs_steps",
     "chunk_size",
@@ -152,6 +203,7 @@ _CHECKPOINT_ARCHITECTURE_FIELDS = {
     "ttt_effective_gate_init",
     "ttt_rope_theta",
     "ttt_second_order",
+    "ttt_stable_inner_update",
     "ttt_start_layer",
     "ttt_layer_indices",
     "ttt_writer_mode",
@@ -213,6 +265,27 @@ def _restore_checkpoint_model_fields(
     }
     requested_writer_mode = str(getattr(config, "ttt_writer_mode", None) or "suffix")
     source_writer_mode = str(getattr(source_config, "ttt_writer_mode", None) or "suffix")
+    # ``ttt_stable_inner_update`` is a checkpoint-owned numerical mode by
+    # default, but the v2 recipe must be able to opt in while initializing from
+    # a clean/legacy teacher (and a clean evaluation must be able to opt out of
+    # an HD/stable checkpoint).  A mismatch between the parser's requested
+    # config and the source value is the only explicit-override signal exposed
+    # by the direct helper, so preserve that requested value after the generic
+    # architecture restore below.
+    requested_stable_inner_update = bool(
+        getattr(config, "ttt_stable_inner_update", False)
+    )
+    source_stable_inner_update = bool(
+        getattr(source_config, "ttt_stable_inner_update", False)
+    )
+    # A ``True`` request is unambiguously an opt-in (needed when converting a
+    # clean/legacy teacher to the robust v2 student).  A ``False`` value on a
+    # hand-built target is not distinguishable from the dataclass default; in
+    # the normal parser path an unoverridden target already inherits the source
+    # value, so source-owned ``True`` remains the safe default here.
+    explicit_stable_override = (
+        requested_stable_inner_update and not source_stable_inner_update
+    )
     # The v2 action-effect objective is a deliberate structural conversion
     # from an ordinary first-order TTT checkpoint to a differentiable
     # (second-order) inner update.  ``ttt_second_order`` lives in the
@@ -254,6 +327,8 @@ def _restore_checkpoint_model_fields(
     if explicit_hd_override:
         for field_name, value in requested_hd.items():
             setattr(config, field_name, value)
+    if explicit_stable_override:
+        config.ttt_stable_inner_update = requested_stable_inner_update
     # A writer-mode mismatch is an intentional structural conversion in the
     # v2 recipe (clean suffix teacher -> prefix-only student).  Preserve the
     # caller's requested mode in that case; otherwise inherit the checkpoint
@@ -545,7 +620,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         # spelling into a non-optional bool, even though the semantic value
         # is the disabled/clean path.  Normalize only these historical flags;
         # every other malformed field must still fail loudly during decoding.
-        for flag_name in ("hd_ttt_enabled", "hd_learned_write_gate"):
+        for flag_name in (
+            "hd_ttt_enabled",
+            "hd_learned_write_gate",
+            "ttt_stable_inner_update",
+        ):
             if values.get(flag_name) is None:
                 values[flag_name] = False
         # The v2 fields were added after several internal checkpoints had
@@ -1880,6 +1959,12 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 f"but the action batch has {batch[ACTION].shape[0]}"
             )
 
+        # A segment may execute the main, true-replay, and wrong-replay paths
+        # below. Clear once before all of them so the finite marker covers the
+        # complete outer update, while the trainer can fail before backward or
+        # optimizer.step if any branch encountered a malformed value.
+        self.model.clear_ttt_diagnostics()
+
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
@@ -2332,6 +2417,20 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 )
             )
 
+        if bool(getattr(self.config, "ttt_stable_inner_update", False)):
+            # Stable mode may use a finite candidate fallback, but the
+            # occurrence is still surfaced so it cannot be mistaken for a
+            # completely healthy batch.  This scalar is observational only.
+            loss_dict["ttt_nonfinite_seen"] = float(
+                self.model.ttt_nonfinite_seen().detach().item()
+            )
+            loss_dict.update(
+                _ttt_state_scale_metrics(
+                    getattr(self.model, "ttt_layers", None),
+                    fast_states,
+                )
+            )
+
         if reduction == "none":
             if actions_is_pad is None:
                 per_sample_loss = losses.mean(dim=(1, 2))
@@ -2598,6 +2697,7 @@ class SmolVLATTTFlowMatching(nn.Module):
                     gate_trainable=config.trains_gate,
                     rope_theta=config.ttt_rope_theta,
                     second_order=config.ttt_second_order,
+                    stable_inner_update=getattr(config, "ttt_stable_inner_update", False),
                     # One scalar gate is shared by all selected TTT layers for
                     # each physical interaction.  Predict it at the first
                     # selected layer so later layers cannot disagree about
@@ -2667,6 +2767,26 @@ class SmolVLATTTFlowMatching(nn.Module):
                 self.action_time_mlp_out,
             ):
                 module.requires_grad_(True)
+
+    def clear_ttt_diagnostics(self) -> None:
+        """Clear per-call numerical diagnostics for every selected TTT layer."""
+
+        for layer in self.ttt_layers.values():
+            clear = getattr(layer, "clear_nonfinite_diagnostic", None)
+            if clear is not None:
+                clear()
+
+    def ttt_nonfinite_seen(self) -> Tensor:
+        """Return a device-local marker for any non-finite stable-path value."""
+
+        flags = [
+            layer.nonfinite_seen
+            for layer in self.ttt_layers.values()
+            if hasattr(layer, "nonfinite_seen")
+        ]
+        if not flags:
+            return self.action_in_proj.weight.new_zeros((), dtype=torch.bool)
+        return torch.stack([flag.to(device=flags[0].device) for flag in flags]).any()
 
     def train(self, mode: bool = True):
         nn.Module.train(self, mode)
@@ -3417,6 +3537,7 @@ class SmolVLATTTFlowMatching(nn.Module):
     ) -> tuple[Tensor, TTTFastStates]:
         """Denoise an action chunk while advancing TTT memory exactly once."""
         fast_states = {} if fast_states is None else dict(fast_states)
+        self.clear_ttt_diagnostics()
         sequence_shape = (state.shape[0], 1)
 
         def callback_factory(update: bool):
@@ -3441,6 +3562,12 @@ class SmolVLATTTFlowMatching(nn.Module):
             _expert_layer_callback_factory=callback_factory,
             **kwargs,
         )
+        if bool(getattr(self.config, "ttt_stable_inner_update", False)) and bool(
+            self.ttt_nonfinite_seen().detach().item()
+        ):
+            raise RuntimeError(
+                "Stable SmolVLA-TTT encountered a non-finite inner value during inference"
+            )
         return actions, fast_states
 
     def denoise_step(

@@ -22,6 +22,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -89,6 +90,175 @@ from .lerobot_eval import eval_policy_all
 # frame/window label artifact generated with a different rule can have a
 # single-branch ``hd_rho`` that no longer matches its stored wrong velocity.
 _HD_GROUNDING_EVENT_POLICY = "min_future_horizon_mean_else_total_credit"
+
+
+def _hd_ttt_finite_guard(
+    *,
+    policy: torch.nn.Module | None = None,
+    loss: Any = None,
+    grad_norm: Any = None,
+    fast_states: Any = None,
+    observations: tuple[tuple[str, Any], ...] = (),
+    accelerator: "Accelerator | None" = None,
+    stage: str,
+    segment_index: int | None = None,
+    check_gradients: bool = True,
+    check_parameters: bool = True,
+) -> None:
+    """Fail a HD-TTT update before ``optimizer.step`` can poison a checkpoint.
+
+    The sequence trainer owns the only custom optimizer path for HD-TTT.  A
+    non-finite inner-loop state can otherwise reach the outer optimizer after
+    gradient clipping (``clip_grad_norm_`` is intentionally configured not to
+    raise).  This guard is deliberately a no-op unless its caller is on the
+    HD path; ordinary LeRobot and clean TTT updates never call it.
+
+    In distributed training every rank participates in one small reduction of
+    a bad-value flag.  Thus a rank that observes a bad local batch causes all
+    ranks to raise together instead of leaving a collective or dataloader
+    deadlocked.  The check happens before the optimizer step, so the in-memory
+    parameters and the last checkpoint written by the training loop remain
+    finite and untouched.
+    """
+
+    # Keep the values around for a detailed message only if the global flag is
+    # bad.  The finite reductions themselves stay on-device and incur one host
+    # synchronization, rather than one synchronization per parameter tensor.
+    tensor_values: list[tuple[str, torch.Tensor]] = []
+    python_bad_names: list[str] = []
+
+    def collect(name: str, value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, torch.Tensor):
+            tensor_values.append((name, value))
+            return
+        # ``TTTFastState`` is intentionally a small dataclass and importing it
+        # here would pull the policy implementation into ordinary LeRobot
+        # training.  Duck-typing its public ``tensors`` method keeps this
+        # guard local to the trainer while still checking every recurrent
+        # weight in an HD replay.
+        tensors_method = getattr(value, "tensors", None)
+        if callable(tensors_method):
+            try:
+                for index, nested in enumerate(tensors_method()):
+                    collect(f"{name}.tensors[{index}]", nested)
+            except (TypeError, RuntimeError):
+                python_bad_names.append(f"{name}(uncheckable)")
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                collect(f"{name}.{key}", nested)
+            return
+        if isinstance(value, (tuple, list)):
+            for index, nested in enumerate(value):
+                collect(f"{name}[{index}]", nested)
+            return
+        try:
+            if name.endswith("nonfinite_seen") and bool(value):
+                python_bad_names.append(name)
+                return
+            if not math.isfinite(float(value)):
+                python_bad_names.append(name)
+        except (TypeError, ValueError):
+            # Non-numeric diagnostics are not part of the finite contract.
+            return
+
+    collect("loss", loss)
+    collect("grad_norm", grad_norm)
+    collect("fast_state", fast_states)
+    for name, value in observations:
+        collect(name, value)
+
+    if policy is not None:
+        for parameter_name, parameter in policy.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if check_parameters:
+                collect(f"parameter:{parameter_name}", parameter)
+            if check_gradients and parameter.grad is not None:
+                gradient = parameter.grad
+                # ``isfinite`` does not operate on sparse layouts on all
+                # supported torch versions; checking sparse values is enough.
+                if gradient.is_sparse:
+                    gradient = gradient.coalesce().values()
+                collect(f"gradient:{parameter_name}", gradient)
+
+    # Select a device without importing/constructing an Accelerator on the
+    # ordinary path.  All model tensors normally share the accelerator device;
+    # moving only the scalar flags also handles CPU-only unit tests.
+    if accelerator is not None and hasattr(accelerator, "device"):
+        flag_device = accelerator.device
+    elif tensor_values:
+        flag_device = tensor_values[0][1].device
+    else:
+        flag_device = torch.device("cpu")
+
+    finite_flags: list[torch.Tensor] = []
+    for name, value in tensor_values:
+        if value.numel() == 0 or not (value.is_floating_point() or value.is_complex()):
+            if name.endswith("nonfinite_seen") and value.numel() > 0:
+                finite_flags.append(
+                    value.detach().bool().any().to(device=flag_device, dtype=torch.int32)
+                )
+            continue
+        if name.endswith("nonfinite_seen"):
+            finite_flags.append(
+                value.detach().bool().any().to(device=flag_device, dtype=torch.int32)
+            )
+        finite_flags.append(
+            (~torch.isfinite(value.detach()).all()).to(device=flag_device, dtype=torch.int32)
+        )
+    if finite_flags:
+        local_bad = torch.stack(finite_flags).amax()
+    else:
+        local_bad = torch.zeros((), device=flag_device, dtype=torch.int32)
+    if python_bad_names:
+        local_bad = torch.maximum(local_bad, torch.ones_like(local_bad))
+
+    if accelerator is not None and getattr(accelerator, "num_processes", 1) > 1:
+        global_bad = accelerator.reduce(local_bad, reduction="sum")
+        has_bad_value = bool(global_bad.detach().item() > 0)
+    else:
+        has_bad_value = bool(local_bad.detach().item() != 0)
+    if not has_bad_value:
+        return
+
+    # Only inspect individual tensors after the aggregate flag is bad.  This
+    # keeps the normal step cheap while still making the failure actionable.
+    bad_names = list(python_bad_names)
+    for name, value in tensor_values:
+        if value.numel() == 0 or not (value.is_floating_point() or value.is_complex()):
+            continue
+        try:
+            if name.endswith("nonfinite_seen") and bool(value.detach().bool().any().item()):
+                bad_names.append(name)
+            elif not bool(torch.isfinite(value.detach()).all().item()):
+                bad_names.append(name)
+        except RuntimeError:
+            bad_names.append(f"{name}(uncheckable)")
+        if len(bad_names) >= 8:
+            break
+    if not bad_names:
+        bad_names.append("another distributed rank")
+    location = stage
+    if segment_index is not None:
+        location = f"{location}, segment={segment_index}"
+    raise RuntimeError(
+        "HD-TTT finite guard failed before optimizer.step "
+        f"({location}): non-finite {', '.join(bad_names[:8])}. "
+        "The optimizer step was not executed; in-memory parameters and the "
+        "last finite checkpoint remain untouched."
+    )
+
+
+def _ttt_finite_guard_enabled(policy_config: Any) -> bool:
+    """Enable the pre-step finite guard for robust HD or stable TTT runs."""
+
+    return bool(
+        getattr(policy_config, "hd_ttt_enabled", False)
+        or getattr(policy_config, "ttt_stable_inner_update", False)
+    )
 
 
 def _teacher_config_sha256(checkpoint: str | Path | None) -> str:
@@ -212,6 +382,13 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
             "HD label artifacts must include guarded provenance metadata; "
             "regenerate labels with build_hd_labels.py"
         )
+    # The bounded inner-update mode was added after the first HD artifacts.
+    # Missing/explicit-null has the legacy clean semantics; materialize that
+    # default locally so the contract below can compare a real boolean without
+    # mutating the serialized dataset object.
+    metadata = dict(metadata)
+    if metadata.get("teacher_ttt_stable_inner_update") is None:
+        metadata["teacher_ttt_stable_inner_update"] = False
     # v2 hindsight artifacts carry an explicit causal-credit protocol.  Legacy
     # files predate this field and are interpreted as the raw-hinge protocol;
     # this keeps old checkpoints loadable while preventing a silent mix of
@@ -303,6 +480,7 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
         "teacher_config_sha256",
         "teacher_ttt_layer_indices",
         "teacher_ttt_num_register_tokens",
+        "teacher_ttt_stable_inner_update",
         "teacher_hd_ttt_enabled",
         "teacher_hd_learned_write_gate",
         "seed",
@@ -402,6 +580,29 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
                 "teacher_hd_learned_write_gate=false; regenerate labels with "
                 "the clean/all-write replay teacher"
             )
+    artifact_stable_inner_update = metadata.get("teacher_ttt_stable_inner_update")
+    if type(artifact_stable_inner_update) is not bool:
+        raise ValueError(
+            "HD labels have malformed teacher_ttt_stable_inner_update; "
+            "expected a JSON boolean"
+        )
+    expected_stable_inner_update = bool(
+        getattr(policy_cfg, "ttt_stable_inner_update", False)
+    )
+    if artifact_stable_inner_update != expected_stable_inner_update:
+        raise ValueError(
+            "HD teacher/student stable-inner-update mismatch: artifact teacher="
+            f"{artifact_stable_inner_update}, student={expected_stable_inner_update}; "
+            "regenerate labels with the same ttt_stable_inner_update setting"
+        )
+    if (
+        float(getattr(policy_cfg, "hd_effect_weight", 0.0) or 0.0) > 0.0
+        and not expected_stable_inner_update
+    ):
+        raise ValueError(
+            "HD v2 action-effect training requires policy.ttt_stable_inner_update=true; "
+            "set the robust recurrence explicitly in the v2 recipe"
+        )
     if str(metadata.get("teacher_checkpoint")) != str(metadata.get("checkpoint")):
         raise ValueError(
             "HD label teacher_checkpoint and checkpoint provenance disagree; regenerate the artifact"
@@ -743,6 +944,7 @@ def update_policy_tbptt(
     batch_size, sequence_length = sequence_shape
     fast_states = None
     policy_config = getattr(unwrapped_policy, "config", None)
+    finite_guard_enabled = _ttt_finite_guard_enabled(policy_config)
     # v2 HD batches contain per-frame action-effect targets.  Their auxiliary
     # terms are normalized by the complete physical window inside the policy,
     # so the trainer must weight only the flow numerator per segment.  This is
@@ -846,6 +1048,24 @@ def update_policy_tbptt(
             # attenuate warm-up/effect supervision by the action-valid mask.
             weighted_segment_loss = segment_loss if use_global_hd_normalization else segment_loss * segment_weight
 
+        if finite_guard_enabled:
+            # Check before autograd can propagate a malformed segment.  The
+            # distributed reduction inside the guard makes this collective
+            # safe even when only one rank receives a bad window.
+            _hd_ttt_finite_guard(
+                loss=weighted_segment_loss,
+                fast_states=fast_states,
+                observations=(
+                    ("segment_loss_per_dim", segment_output.get("loss_per_dim")),
+                    ("ttt_nonfinite_seen", segment_output.get("ttt_nonfinite_seen")),
+                ),
+                accelerator=accelerator,
+                stage="segment loss before backward",
+                segment_index=segment_index,
+                check_gradients=False,
+                check_parameters=False,
+            )
+
         accelerator.backward(weighted_segment_loss)
         total_loss += weighted_segment_loss.detach()
         segment_loss_per_dim = torch.tensor(
@@ -875,6 +1095,20 @@ def update_policy_tbptt(
                 auxiliary_metric_sums[metric_name] = auxiliary_metric_sums.get(metric_name, 0.0) + float(
                     metric_value
                 ) * metric_weight
+            elif metric_name.startswith("ttt_"):
+                value = float(metric_value)
+                if metric_name.endswith("_max") or metric_name == "ttt_nonfinite_seen":
+                    auxiliary_metric_sums[metric_name] = max(
+                        auxiliary_metric_sums.get(metric_name, value), value
+                    )
+                elif metric_name.endswith("_min"):
+                    auxiliary_metric_sums[metric_name] = min(
+                        auxiliary_metric_sums.get(metric_name, value), value
+                    )
+                else:
+                    auxiliary_metric_sums[metric_name] = auxiliary_metric_sums.get(
+                        metric_name, 0.0
+                    ) + value * segment_weight
         fast_states = {
             layer_index: fast_state.detach() for layer_index, fast_state in fast_states.items()
         }
@@ -910,9 +1144,36 @@ def update_policy_tbptt(
         loss_per_dim = accelerator.reduce(loss_per_dim, reduction="mean")
         for metric_name, metric_value in list(auxiliary_metric_sums.items()):
             metric_tensor = torch.tensor(metric_value, device=accelerator.device)
+            if metric_name.endswith("_max") or metric_name == "ttt_nonfinite_seen":
+                reduction = "max"
+            elif metric_name.endswith("_min"):
+                reduction = "min"
+            else:
+                reduction = "mean"
             auxiliary_metric_sums[metric_name] = float(
-                accelerator.reduce(metric_tensor, reduction="mean").item()
+                accelerator.reduce(metric_tensor, reduction=reduction).item()
             )
+
+    if finite_guard_enabled:
+        # This is the last point before gradient clipping and the optimizer
+        # step.  A bad loss, gradient, recurrent fast state, or parameter is
+        # therefore reported without allowing any mutation by the optimizer.
+        _hd_ttt_finite_guard(
+            policy=policy,
+            loss=total_loss,
+            fast_states=fast_states,
+            observations=(
+                ("loss_per_dim", loss_per_dim),
+                (
+                    "ttt_nonfinite_seen",
+                    segment_output.get("ttt_nonfinite_seen")
+                    if "segment_output" in locals()
+                    else None,
+                ),
+            ),
+            accelerator=accelerator,
+            stage="before gradient clipping",
+        )
 
     # Report a single sequence-level balance value.  For v2, each HD scalar is
     # already normalized by the complete physical-frame denominator and each
@@ -936,6 +1197,19 @@ def update_policy_tbptt(
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), float("inf"), error_if_nonfinite=False
+        )
+
+    if finite_guard_enabled:
+        # Clipping can itself produce an infinite norm for otherwise finite
+        # but overflowing gradients.  Check again after clipping and still
+        # abort before entering the lock/optimizer section.
+        _hd_ttt_finite_guard(
+            policy=policy,
+            loss=total_loss,
+            grad_norm=grad_norm,
+            fast_states=fast_states,
+            accelerator=accelerator,
+            stage="after gradient clipping",
         )
 
     with lock if lock is not None else nullcontext():
@@ -980,6 +1254,8 @@ def update_policy_tbptt(
         "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
         "tbptt_segments": num_segments,
     }
+    if "segment_output" in locals() and "ttt_nonfinite_seen" in segment_output:
+        output_dict["ttt_nonfinite_seen"] = segment_output["ttt_nonfinite_seen"]
     output_dict.update(auxiliary_metric_sums)
     return train_metrics, output_dict
 
@@ -1354,6 +1630,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             "hd_ttt_effective_gate_max",
         ):
             train_metrics[metric_name] = AverageMeter(metric_name, ":.5f")
+    if is_smolvla_ttt and getattr(cfg.policy, "ttt_stable_inner_update", False):
+        for metric_name in (
+            "ttt_nonfinite_seen",
+            "ttt_state_rms_ratio_min",
+            "ttt_state_rms_ratio_mean",
+            "ttt_state_rms_ratio_max",
+        ):
+            train_metrics[metric_name] = AverageMeter(metric_name, ":.5f")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
     effective_batch_size = cfg.batch_size * accelerator.num_processes
@@ -1448,6 +1732,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "hd_ttt_inner_lr_max",
                 "hd_ttt_effective_gate_min",
                 "hd_ttt_effective_gate_max",
+            ):
+                if metric_name in output_dict:
+                    setattr(train_tracker, metric_name, output_dict[metric_name])
+        if is_smolvla_ttt and getattr(cfg.policy, "ttt_stable_inner_update", False):
+            for metric_name in (
+                "ttt_nonfinite_seen",
+                "ttt_state_rms_ratio_min",
+                "ttt_state_rms_ratio_mean",
+                "ttt_state_rms_ratio_max",
             ):
                 if metric_name in output_dict:
                     setattr(train_tracker, metric_name, output_dict[metric_name])

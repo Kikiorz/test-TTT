@@ -55,6 +55,30 @@ def test_teacher_checkpoint_contract_preserves_prefix_writer_mode(tmp_path) -> N
     info = builder._validate_teacher_checkpoint(checkpoint)
 
     assert info["ttt_writer_mode"] == "prefix_only"
+    assert info["ttt_stable_inner_update"] is False
+
+
+def test_teacher_checkpoint_contract_normalizes_nullable_stable_flag(tmp_path) -> None:
+    builder = _load_builder()
+    checkpoint = tmp_path / "legacy_teacher"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "smolvla_ttt",
+                "hd_ttt_enabled": False,
+                "hd_learned_write_gate": False,
+                "ttt_layer_indices": [12, 13, 14, 15],
+                "ttt_num_register_tokens": 16,
+                "ttt_stable_inner_update": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    info = builder._validate_teacher_checkpoint(checkpoint)
+
+    assert info["ttt_stable_inner_update"] is False
 
 
 def test_selected_grounding_event_uses_total_credit_for_short_episode() -> None:

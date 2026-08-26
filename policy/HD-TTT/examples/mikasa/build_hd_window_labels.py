@@ -232,6 +232,10 @@ def _build_shard(args: argparse.Namespace) -> None:
         # Keep offline replay on the exact writer path serialized by the
         # teacher checkpoint (prefix-only vs legacy suffix).
         ttt_writer_mode=str(teacher_info.get("ttt_writer_mode", "suffix")),
+        # Preserve the teacher's numerical recurrence mode in the label
+        # provenance.  The builder itself runs a frozen replay, but a student
+        # must use the same mode when consuming these window-local labels.
+        ttt_stable_inner_update=bool(teacher_info.get("ttt_stable_inner_update", False)),
     )
     policy = make_policy(config, ds_meta=metadata)
     policy.eval()
@@ -372,6 +376,9 @@ def _build_shard(args: argparse.Namespace) -> None:
             "teacher_config_sha256": teacher_info["config_sha256"],
             "teacher_ttt_layer_indices": list(teacher_info["ttt_layer_indices"]),
             "teacher_ttt_num_register_tokens": int(teacher_info["ttt_num_register_tokens"]),
+            "teacher_ttt_stable_inner_update": bool(
+                teacher_info.get("ttt_stable_inner_update", False)
+            ),
             "teacher_ttt_writer_mode": str(teacher_info.get("ttt_writer_mode", "suffix")),
             "teacher_hd_ttt_enabled": bool(teacher_info["hd_ttt_enabled"]),
             "teacher_hd_learned_write_gate": bool(teacher_info["hd_learned_write_gate"]),
@@ -443,6 +450,7 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
         "teacher_config_sha256",
         "teacher_ttt_layer_indices",
         "teacher_ttt_num_register_tokens",
+        "teacher_ttt_stable_inner_update",
         "teacher_hd_ttt_enabled",
         "teacher_hd_learned_write_gate",
         "action_chunk_size",
@@ -458,6 +466,11 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
         if not isinstance(shard_meta, Mapping):
             raise ValueError(f"Shard {path} is missing metadata")
         shard_meta = dict(shard_meta)
+        # Legacy window artifacts predate the robust recurrence field.  Missing
+        # or explicit-null means the original clean update; normalize before
+        # checking the shared contract while rejecting malformed values below.
+        if shard_meta.get("teacher_ttt_stable_inner_update") is None:
+            shard_meta["teacher_ttt_stable_inner_update"] = False
         protocol = shard_meta.get("attribution_protocol", HD_ATTRIBUTION_PROTOCOL_LEGACY)
         if protocol in {"legacy", "v1"}:
             protocol = HD_ATTRIBUTION_PROTOCOL_LEGACY
@@ -517,13 +530,17 @@ def _merge_shards(inputs: list[Path], output: Path) -> None:
                 f"Shard {path} has malformed grounding_min_future_frames; "
                 "expected a non-negative int"
             )
-        for flag_name in ("teacher_hd_ttt_enabled", "teacher_hd_learned_write_gate"):
+        for flag_name in (
+            "teacher_hd_ttt_enabled",
+            "teacher_hd_learned_write_gate",
+            "teacher_ttt_stable_inner_update",
+        ):
             flag_value = shard_meta[flag_name]
             if type(flag_value) is not bool:
                 raise ValueError(
                     f"Shard {path} has malformed {flag_name}; expected a JSON boolean"
                 )
-            if flag_value:
+            if flag_name != "teacher_ttt_stable_inner_update" and flag_value:
                 raise ValueError(
                     f"Shard {path} was generated with an HD teacher; "
                     "the clean/all-write replay contract must be used for hindsight labels"
