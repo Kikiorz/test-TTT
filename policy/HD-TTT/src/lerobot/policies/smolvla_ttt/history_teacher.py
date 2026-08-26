@@ -218,6 +218,8 @@ def summarize_prefix(
             "prefix_embeddings must have shape [B,P,D] or [B,T,P,D], got "
             f"{tuple(prefix_embeddings.shape)}"
         )
+    if prefix_embeddings.shape[-2] <= 0:
+        raise ValueError("prefix_embeddings must contain at least one prefix token")
     if not prefix_embeddings.is_floating_point():
         raise ValueError("prefix_embeddings must be a floating-point tensor")
     mask = prefix_valid_mask
@@ -379,6 +381,8 @@ class CausalHistoryTeacher(nn.Module):
         if not event_tokens.is_floating_point():
             raise ValueError("event_tokens must be floating-point")
         batch_size, steps, event_dim = event_tokens.shape
+        if steps <= 0:
+            raise ValueError("event_tokens must contain at least one timestep")
         if event_dim != self.event_dim:
             raise ValueError(
                 f"event_tokens feature dim must be {self.event_dim}, got {event_dim}"
@@ -697,6 +701,8 @@ class HistoryPrefixConditioner(nn.Module):
                 f"{tuple(prefix_embeddings.shape)}"
             )
         batch_size, steps, prefix_length, prefix_dim = prefix_embeddings.shape
+        if steps <= 0 or prefix_length <= 0:
+            raise ValueError("prefix sequence must contain at least one timestep and prefix token")
         expected_mask_shape = (batch_size, steps, prefix_length)
         if prefix_pad_mask.shape != expected_mask_shape:
             raise ValueError(
@@ -713,11 +719,14 @@ class HistoryPrefixConditioner(nn.Module):
                 "memory_tokens must have shape [B,T,M] matching prefix sequence; got "
                 f"{tuple(memory_tokens.shape)}"
             )
-        if memory_valid is not None and memory_valid.shape != (batch_size, steps):
-            raise ValueError(
-                "memory_valid must have shape [B,T] matching prefix sequence; got "
-                f"{tuple(memory_valid.shape)}"
-            )
+        if memory_valid is not None:
+            if not isinstance(memory_valid, Tensor):
+                memory_valid = torch.as_tensor(memory_valid, device=prefix_embeddings.device)
+            if memory_valid.shape != (batch_size, steps):
+                raise ValueError(
+                    "memory_valid must have shape [B,T] matching prefix sequence; got "
+                    f"{tuple(memory_valid.shape)}"
+                )
         flattened_valid = None if memory_valid is None else memory_valid.reshape(batch_size * steps)
         conditioned = self.forward(
             prefix_embeddings.reshape(batch_size * steps, prefix_length, prefix_dim),
