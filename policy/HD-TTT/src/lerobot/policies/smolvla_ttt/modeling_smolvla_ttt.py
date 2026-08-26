@@ -3955,9 +3955,14 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 else:
                     qh2l_loss, v3_metrics = _qh2l_call()
                     cmd_loss, cmd_metrics = _cmd_call()
-                streamed_v3_loss = float(
+                # The callback applies each objective's configured weight to
+                # its backward call.  Mirror those weights in the detached
+                # scalar returned to the trainer so logged/flow totals remain
+                # exactly the same as the historical combined loss when an
+                # ablation uses non-unit QH2L/CMD coefficients.
+                streamed_v3_loss = v3_local_weight * float(
                     v3_metrics.get("hd_v3_qh2l_streamed_loss", 0.0)
-                ) + float(cmd_metrics.get("hd_v3_cmd_streamed_loss", 0.0))
+                ) + v3_cmd_weight * float(cmd_metrics.get("hd_v3_cmd_streamed_loss", 0.0))
                 bind_loss = (
                     local_ttt_loss.sum()
                     / torch.as_tensor(
