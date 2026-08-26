@@ -58,6 +58,8 @@ Useful overrides:
   TASK_ID=color|shuffle_long|shell_touch|intercept_medium|remember_color3|remember_color9,
   TRAIN_EPISODE_END=250 (canonical: all 250 demos),
   FEATURE_EPISODE_END=250, OUTPUT_ROOT=..., SEED=1000,
+  EPOCHS=100 (canonical student minimum; one sequence epoch = one pass over
+  the selected episode windows),
   NATIVE_CHECKPOINT=..., CLEAN_CHECKPOINT=...
 
 The V3 loss weights are exposed for explicitly named ablations/smoke tests
@@ -206,7 +208,13 @@ case "${V3_ABLATION}" in
     exit 2
     ;;
 esac
-EPOCHS="${EPOCHS:-20}"
+# The paper recipe trains each task-specific student for at least 100 complete
+# passes over the selected episode windows.  A shorter run is allowed only
+# when the caller explicitly marks it as a smoke/pilot run; this prevents a
+# 3k-step diagnostic from being accidentally promoted to a paper checkpoint.
+EPOCHS="${EPOCHS:-100}"
+MIN_SEQUENCE_EPOCHS="${MIN_SEQUENCE_EPOCHS:-100}"
+ALLOW_SHORT_RUN="${ALLOW_SHORT_RUN:-0}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 TEACHER_HIDDEN_DIM="${TEACHER_HIDDEN_DIM:-256}"
 TEACHER_LR="${TEACHER_LR:-0.001}"
@@ -578,6 +586,26 @@ fi
 require_runtime_inputs
 if [[ "${STAGE}" == "student" || "${STAGE}" == "all" ]]; then
   resolve_full_history_window
+  if [[ "${ALLOW_SHORT_RUN}" != "1" ]]; then
+    if ! [[ "${MIN_SEQUENCE_EPOCHS}" =~ ^[0-9]+$ && "${EPOCHS}" =~ ^[0-9]+$ ]]; then
+      echo "MIN_SEQUENCE_EPOCHS and EPOCHS must be non-negative integers" >&2
+      exit 2
+    fi
+    if (( EPOCHS < MIN_SEQUENCE_EPOCHS )); then
+      echo "Refusing a canonical student run with EPOCHS=${EPOCHS}; minimum is "\
+           "${MIN_SEQUENCE_EPOCHS}. Set ALLOW_SHORT_RUN=1 only for a named "\
+           "smoke/pilot experiment." >&2
+      exit 2
+    fi
+    minimum_steps=$((STEPS_PER_EPOCH * MIN_SEQUENCE_EPOCHS))
+    if (( STEPS < minimum_steps )); then
+      echo "Refusing a canonical student run with STEPS=${STEPS}; minimum is "\
+           "${minimum_steps} (${MIN_SEQUENCE_EPOCHS} sequence epochs x "\
+           "${STEPS_PER_EPOCH} windows/epoch). Set ALLOW_SHORT_RUN=1 only "\
+           "for a named smoke/pilot experiment." >&2
+      exit 2
+    fi
+  fi
 else
   # Teacher/label stages do not launch the sequence trainer.  Keep symbolic
   # values available for a concise status line without pretending that a
