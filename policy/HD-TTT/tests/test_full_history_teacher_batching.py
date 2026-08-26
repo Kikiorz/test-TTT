@@ -128,6 +128,57 @@ def test_masked_batch_loss_matches_frame_weighted_independent_replays() -> None:
         assert torch.count_nonzero(batched.actions[batch_index, length:]) == 0
 
 
+def test_masked_batch_gradient_matches_weighted_independent_gradient() -> None:
+    """Padding must not change the gradient of the declared batch objective."""
+
+    train, history = _load_training_module()
+    torch.manual_seed(104)
+    batched_teacher = history.FullHistoryActionTeacher(event_dim=5, action_dim=3, hidden_dim=9)
+    independent_teacher = history.FullHistoryActionTeacher(event_dim=5, action_dim=3, hidden_dim=9)
+    independent_teacher.load_state_dict(batched_teacher.state_dict())
+    rows = _toy_rows([2, 5, 3])
+    events, previous, targets, valid = train._pad_episode_batch(rows, device=torch.device("cpu"))
+
+    batch_output = batched_teacher(events, previous, valid_mask=valid)
+    batch_loss = batched_teacher.action_loss(batch_output.actions, targets, valid_mask=valid)
+    batch_loss.backward()
+
+    weighted_loss = torch.zeros(())
+    frame_count = 0
+    for row in rows:
+        episode_events, episode_previous, episode_targets = train._episode_tensors(
+            row, device=torch.device("cpu")
+        )
+        episode_output = independent_teacher(episode_events, episode_previous)
+        length = int(episode_events.shape[1])
+        weighted_loss = weighted_loss + independent_teacher.action_loss(
+            episode_output.actions, episode_targets
+        ) * length
+        frame_count += length
+    (weighted_loss / frame_count).backward()
+
+    for batch_parameter, independent_parameter in zip(
+        batched_teacher.parameters(), independent_teacher.parameters(), strict=True
+    ):
+        # ``null_event`` is intentionally unused by the canonical ``skip``
+        # deletion mode, so both paths legitimately leave that parameter's
+        # gradient as ``None``.  Treat absent gradients as structural zeros.
+        batch_gradient = (
+            torch.zeros_like(batch_parameter) if batch_parameter.grad is None else batch_parameter.grad
+        )
+        independent_gradient = (
+            torch.zeros_like(independent_parameter)
+            if independent_parameter.grad is None
+            else independent_parameter.grad
+        )
+        torch.testing.assert_close(
+            batch_gradient,
+            independent_gradient,
+            rtol=2e-5,
+            atol=2e-7,
+        )
+
+
 def test_batch_size_one_delegates_to_legacy_epoch() -> None:
     train, history = _load_training_module()
     rows = _toy_rows([2, 4, 3])
