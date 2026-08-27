@@ -114,6 +114,7 @@ LOG_FREQ="${LOG_FREQ:-100}"
 SAVE_FREQ="${SAVE_FREQ:-1000}"
 SEED="${SEED:-1000}"
 RESUME="${RESUME:-false}"
+CONFIG_PATH="${CONFIG_PATH:-}"
 DEVICE="${DEVICE:-cuda}"
 
 export HF_HOME="${HF_HOME:-/workspace/hf_cache}"
@@ -358,6 +359,9 @@ ARGS=(
   --seed="${SEED}"
   --output_dir="${OUTPUT_DIR}"
 )
+if [[ -n "${CONFIG_PATH}" ]]; then
+  ARGS+=(--config_path="${CONFIG_PATH}")
+fi
 
 echo "Native SmolVLA protocol: policy.type=smolvla (no fast weights, registers, HD labels, or TTT flags)"
 echo "task=${TASK_ID} dataset=${DATASET_REPO_ID} root=${DATASET_ROOT}"
