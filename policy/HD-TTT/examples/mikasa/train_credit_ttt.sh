@@ -263,6 +263,10 @@ PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 LOG_FREQ="${LOG_FREQ:-50}"
 SAVE_FREQ="${SAVE_FREQ:-500}"
 RESUME="${RESUME:-false}"
+# CONFIG_PATH is the checkpoint's pretrained_model/train_config.json used by
+# LeRobot's resume parser.  Keep it explicit so a resumed run cannot silently
+# pick a different checkpoint or reinterpret the optimizer state.
+CONFIG_PATH="${CONFIG_PATH:-}"
 DEVICE="${DEVICE:-cuda}"
 TEACHER_DEVICE="${TEACHER_DEVICE:-${DEVICE}}"
 SIM_BACKEND="${SIM_BACKEND:-gpu}"
@@ -774,6 +778,9 @@ student_command() {
     --seed="${SEED}"
     --output_dir="${STUDENT_OUTPUT_DIR}"
   )
+  if [[ -n "${CONFIG_PATH}" ]]; then
+    out+=(--config_path="${CONFIG_PATH}")
+  fi
 }
 
 baseline_commands() {
