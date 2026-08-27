@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 """Build the frame-aligned CreditTTT V3 pair-label artifact.
 
-This builder is intentionally separate from :mod:`build_hd_labels`.  The
-older builder measures a clean-TTT *write* intervention and emits velocity
-labels; this file emits the V3 contract only:
+This builder emits only the CreditTTT V3 contract:
 
 * an explicit causal ``FullHistoryActionTeacher`` supplies the full and
   event-write-deleted action predictions;

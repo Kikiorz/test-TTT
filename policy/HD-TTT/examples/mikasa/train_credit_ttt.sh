@@ -2,8 +2,7 @@
 
 # Reproducible CreditTTT (V3) training/evaluation recipe for MIKASA-Robo-VLA.
 #
-# This launcher is intentionally independent from train_hd_ttt.sh.  It does
-# not change the legacy/V2 recipe and it never fabricates an evaluation JSON.
+# This is the canonical paper launcher.  It never fabricates an evaluation JSON.
 # With no argument (or with ``plan``) it only prints the frozen commands.  A
 # stage is executed only after the caller explicitly sets EXECUTE=1.
 #

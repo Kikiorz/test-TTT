@@ -183,12 +183,6 @@ def _load_base_policy(args: argparse.Namespace):
     return metadata, policy, preprocessor
 
 
-def _strip_singleton(value: Any) -> Any:
-    if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == 1:
-        return value[0]
-    return value
-
-
 def _extract_episode_features(
     dataset: Any,
     local_start: int,
@@ -201,12 +195,14 @@ def _extract_episode_features(
 ) -> dict[str, Any]:
     """Extract one event token per physical frame from the frozen VLM prefix."""
 
-    # Importing the helper keeps the exact camera/action preprocessing shared
-    # with the existing MIKASA label builder, avoiding a second normalization
-    # implementation in the teacher path.
-    from build_hd_labels import _prepare_episode
+    # Keep the exact camera/action preprocessing in one objective-independent
+    # helper so this V3 path does not depend on a legacy HD label builder.
+    try:
+        from mikasa_data import prepare_episode
+    except ImportError:  # Supports ``python -m examples.mikasa...``.
+        from .mikasa_data import prepare_episode
 
-    prepared, global_indices, episode_indices, frame_indices = _prepare_episode(
+    prepared, global_indices, episode_indices, frame_indices = prepare_episode(
         dataset,
         local_start,
         length,

@@ -502,7 +502,7 @@ def _attach_hd_labels(dataset, cfg: TrainPipelineConfig, *, is_smolvla_ttt: bool
     if not metadata:
         raise ValueError(
             "HD label artifacts must include guarded provenance metadata; "
-            "regenerate labels with build_hd_labels.py"
+            "regenerate the artifact with the matching canonical label builder"
         )
     # The bounded inner-update mode was added after the first HD artifacts.
     # Missing/explicit-null has the legacy clean semantics; materialize that
