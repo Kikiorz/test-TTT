@@ -39,6 +39,14 @@ logs/
 !policy/Method1_lerobot-pi0-ttt/src/lerobot/datasets/**
 !policy/Method1_lerobot-pi0-ttt/src/lerobot/processor/tokenizer_processor.py
 !policy/Method1_lerobot-pi0-ttt/src/lerobot/scripts/lerobot_train_tokenizer.py
+!policy/lerobot-pi0-ttt/src/lerobot/datasets/
+!policy/lerobot-pi0-ttt/src/lerobot/datasets/**
+!policy/lerobot-pi0-ttt/src/lerobot/processor/tokenizer_processor.py
+!policy/lerobot-pi0-ttt/src/lerobot/scripts/lerobot_train_tokenizer.py
+
+# This is a small textual Python path file used by the RMBench deployment setup,
+# not a model checkpoint.
+!.codex-deploy/rmbench_mikasa_base.pth
 
 # Editors and operating systems
 .DS_Store
