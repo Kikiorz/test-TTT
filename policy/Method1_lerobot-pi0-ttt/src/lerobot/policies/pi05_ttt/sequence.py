@@ -55,18 +55,16 @@ def _dataset_episode_lengths(dataset: Dataset) -> list[int]:
     child_datasets = getattr(dataset, "_datasets", None)
     if child_datasets is None:
         return _selected_episode_lengths(dataset)
-    return [
-        length for child_dataset in child_datasets for length in _selected_episode_lengths(child_dataset)
-    ]
+    return [length for child_dataset in child_datasets for length in _selected_episode_lengths(child_dataset)]
 
 
 class TailPreservingSequenceDataset(Dataset):
-    """Return episode-local windows of at most ``sequence_length`` without dropping the tail.
+    """Return independent episode-local selected sequences without dropping the tail.
 
-    Starts advance by ``sequence_stride``. Each final window ends exactly at the
-    episode boundary, so short episodes and non-divisible tails remain training
-    examples instead of being filtered out. The formal four-GPU recipe uses
-    ``sequence_length == sequence_stride == 256``, which covers every frame once.
+    Each window has at most ``sequence_length`` timesteps and starts from the
+    learned fast-weight initialization during training. Starts advance by
+    ``sequence_stride``; short episodes and non-divisible tails remain selected
+    sequences instead of being filtered out.
     """
 
     def __init__(self, dataset: Dataset, sequence_length: int, sequence_stride: int) -> None:

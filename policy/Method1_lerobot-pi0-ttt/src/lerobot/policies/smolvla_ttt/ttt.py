@@ -59,8 +59,8 @@ class TTTMLPLayer(nn.Module):
         hidden_dim: int,
         *,
         base_inner_lr: float = 0.1,
-        effective_gate_init: float = 0.05,
-        gate_trainable: bool = False,
+        effective_gate_init: float = 0.001,
+        gate_trainable: bool = True,
         rope_theta: float = 10_000.0,
         second_order: bool = True,
     ) -> None:
@@ -138,9 +138,28 @@ class TTTMLPLayer(nn.Module):
         output = torch.einsum("bsh,bdh->bsd", hidden, state.w2)
         return output + state.b2[:, None, :]
 
-    def _update(self, keys: Tensor, values: Tensor, state: TTTFastState, create_graph: bool) -> TTTFastState:
+    def _update(
+        self,
+        keys: Tensor,
+        values: Tensor,
+        state: TTTFastState,
+        create_graph: bool,
+        token_mask: Tensor | None = None,
+    ) -> TTTFastState:
         prediction = self._fast_mlp(keys, state)
-        per_trajectory_loss = F.mse_loss(prediction, values, reduction="none").mean(dim=(1, 2))
+        per_token_loss = F.mse_loss(prediction, values, reduction="none").mean(dim=-1)
+        if token_mask is None:
+            per_trajectory_loss = per_token_loss.mean(dim=1)
+        else:
+            if token_mask.shape != per_token_loss.shape:
+                raise ValueError(
+                    f"Expected token_mask with shape {tuple(per_token_loss.shape)}, "
+                    f"got {tuple(token_mask.shape)}"
+                )
+            valid_tokens = token_mask.to(device=per_token_loss.device, dtype=per_token_loss.dtype)
+            per_trajectory_loss = (per_token_loss * valid_tokens).sum(dim=1) / valid_tokens.sum(
+                dim=1
+            ).clamp_min(1)
         gradients = torch.autograd.grad(
             per_trajectory_loss.sum(),
             state.tensors(),
@@ -182,6 +201,8 @@ class TTTMLPLayer(nn.Module):
         state: TTTFastState | None = None,
         *,
         update: bool = True,
+        update_mask: Tensor | None = None,
+        token_mask: Tensor | None = None,
         create_graph: bool | None = None,
     ) -> tuple[Tensor, TTTFastState]:
         """Process ``[batch, timesteps, tokens, dim]`` and return the next fast state."""
@@ -193,6 +214,26 @@ class TTTMLPLayer(nn.Module):
             raise ValueError(
                 f"Fast-state batch size {state.batch_size} does not match input batch size {inputs.shape[0]}"
             )
+        if update_mask is None:
+            update_mask = torch.ones(inputs.shape[:2], dtype=torch.bool, device=inputs.device)
+        elif update_mask.shape != inputs.shape[:2]:
+            raise ValueError(
+                f"Expected update_mask with shape {tuple(inputs.shape[:2])}, got {tuple(update_mask.shape)}"
+            )
+        else:
+            update_mask = update_mask.to(device=inputs.device, dtype=torch.bool)
+        if token_mask is None:
+            token_mask = torch.ones(inputs.shape[:3], dtype=torch.bool, device=inputs.device)
+        elif token_mask.shape != inputs.shape[:3]:
+            raise ValueError(
+                f"Expected token_mask with shape {tuple(inputs.shape[:3])}, got {tuple(token_mask.shape)}"
+            )
+        else:
+            token_mask = token_mask.to(device=inputs.device, dtype=torch.bool)
+        # A timestep with no valid token is pure padding and must neither
+        # update fast weights nor advance the persistent RoPE position.
+        update_mask = update_mask & token_mask.any(dim=-1)
+        token_mask = token_mask & update_mask[:, :, None]
 
         outer_grad_enabled = torch.is_grad_enabled()
         outer_inference_enabled = torch.is_inference_mode_enabled()
@@ -210,6 +251,12 @@ class TTTMLPLayer(nn.Module):
         ):
             projected_inputs = inputs.detach().clone() if outer_inference_enabled else inputs
             projected_inputs = projected_inputs.to(dtype=projection_dtype)
+            # Boolean masks created by an outer ``torch.inference_mode`` are
+            # inference tensors too. ``torch.where`` saves its condition for
+            # the inner fast-weight backward pass, so use a normal clone just
+            # like we do for the projected inputs and carried fast state.
+            projected_update_mask = update_mask.detach().clone() if outer_inference_enabled else update_mask
+            projected_token_mask = token_mask.detach().clone() if outer_inference_enabled else token_mask
             if state is None:
                 state = self.initial_state(inputs.shape[0])
             elif update and (
@@ -226,9 +273,16 @@ class TTTMLPLayer(nn.Module):
                 )
 
             outputs = []
-            for timestep_inputs in projected_inputs.unbind(dim=1):
+            for timestep_index, timestep_inputs in enumerate(projected_inputs.unbind(dim=1)):
+                timestep_update_mask = projected_update_mask[:, timestep_index]
+                timestep_token_mask = projected_token_mask[:, timestep_index]
                 normalized_inputs = F.layer_norm(timestep_inputs, (self.dim,))
-                timestep_position = state.position + 1 if update else state.position.clamp_min(0)
+                next_position = state.position + 1
+                timestep_position = (
+                    torch.where(timestep_update_mask, next_position, state.position.clamp_min(0))
+                    if update
+                    else state.position.clamp_min(0)
+                )
                 token_positions = (
                     timestep_position[:, None] * timestep_inputs.shape[1]
                     + torch.arange(timestep_inputs.shape[1], device=inputs.device)[None, :]
@@ -237,8 +291,22 @@ class TTTMLPLayer(nn.Module):
                 if update:
                     keys = self._apply_rope(self.k_proj(normalized_inputs), token_positions)
                     values = self.v_proj(normalized_inputs)
-                    state = self._update(keys, values, state, create_graph=create_graph)
-                    state = TTTFastState(*state.tensors(), position=timestep_position)
+                    candidate_state = self._update(
+                        keys,
+                        values,
+                        state,
+                        create_graph=create_graph,
+                        token_mask=timestep_token_mask,
+                    )
+                    weight_mask = timestep_update_mask[:, None, None]
+                    bias_mask = timestep_update_mask[:, None]
+                    state = TTTFastState(
+                        w1=torch.where(weight_mask, candidate_state.w1, state.w1),
+                        b1=torch.where(bias_mask, candidate_state.b1, state.b1),
+                        w2=torch.where(weight_mask, candidate_state.w2, state.w2),
+                        b2=torch.where(bias_mask, candidate_state.b2, state.b2),
+                        position=torch.where(timestep_update_mask, next_position, state.position),
+                    )
 
                 ttt_output = self._fast_mlp(queries, state)
                 outputs.append(timestep_inputs + self.effective_gate * ttt_output)

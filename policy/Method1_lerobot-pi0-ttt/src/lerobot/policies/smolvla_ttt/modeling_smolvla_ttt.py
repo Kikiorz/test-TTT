@@ -46,7 +46,7 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_smolvla_ttt import SmolVLATTTConfig
-from .sequence import SEQUENCE_SHAPE_KEY
+from .sequence import SEQUENCE_SHAPE_KEY, SEQUENCE_VALID_KEY
 from .smolvlm_with_expert_ttt import SmolVLMWithExpertTTTModel
 from .ttt import TTTFastState, TTTMLPLayer
 
@@ -102,9 +102,7 @@ def _validate_checkpoint_keys(
 ) -> None:
     """Allow new TTT tensors to be absent only when converting a base SmolVLA checkpoint."""
     allowed_base_missing = [
-        key
-        for key in missing_keys
-        if key.startswith("model.ttt_layers.") or key == "model.register_tokens"
+        key for key in missing_keys if key.startswith("model.ttt_layers.") or key == "model.register_tokens"
     ]
     disallowed_missing = [key for key in missing_keys if key not in allowed_base_missing]
     require_exact_checkpoint = source_is_ttt or strict
@@ -269,7 +267,10 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
 
     config_class = SmolVLATTTConfig
     name = "smolvla_ttt"
-    tbptt_loss_weighting = "valid_actions"
+    # Normalize every trajectory by its own valid action count before averaging
+    # trajectories. This keeps the batch>1 objective identical to averaging the
+    # same episode-local sequences one at a time.
+    tbptt_loss_weighting = "valid_actions_per_sequence"
 
     def __init__(
         self,
@@ -286,6 +287,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self.source_sequence_state_semantics = "fresh_initialization"
         self.init_rtc_processor()
         self.model = SmolVLATTTFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
@@ -300,13 +302,23 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             raise TypeError(f"smolvla_ttt can only load SmolVLA-family checkpoints, got {config_type!r}")
         valid_fields = {field.name for field in fields(SmolVLATTTConfig) if field.init}
         values = {key: value for key, value in raw_config.items() if key in valid_fields}
+        serialized_sequence_semantics = values.get("ttt_sequence_state_semantics")
+        # Sequence semantics do not change tensor structure. Decode legacy TTT
+        # checkpoints with the current validated runtime value, then restore
+        # their marker so callers can reject them for further training without
+        # making evaluation/loading impossible.
+        if config_type == "smolvla_ttt":
+            values["ttt_sequence_state_semantics"] = "sequence_outer_step_v1"
         if config_type == "smolvla":
             # Base checkpoints often cache a full action chunk. TTT must observe
             # every environment decision and therefore executes one action at a time.
             values["n_action_steps"] = 1
             values["compile_model"] = False
             values["rtc_config"] = None
-        return draccus.decode(SmolVLATTTConfig, values)
+        decoded = draccus.decode(SmolVLATTTConfig, values)
+        if config_type == "smolvla_ttt" and serialized_sequence_semantics is not None:
+            decoded.ttt_sequence_state_semantics = serialized_sequence_semantics
+        return decoded
 
     @classmethod
     def from_pretrained(
@@ -354,6 +366,17 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
         with open(config_file) as file:
             raw_config = json.load(file)
         source_is_ttt = raw_config.get("type") == "smolvla_ttt"
+        source_sequence_semantics = (
+            raw_config.get("ttt_sequence_state_semantics", "legacy_window_reset_v0")
+            if source_is_ttt
+            else "base_smolvla"
+        )
+        if source_is_ttt and source_sequence_semantics != "sequence_outer_step_v1":
+            logging.warning(
+                "Loading a SmolVLA-TTT checkpoint with legacy sequence semantics. It may still be "
+                "evaluated, but it must not seed training where each selected sequence starts from "
+                "the learned fast-weight initialization and owns one outer optimizer step."
+            )
         source_config = cls._decode_source_config(raw_config)
 
         if config is None:
@@ -362,6 +385,11 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             _restore_checkpoint_model_fields(config, source_config, raw_config)
         else:
             raise TypeError(f"Expected SmolVLATTTConfig, got {type(config).__name__}")
+        if source_is_ttt:
+            # Keep evaluation/resaves truthfully labelled even when the caller
+            # supplied a fresh runtime config. The trainer separately refuses
+            # any legacy marker as a stage initialization source.
+            config.ttt_sequence_state_semantics = source_sequence_semantics
         config.pretrained_path = Path(pretrained_name_or_path)
 
         model = cls(config, **kwargs)
@@ -387,6 +415,7 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 "Loaded a SmolVLA base checkpoint; initialized %d new TTT/register tensors",
                 len(missing_keys),
             )
+        model.source_sequence_state_semantics = source_sequence_semantics
         model.eval()
         return model
 
@@ -522,6 +551,52 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
                 f"Sequence shape {sequence_shape} requires {expected_flat_batch} flattened samples, "
                 f"but the action batch has {batch[ACTION].shape[0]}"
             )
+        sequence_valid = batch.get(SEQUENCE_VALID_KEY)
+        if sequence_valid is None:
+            sequence_valid = torch.ones(sequence_shape, dtype=torch.bool, device=batch[ACTION].device)
+        elif sequence_valid.numel() != expected_flat_batch:
+            raise ValueError(
+                f"Sequence shape {sequence_shape} requires {expected_flat_batch} validity values, "
+                f"but got {sequence_valid.numel()}"
+            )
+        else:
+            sequence_valid = sequence_valid.reshape(sequence_shape).to(
+                device=batch[ACTION].device, dtype=torch.bool
+            )
+        actions_is_pad = batch.get("action_is_pad")
+        action_token_mask = None
+        ttt_token_mask = None
+        if actions_is_pad is not None:
+            if not isinstance(actions_is_pad, Tensor) or actions_is_pad.shape != (
+                expected_flat_batch,
+                self.config.chunk_size,
+            ):
+                actual_shape = (
+                    tuple(actions_is_pad.shape)
+                    if isinstance(actions_is_pad, Tensor)
+                    else type(actions_is_pad).__name__
+                )
+                raise ValueError(
+                    "action_is_pad must have shape "
+                    f"[{expected_flat_batch}, {self.config.chunk_size}], got {actual_shape}"
+                )
+            actions_is_pad = actions_is_pad.to(device=batch[ACTION].device, dtype=torch.bool)
+            action_token_mask = (~actions_is_pad).reshape(
+                batch_size,
+                sequence_length,
+                self.config.chunk_size,
+            )
+            if self.config.ttt_num_register_tokens > 0:
+                register_token_mask = torch.ones(
+                    batch_size,
+                    sequence_length,
+                    self.config.ttt_num_register_tokens,
+                    dtype=torch.bool,
+                    device=action_token_mask.device,
+                )
+                ttt_token_mask = torch.cat((register_token_mask, action_token_mask), dim=-1)
+            else:
+                ttt_token_mask = action_token_mask
 
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
@@ -547,36 +622,50 @@ class SmolVLATTTPolicy(PreTrainedPolicy):
             noise,
             time,
             sequence_shape=sequence_shape,
+            sequence_valid=sequence_valid,
+            token_mask=ttt_token_mask,
+            action_token_mask=action_token_mask.reshape(expected_flat_batch, self.config.chunk_size)
+            if action_token_mask is not None
+            else None,
             fast_states=fast_states,
         )
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
-        actions_is_pad = batch.get("action_is_pad")
-        if actions_is_pad is not None:
-            valid = (~actions_is_pad).unsqueeze(-1)
-            losses = losses * valid
-            valid_steps = valid.sum().clamp_min(1)
-            loss_per_dim = losses.sum(dim=(0, 1)) / valid_steps
+        sequence_valid_flat = sequence_valid.reshape(-1)
+        if actions_is_pad is None:
+            valid_actions = sequence_valid_flat[:, None].expand(-1, losses.shape[1])
         else:
-            loss_per_dim = losses.mean(dim=(0, 1))
+            valid_actions = (~actions_is_pad) & sequence_valid_flat[:, None]
+        losses = losses * valid_actions.unsqueeze(-1)
+        valid_steps = valid_actions.sum().clamp_min(1)
+        loss_per_dim = losses.sum(dim=(0, 1)) / valid_steps
 
         loss_dict = {"loss_per_dim": loss_per_dim.detach().cpu().tolist()}
+        if reduction == "sequence":
+            losses_by_sequence = losses.reshape(
+                batch_size,
+                sequence_length,
+                losses.shape[1],
+                losses.shape[2],
+            )
+            valid_actions_by_sequence = valid_actions.reshape(batch_size, sequence_length, -1).sum(dim=(1, 2))
+            per_sequence_loss_per_dim = losses_by_sequence.sum(dim=(1, 2)) / (
+                valid_actions_by_sequence[:, None].clamp_min(1)
+            )
+            per_sequence_loss = per_sequence_loss_per_dim.mean(dim=1)
+            loss_dict["loss"] = per_sequence_loss.mean().item()
+            loss_dict["loss_per_dim_per_sequence"] = per_sequence_loss_per_dim.detach().cpu().tolist()
+            return per_sequence_loss, loss_dict, fast_states
         if reduction == "none":
-            if actions_is_pad is None:
-                per_sample_loss = losses.mean(dim=(1, 2))
-            else:
-                num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
-                per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+            num_valid = (valid_actions.sum(dim=1) * losses.shape[-1]).clamp_min(1)
+            per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict, fast_states
         if reduction != "mean":
             raise ValueError(f"Unsupported reduction: {reduction}")
 
-        if actions_is_pad is None:
-            loss = losses.mean()
-        else:
-            num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
-            loss = losses.sum() / num_valid
+        num_valid = (valid_actions.sum() * losses.shape[-1]).clamp_min(1)
+        loss = losses.sum() / num_valid
         loss_dict["loss"] = loss.item()
         return loss, loss_dict, fast_states
 
@@ -873,6 +962,8 @@ class SmolVLATTTFlowMatching(nn.Module):
         *,
         update: bool,
         create_graph: bool | None,
+        update_mask: Tensor | None = None,
+        token_mask: Tensor | None = None,
     ):
         batch_size, sequence_length = sequence_shape
 
@@ -892,6 +983,8 @@ class SmolVLATTTFlowMatching(nn.Module):
                 sequence,
                 fast_states.get(layer_index),
                 update=update,
+                update_mask=update_mask,
+                token_mask=token_mask,
                 create_graph=create_graph,
             )
             fast_states[layer_index] = next_state
@@ -1065,23 +1158,42 @@ class SmolVLATTTFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
 
-    def _make_suffix_att_2d_masks(self, pad_masks: Tensor, att_masks: Tensor) -> Tensor:
-        """Build register-aware within-timestep attention without changing action causality."""
+    def _make_suffix_att_2d_masks(
+        self,
+        pad_masks: Tensor,
+        att_masks: Tensor,
+        action_token_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Build register-aware attention while excluding padded actions as keys."""
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         num_register_tokens = self.config.ttt_num_register_tokens
-        if num_register_tokens == 0:
-            return att_2d_masks
-
         expected_suffix_length = num_register_tokens + self.config.chunk_size
         if pad_masks.shape[1] != expected_suffix_length:
-            raise ValueError(
-                f"Expected {expected_suffix_length} suffix tokens, got {pad_masks.shape[1]}"
+            raise ValueError(f"Expected {expected_suffix_length} suffix tokens, got {pad_masks.shape[1]}")
+
+        if num_register_tokens > 0:
+            register_queries_are_valid = pad_masks[:, :num_register_tokens, None]
+            all_suffix_keys_are_valid = pad_masks[:, None, :]
+            att_2d_masks[:, :num_register_tokens, :] = register_queries_are_valid & all_suffix_keys_are_valid
+
+        if action_token_mask is not None:
+            expected_action_shape = (pad_masks.shape[0], self.config.chunk_size)
+            if action_token_mask.shape != expected_action_shape:
+                raise ValueError(
+                    f"Expected action_token_mask shape {expected_action_shape}, "
+                    f"got {tuple(action_token_mask.shape)}"
+                )
+            action_token_mask = action_token_mask.to(device=pad_masks.device, dtype=torch.bool)
+            register_key_mask = torch.ones(
+                pad_masks.shape[0],
+                num_register_tokens,
+                dtype=torch.bool,
+                device=pad_masks.device,
             )
-        register_queries_are_valid = pad_masks[:, :num_register_tokens, None]
-        all_suffix_keys_are_valid = pad_masks[:, None, :]
-        att_2d_masks[:, :num_register_tokens, :] = (
-            register_queries_are_valid & all_suffix_keys_are_valid
-        )
+            suffix_key_mask = torch.cat((register_key_mask, action_token_mask), dim=1)
+            # Only mask key columns. Masking padded query rows as well would
+            # produce all-masked softmax rows and NaNs in the expert stream.
+            att_2d_masks = att_2d_masks & suffix_key_mask[:, None, :]
         return att_2d_masks
 
     def _select_action_tokens(self, suffix_output: Tensor) -> Tensor:
@@ -1089,9 +1201,7 @@ class SmolVLATTTFlowMatching(nn.Module):
         action_start = self.config.ttt_num_register_tokens
         action_end = action_start + self.config.chunk_size
         if suffix_output.shape[1] < action_end:
-            raise ValueError(
-                f"Expected at least {action_end} expert tokens, got {suffix_output.shape[1]}"
-            )
+            raise ValueError(f"Expected at least {action_end} expert tokens, got {suffix_output.shape[1]}")
         return suffix_output[:, action_start:action_end]
 
     def forward(
@@ -1105,6 +1215,7 @@ class SmolVLATTTFlowMatching(nn.Module):
         noise=None,
         time=None,
         *,
+        action_token_mask: Tensor | None = None,
         expert_layer_callback=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
@@ -1128,7 +1239,9 @@ class SmolVLATTTFlowMatching(nn.Module):
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         suffix_length = suffix_pad_masks.shape[1]
         att_2d_masks[:, -suffix_length:, -suffix_length:] = self._make_suffix_att_2d_masks(
-            suffix_pad_masks, suffix_att_masks
+            suffix_pad_masks,
+            suffix_att_masks,
+            action_token_mask=action_token_mask,
         )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         (_, suffix_out), _ = self.vlm_with_expert.forward(
@@ -1159,6 +1272,9 @@ class SmolVLATTTFlowMatching(nn.Module):
         time,
         *,
         sequence_shape: tuple[int, int],
+        sequence_valid: Tensor | None = None,
+        token_mask: Tensor | None = None,
+        action_token_mask: Tensor | None = None,
         fast_states: TTTFastStates | None = None,
         create_graph: bool | None = None,
     ) -> tuple[Tensor, TTTFastStates]:
@@ -1167,6 +1283,8 @@ class SmolVLATTTFlowMatching(nn.Module):
             sequence_shape,
             fast_states,
             update=True,
+            update_mask=sequence_valid,
+            token_mask=token_mask,
             create_graph=create_graph,
         )
         losses = self.forward(
@@ -1178,6 +1296,7 @@ class SmolVLATTTFlowMatching(nn.Module):
             actions,
             noise,
             time,
+            action_token_mask=action_token_mask,
             expert_layer_callback=callback,
         )
         return losses, fast_states

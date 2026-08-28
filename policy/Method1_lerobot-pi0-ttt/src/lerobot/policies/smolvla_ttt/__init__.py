@@ -15,11 +15,17 @@
 from .configuration_smolvla_ttt import SmolVLATTTConfig
 from .modeling_smolvla_ttt import SmolVLATTTPolicy
 from .processor_smolvla_ttt import make_smolvla_ttt_pre_post_processors
-from .sequence import SEQUENCE_SHAPE_KEY, TailPreservingSequenceDataset, sequence_collate_fn
+from .sequence import (
+    SEQUENCE_SHAPE_KEY,
+    EpisodeSequenceBatchSampler,
+    TailPreservingSequenceDataset,
+    sequence_collate_fn,
+)
 from .ttt import TTTFastState, TTTMLPLayer
 
 __all__ = [
     "SEQUENCE_SHAPE_KEY",
+    "EpisodeSequenceBatchSampler",
     "SmolVLATTTConfig",
     "SmolVLATTTPolicy",
     "TTTFastState",

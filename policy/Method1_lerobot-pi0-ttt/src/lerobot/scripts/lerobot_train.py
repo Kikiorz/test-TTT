@@ -61,6 +61,13 @@ from lerobot.policies.pi05_ttt.sequence import (
 )
 from lerobot.policies.smolvla_ttt.configuration_smolvla_ttt import SmolVLATTTConfig
 from lerobot.policies.smolvla_ttt.sequence import (
+    SEQUENCE_ACTIVE_KEY as SMOLVLA_TTT_SEQUENCE_ACTIVE_KEY,
+    SEQUENCE_EPISODE_INDEX_KEY as SMOLVLA_TTT_SEQUENCE_EPISODE_INDEX_KEY,
+    SEQUENCE_VALID_KEY as SMOLVLA_TTT_SEQUENCE_VALID_KEY,
+    SEQUENCE_WAVE_END_KEY as SMOLVLA_TTT_SEQUENCE_WAVE_END_KEY,
+    SEQUENCE_WAVE_START_KEY as SMOLVLA_TTT_SEQUENCE_WAVE_START_KEY,
+    SEQUENCE_WINDOW_ORDINAL_KEY as SMOLVLA_TTT_SEQUENCE_WINDOW_ORDINAL_KEY,
+    EpisodeSequenceBatchSampler as SmolVLATTTEpisodeBatchSampler,
     TailPreservingSequenceDataset as SmolVLATTTSequenceDataset,
     sequence_collate_fn as smolvla_ttt_sequence_collate_fn,
 )
@@ -212,11 +219,36 @@ def _tbptt_segment_loss_weights(
     segment_length: int,
     *,
     weight_by_valid_actions: bool,
-) -> list[float]:
-    """Return weights that reconstruct the full valid-action mean across TBPTT segments."""
+    per_sequence: bool = False,
+) -> list[float] | list[torch.Tensor]:
+    """Return weights that reconstruct each selected sequence's valid-action mean."""
     batch_size, sequence_length = sequence_shape
     actions_is_pad = batch.get("action_is_pad") if weight_by_valid_actions else None
-    segment_valid_counts: list[int] = []
+    segment_valid_counts: list[int] | list[torch.Tensor] = []
+    weight_device = next(
+        (value.device for value in batch.values() if isinstance(value, torch.Tensor)),
+        torch.device("cpu"),
+    )
+    sequence_valid = batch.get(SMOLVLA_TTT_SEQUENCE_VALID_KEY)
+    if sequence_valid is None:
+        sequence_valid = torch.ones((batch_size, sequence_length), dtype=torch.bool, device=weight_device)
+    elif (
+        not isinstance(sequence_valid, torch.Tensor) or sequence_valid.numel() != batch_size * sequence_length
+    ):
+        raise ValueError(
+            "Sequence validity must have flattened batch-major shape "
+            f"[{batch_size * sequence_length}], got "
+            f"{type(sequence_valid).__name__}"
+            + (
+                f" with shape {tuple(sequence_valid.shape)}"
+                if isinstance(sequence_valid, torch.Tensor)
+                else ""
+            )
+        )
+    else:
+        sequence_valid = sequence_valid.reshape(batch_size, sequence_length).to(
+            device=weight_device, dtype=torch.bool
+        )
 
     if actions_is_pad is not None:
         if not isinstance(actions_is_pad, torch.Tensor):
@@ -232,15 +264,29 @@ def _tbptt_segment_loss_weights(
     for segment_start in range(0, sequence_length, segment_length):
         segment_end = min(segment_start + segment_length, sequence_length)
         if actions_is_pad is None:
-            valid_count = batch_size * (segment_end - segment_start)
+            per_sequence_count = sequence_valid[:, segment_start:segment_end].sum(dim=1)
         else:
-            valid_count = int((~action_padding[:, segment_start:segment_end]).sum().item())
+            valid_actions = (~action_padding[:, segment_start:segment_end]) & sequence_valid[
+                :, segment_start:segment_end, None
+            ]
+            per_sequence_count = valid_actions.sum(dim=(1, 2))
+        valid_count = per_sequence_count if per_sequence else int(per_sequence_count.sum().item())
         segment_valid_counts.append(valid_count)
 
-    total_valid_count = sum(segment_valid_counts)
+    if per_sequence:
+        tensor_counts = [count for count in segment_valid_counts if isinstance(count, torch.Tensor)]
+        total_valid_count = torch.stack(tensor_counts).sum(dim=0)
+        # The distributed sampler uses fully masked dummy lanes instead of
+        # duplicating real sequences. Their weights stay zero while active lanes
+        # preserve exact per-sequence normalization.
+        denominator = total_valid_count.clamp_min(1)
+        return [count / denominator for count in tensor_counts]
+
+    scalar_counts = [int(count) for count in segment_valid_counts]
+    total_valid_count = sum(scalar_counts)
     if total_valid_count == 0:
         raise ValueError("A TTT training sequence must contain at least one supervised action")
-    return [valid_count / total_valid_count for valid_count in segment_valid_counts]
+    return [valid_count / total_valid_count for valid_count in scalar_counts]
 
 
 def update_policy_tbptt(
@@ -255,12 +301,12 @@ def update_policy_tbptt(
     lr_scheduler=None,
     lock=None,
 ) -> tuple[MetricsTracker, dict]:
-    """Update a TTT policy over one sequence while truncating gradients between segments.
+    """Update a TTT policy over independent sequences with TBPTT.
 
-    Each accelerator process owns an independent trajectory window and its local fast state. The
-    persistent PI0-TTT parameters are synchronized once, after all TBPTT segments have contributed
-    gradients and before clipping/stepping the optimizer. This preserves trajectory-local memory while
-    implementing data parallel training for the outer parameters.
+    Every batch lane starts from the learned fast-weight initialization. Fast
+    weights carry numerically across this sequence's segments and are detached
+    at each segment boundary. Slow parameters are synchronized and stepped once,
+    only after every segment in the selected sequence has contributed gradients.
     """
 
     start_time = time.perf_counter()
@@ -272,14 +318,40 @@ def update_policy_tbptt(
     total_loss = torch.zeros((), device=accelerator.device)
     loss_per_dim = None
     num_segments = 0
+    loss_weighting = getattr(unwrapped_policy, "tbptt_loss_weighting", None)
+    per_sequence_weighting = loss_weighting == "valid_actions_per_sequence"
     segment_loss_weights = _tbptt_segment_loss_weights(
         batch,
         sequence_shape,
         segment_length,
-        weight_by_valid_actions=(
-            getattr(unwrapped_policy, "tbptt_loss_weighting", None) == "valid_actions"
-        ),
+        weight_by_valid_actions=loss_weighting in {"valid_actions", "valid_actions_per_sequence"},
+        per_sequence=per_sequence_weighting,
     )
+    global_sequence_count = None
+    if per_sequence_weighting:
+        sequence_valid = batch.get(SMOLVLA_TTT_SEQUENCE_VALID_KEY)
+        if sequence_valid is None:
+            local_active_sequences = batch_size
+        else:
+            local_active_sequences = int(
+                sequence_valid.reshape(batch_size, sequence_length).any(dim=1).sum().item()
+            )
+        local_sequence_count = torch.tensor(
+            float(local_active_sequences), dtype=torch.float32, device=accelerator.device
+        )
+        global_sequence_count = accelerator.reduce(local_sequence_count, reduction="sum")
+        if global_sequence_count.item() <= 0:
+            raise RuntimeError("A distributed TTT optimizer step must contain at least one active sequence")
+        if (
+            accelerator.is_main_process
+            and os.environ.get("LEROBOT_VERIFY_DDP_SYNC") == "1"
+            and global_sequence_count.item() != batch_size * accelerator.num_processes
+        ):
+            logging.info(
+                "Verified unequal final local sequence batch: global_sequence_count=%d instead of nominal=%d",
+                int(global_sequence_count.item()),
+                batch_size * accelerator.num_processes,
+            )
 
     for segment_index, segment_start in enumerate(range(0, sequence_length, segment_length)):
         segment_end = min(segment_start + segment_length, sequence_length)
@@ -297,22 +369,32 @@ def update_policy_tbptt(
                 segment_batch,
                 sequence_shape=(batch_size, current_segment_length),
                 fast_states=fast_states,
+                reduction="sequence" if per_sequence_weighting else "mean",
             )
             segment_weight = segment_loss_weights[segment_index]
-            weighted_segment_loss = segment_loss * segment_weight
+            weighted_segment_loss = (
+                (segment_loss * segment_weight).sum() / global_sequence_count
+                if per_sequence_weighting
+                else segment_loss * segment_weight
+            )
 
         accelerator.backward(weighted_segment_loss)
         total_loss += weighted_segment_loss.detach()
-        segment_loss_per_dim = torch.tensor(
-            segment_output["loss_per_dim"], device=accelerator.device
-        )
-        if loss_per_dim is None:
-            loss_per_dim = segment_loss_per_dim * segment_weight
+        if per_sequence_weighting:
+            segment_loss_per_dim = torch.tensor(
+                segment_output["loss_per_dim_per_sequence"], device=accelerator.device
+            )
+            weighted_segment_loss_per_dim = (segment_loss_per_dim * segment_weight[:, None]).sum(
+                dim=0
+            ) / global_sequence_count
         else:
-            loss_per_dim += segment_loss_per_dim * segment_weight
-        fast_states = {
-            layer_index: fast_state.detach() for layer_index, fast_state in fast_states.items()
-        }
+            segment_loss_per_dim = torch.tensor(segment_output["loss_per_dim"], device=accelerator.device)
+            weighted_segment_loss_per_dim = segment_loss_per_dim * segment_weight
+        if loss_per_dim is None:
+            loss_per_dim = weighted_segment_loss_per_dim
+        else:
+            loss_per_dim += weighted_segment_loss_per_dim
+        fast_states = {layer_index: fast_state.detach() for layer_index, fast_state in fast_states.items()}
         num_segments += 1
 
     if accelerator.num_processes > 1:
@@ -323,22 +405,30 @@ def update_policy_tbptt(
             device=accelerator.device,
         )
         gradient_presence = accelerator.reduce(gradient_presence, reduction="sum")
-        inconsistent = (gradient_presence != 0) & (gradient_presence != accelerator.num_processes)
-        if inconsistent.any().item():
-            inconsistent_indices = inconsistent.nonzero(as_tuple=False).flatten().cpu().tolist()
-            raise RuntimeError(
-                "TTT policy produced inconsistent gradients across data-parallel workers for "
-                f"trainable parameter indices {inconsistent_indices}"
-            )
-
         for parameter, presence_count in zip(trainable_parameters, gradient_presence.tolist(), strict=True):
             if presence_count == 0:
                 continue
-            reduced_gradient = accelerator.reduce(parameter.grad, reduction="mean")
+            # A rank containing only fully masked dummy lanes legitimately has
+            # no path through some update-only K/V parameters. Match DDP's
+            # unused-parameter behavior by contributing zeros when another
+            # rank used the parameter. If no rank used it, leave grad=None so
+            # the optimizer does not apply weight decay spuriously.
+            if parameter.grad is None:
+                parameter.grad = torch.zeros_like(parameter)
+            reduced_gradient = accelerator.reduce(
+                parameter.grad,
+                reduction="sum" if per_sequence_weighting else "mean",
+            )
             parameter.grad.copy_(reduced_gradient)
 
-        total_loss = accelerator.reduce(total_loss, reduction="mean")
-        loss_per_dim = accelerator.reduce(loss_per_dim, reduction="mean")
+        total_loss = accelerator.reduce(
+            total_loss,
+            reduction="sum" if per_sequence_weighting else "mean",
+        )
+        loss_per_dim = accelerator.reduce(
+            loss_per_dim,
+            reduction="sum" if per_sequence_weighting else "mean",
+        )
 
     if grad_clip_norm > 0:
         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
@@ -389,7 +479,28 @@ def update_policy_tbptt(
         "loss_per_dim": loss_per_dim.detach().cpu().tolist(),
         "tbptt_segments": num_segments,
     }
+    if fast_states is None:
+        raise RuntimeError("TTT sequence update did not produce fast state")
     return train_metrics, output_dict
+
+
+def _broadcast_sequence_policy_state(policy: PreTrainedPolicy, accelerator: "Accelerator") -> None:
+    """Make manually synchronized TTT replicas identical before optimizer construction."""
+    if accelerator.num_processes <= 1:
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError("Distributed TTT training requires an initialized torch process group")
+
+    for name, tensor in [*policy.named_parameters(), *policy.named_buffers()]:
+        if tensor.device != accelerator.device:
+            raise RuntimeError(
+                f"Cannot broadcast {name!r} on {tensor.device}; expected accelerator device "
+                f"{accelerator.device}"
+            )
+        torch.distributed.broadcast(tensor.data, src=0)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        logging.info("Broadcast all TTT policy parameters and buffers from rank 0")
 
 
 @parser.wrap()
@@ -446,8 +557,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             raise ValueError("TTT sequence training does not support PEFT yet")
         if cfg.dataset.streaming:
             raise ValueError("TTT sequence training requires a map-style dataset; streaming is not supported")
-    if (is_pi05_ttt or is_smolvla_ttt) and cfg.batch_size != 1:
-        raise ValueError("Tail-preserving TTT sequences require per-device batch_size=1")
+    if is_pi05_ttt and cfg.batch_size != 1:
+        raise ValueError("PI05-TTT tail-preserving sequences require per-device batch_size=1")
 
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
@@ -519,6 +630,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             ds_meta=dataset.meta,
             rename_map=cfg.rename_map,
         )
+        if is_smolvla_ttt and getattr(policy, "source_sequence_state_semantics", None) not in {
+            "base_smolvla",
+            "fresh_initialization",
+            "sequence_outer_step_v1",
+        }:
+            raise ValueError(
+                "Refusing to continue SmolVLA-TTT sequence training from an incompatible checkpoint. "
+                "Start Stage 1 from native SmolVLA or use a checkpoint marked "
+                "ttt_sequence_state_semantics='sequence_outer_step_v1'."
+            )
 
     if cfg.peft is not None:
         if cfg.is_reward_model_training:
@@ -532,8 +653,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             peft_cli_overrides = dataclasses.asdict(cfg.peft)
             policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
-    # Wait for all processes to finish model creation before continuing
+    # Wait for all processes to finish model creation before continuing.
+    # Sequence-TTT bypasses DDP's model wrapper and synchronizes outer
+    # gradients manually, so it also needs an explicit initial state broadcast.
     accelerator.wait_for_everyone()
+    if is_sequence_ttt:
+        _broadcast_sequence_policy_state(policy, accelerator)
 
     active_cfg = cfg.trainable_config
     processor_pretrained_path = active_cfg.pretrained_path
@@ -633,15 +758,30 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # create dataloader for offline training
+    # Create dataloader for offline training. SmolVLA-TTT owns its distributed
+    # sharding so the final incomplete global batch can use masked dummy lanes
+    # without duplicating real data. Every yielded window is an independent
+    # training sequence; one global batch of such windows is one outer step.
+    smolvla_ttt_batch_sampler = None
+    sequence_steps_per_epoch = None
     if is_smolvla_ttt:
         dataloader_dataset = SmolVLATTTSequenceDataset(
             dataset,
             sequence_length=active_cfg.sequence_length,
             sequence_stride=active_cfg.sequence_stride,
         )
-        shuffle = True
+        smolvla_ttt_batch_sampler = SmolVLATTTEpisodeBatchSampler(
+            dataloader_dataset,
+            batch_size=cfg.batch_size,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            seed=0 if cfg.seed is None else cfg.seed,
+            shuffle=True,
+        )
+        sequence_steps_per_epoch = smolvla_ttt_batch_sampler.steps_per_epoch
+        smolvla_ttt_batch_sampler.set_epoch(step // sequence_steps_per_epoch)
         sampler = None
+        shuffle = False
         collate_fn = smolvla_ttt_sequence_collate_fn
     elif is_pi05_ttt:
         dataloader_dataset = TailPreservingSequenceDataset(
@@ -680,31 +820,60 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # declares language columns; otherwise stay on PyTorch's default
         # collate so non-language training runs are unaffected.
         collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
-    dataloader = torch.utils.data.DataLoader(
-        dataloader_dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
-        sampler=sampler,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        collate_fn=collate_fn,
-        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
-        persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
-    )
+    dataloader_kwargs = {
+        "num_workers": cfg.num_workers,
+        "pin_memory": device.type == "cuda",
+        "collate_fn": collate_fn,
+        "prefetch_factor": cfg.prefetch_factor if cfg.num_workers > 0 else None,
+        "persistent_workers": cfg.persistent_workers and cfg.num_workers > 0,
+    }
+    if is_smolvla_ttt:
+        dataloader = torch.utils.data.DataLoader(
+            dataloader_dataset,
+            batch_sampler=smolvla_ttt_batch_sampler,
+            **dataloader_kwargs,
+        )
+        if is_main_process:
+            logging.info(
+                "SmolVLA-TTT independent sequences: optimizer_steps_per_epoch=%d, "
+                "per_device_batch_size=%d, world_size=%d",
+                sequence_steps_per_epoch,
+                cfg.batch_size,
+                accelerator.num_processes,
+            )
+    else:
+        dataloader = torch.utils.data.DataLoader(
+            dataloader_dataset,
+            batch_size=cfg.batch_size,
+            shuffle=shuffle and not cfg.dataset.streaming,
+            sampler=sampler,
+            drop_last=False,
+            **dataloader_kwargs,
+        )
 
     # TTT policies call a custom sequence-segment method on the unwrapped policy so fast state can be
     # carried across TBPTT segments. In multi-process mode, wrapping that policy in DDP would bypass
     # DDP's forward bookkeeping. Prepare the optimizer/dataloader/scheduler only and synchronize the
     # outer gradients explicitly in update_policy_tbptt instead.
     accelerator.wait_for_everyone()
-    if is_sequence_ttt and accelerator.num_processes > 1:
+    if is_smolvla_ttt and accelerator.num_processes > 1:
+        # The loader is already rank-sharded by EpisodeSequenceBatchSampler.
+        optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
+    elif is_smolvla_ttt:
+        policy, optimizer, lr_scheduler = accelerator.prepare(policy, optimizer, lr_scheduler)
+    elif is_sequence_ttt and accelerator.num_processes > 1:
         optimizer, dataloader, lr_scheduler = accelerator.prepare(optimizer, dataloader, lr_scheduler)
     else:
         policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler
         )
     dl_iter = cycle(dataloader)
+    if is_smolvla_ttt and sequence_steps_per_epoch is not None:
+        # Each checkpoint is taken after a complete minibatch of independent
+        # sequences, so arbitrary-step resume is safe. Advance the deterministic
+        # sampler to the next window batch instead of requiring an epoch boundary.
+        for _ in range(step % sequence_steps_per_epoch):
+            next(dl_iter)
 
     policy.train()
 
@@ -744,12 +913,33 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         start_time = time.perf_counter()
         batch = next(dl_iter)
         sequence_shape = None
+        smolvla_ttt_sequence_valid = None
         if is_sequence_ttt:
             sequence_shape = tuple(int(value) for value in batch.pop(SEQUENCE_SHAPE_KEY))
+        if is_smolvla_ttt:
+            smolvla_ttt_sequence_valid = batch.pop(SMOLVLA_TTT_SEQUENCE_VALID_KEY)
+            sequence_start = bool(batch.pop(SMOLVLA_TTT_SEQUENCE_WAVE_START_KEY).item())
+            sequence_end = bool(batch.pop(SMOLVLA_TTT_SEQUENCE_WAVE_END_KEY).item())
+            batch.pop(SMOLVLA_TTT_SEQUENCE_EPISODE_INDEX_KEY)
+            batch.pop(SMOLVLA_TTT_SEQUENCE_WINDOW_ORDINAL_KEY)
+            active_lanes = batch.pop(SMOLVLA_TTT_SEQUENCE_ACTIVE_KEY)
+            if not sequence_start or not sequence_end:
+                raise RuntimeError(
+                    "Every SmolVLA-TTT loader window must be one complete independent training sequence"
+                )
+            if not torch.equal(
+                active_lanes,
+                smolvla_ttt_sequence_valid.reshape(sequence_shape).any(dim=1),
+            ):
+                raise RuntimeError("SmolVLA-TTT lane activity disagrees with timestep validity")
         for cam_key in dataset.meta.camera_keys:
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
         batch = preprocessor(batch)
+        if smolvla_ttt_sequence_valid is not None:
+            batch[SMOLVLA_TTT_SEQUENCE_VALID_KEY] = smolvla_ttt_sequence_valid.to(
+                device=accelerator.device, dtype=torch.bool
+            )
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         if is_sequence_ttt:
@@ -785,6 +975,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        if is_smolvla_ttt and sequence_steps_per_epoch is not None:
+            output_dict["sequence_epoch"] = step / sequence_steps_per_epoch
 
         if is_log_step:
             logging.info(train_tracker)

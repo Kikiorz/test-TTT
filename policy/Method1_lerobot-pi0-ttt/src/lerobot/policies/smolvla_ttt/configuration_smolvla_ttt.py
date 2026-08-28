@@ -29,8 +29,9 @@ class SmolVLATTTConfig(PreTrainedConfig):
     # Input / output structure.
     n_obs_steps: int = 1
     chunk_size: int = 50
-    # TTT state advances once per environment decision, so do not cache and
-    # execute several actions before the next observation is processed.
+    # TTT state advances once per action-chunk inference. The default observes
+    # every environment step; larger values execute more of the predicted
+    # chunk before the next fast-weight update.
     n_action_steps: int = 1
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -111,14 +112,19 @@ class SmolVLATTTConfig(PreTrainedConfig):
     compile_mode: str = "max-autotune"  # Torch compile mode
 
     # Episode-local sequence training and truncated backpropagation through time.
+    # One outer optimizer step consumes a minibatch of independently sampled
+    # trajectories/sub-trajectories, each no longer than ``sequence_length``.
     sequence_length: int = 256
     sequence_stride: int = 256
     tbptt_segment_length: int = 4
+    # Serialized experiment identity. Fast weights start from the learned W0
+    # for every sampled sequence and are carried only across its TBPTT segments.
+    ttt_sequence_state_semantics: str = "sequence_outer_step_v1"
 
     # RoboTTT fast MLPs are inserted after attention and before the expert MLP.
     ttt_hidden_dim: int = 4096
     ttt_base_inner_lr: float = 0.1
-    ttt_effective_gate_init: float = 0.05
+    ttt_effective_gate_init: float = 0.001
     ttt_rope_theta: float = 10_000.0
     ttt_second_order: bool = True
     ttt_start_layer: int = 12
@@ -133,13 +139,13 @@ class SmolVLATTTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.n_action_steps <= 0:
+            raise ValueError("n_action_steps must be positive")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
-        if self.n_action_steps != 1:
-            raise ValueError("smolvla_ttt requires n_action_steps=1 so fast state advances every decision")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
@@ -153,11 +159,13 @@ class SmolVLATTTConfig(PreTrainedConfig):
         if self.sequence_stride <= 0:
             raise ValueError("sequence_stride must be positive")
         if self.sequence_stride > self.sequence_length:
-            raise ValueError("sequence_stride cannot exceed sequence_length because that would drop frames")
+            raise ValueError("sequence_stride cannot exceed sequence_length")
         if self.tbptt_segment_length <= 0:
             raise ValueError("tbptt_segment_length must be positive")
         if self.tbptt_segment_length > self.sequence_length:
             raise ValueError("tbptt_segment_length cannot exceed sequence_length")
+        if self.ttt_sequence_state_semantics != "sequence_outer_step_v1":
+            raise ValueError("ttt_sequence_state_semantics must be 'sequence_outer_step_v1'")
         if self.ttt_hidden_dim <= 0:
             raise ValueError("ttt_hidden_dim must be positive")
         if self.ttt_base_inner_lr <= 0:
@@ -214,7 +222,9 @@ class SmolVLATTTConfig(PreTrainedConfig):
 
     @property
     def trains_gate(self) -> bool:
-        return self.ttt_training_stage == "action_head"
+        # The residual gate is part of every newly inserted TTT layer and is
+        # learned during both RoboTTT pretraining and action-head post-training.
+        return True
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

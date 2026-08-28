@@ -120,9 +120,7 @@ def _compute_layer_with_ttt(
         if stream_index == 1:
             out_emb = expert_layer_callback(layer_index, out_emb)
         after_first_residual = out_emb.clone()
-        out_emb, gate = layernorm_forward(
-            layer.post_attention_layernorm, out_emb, adarms_cond[stream_index]
-        )
+        out_emb, gate = layernorm_forward(layer.post_attention_layernorm, out_emb, adarms_cond[stream_index])
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
         out_emb = layer.mlp(out_emb)
@@ -286,6 +284,8 @@ class PI05TTTPytorch(PI05Pytorch):
         fast_states: TTTFastStates,
         *,
         update: bool,
+        update_mask: Tensor | None = None,
+        token_mask: Tensor | None = None,
         create_graph: bool | None,
     ):
         batch_size, sequence_length = sequence_shape
@@ -307,6 +307,8 @@ class PI05TTTPytorch(PI05Pytorch):
                 sequence,
                 fast_states.get(layer_index),
                 update=update,
+                update_mask=update_mask,
+                token_mask=token_mask,
                 create_graph=create_graph,
             )
             fast_states[layer_index] = next_state
@@ -324,6 +326,7 @@ class PI05TTTPytorch(PI05Pytorch):
         noise,
         time,
         *,
+        action_token_mask: Tensor | None = None,
         expert_layer_callback=None,
     ) -> Tensor:
         if expert_layer_callback is None:
@@ -334,6 +337,17 @@ class PI05TTTPytorch(PI05Pytorch):
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_key_mask = None
+        if action_token_mask is not None:
+            if action_token_mask.shape != suffix_pad_masks.shape:
+                raise ValueError(
+                    f"Expected action_token_mask with shape {tuple(suffix_pad_masks.shape)}, "
+                    f"got {tuple(action_token_mask.shape)}"
+                )
+            suffix_key_mask = action_token_mask.to(
+                device=suffix_pad_masks.device,
+                dtype=torch.bool,
+            )
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -345,6 +359,12 @@ class PI05TTTPytorch(PI05Pytorch):
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        if suffix_key_mask is not None:
+            # Padded action slots must not become keys for valid action tokens.
+            # Keep their query rows readable, however: fully masked query rows
+            # are unsafe for attention implementations that use -inf masks.
+            key_mask = torch.cat([prefix_pad_masks, suffix_key_mask], dim=1)
+            att_2d_masks = att_2d_masks & key_mask[:, None, :]
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
@@ -372,6 +392,8 @@ class PI05TTTPytorch(PI05Pytorch):
         time,
         *,
         sequence_shape: tuple[int, int],
+        update_mask: Tensor | None = None,
+        token_mask: Tensor | None = None,
         fast_states: TTTFastStates | None = None,
         create_graph: bool | None = None,
     ) -> tuple[Tensor, TTTFastStates]:
@@ -380,6 +402,8 @@ class PI05TTTPytorch(PI05Pytorch):
             sequence_shape,
             fast_states,
             update=True,
+            update_mask=update_mask,
+            token_mask=token_mask,
             create_graph=create_graph,
         )
         losses = self.forward(
@@ -390,6 +414,9 @@ class PI05TTTPytorch(PI05Pytorch):
             actions,
             noise,
             time,
+            action_token_mask=(
+                None if token_mask is None else token_mask.reshape(sequence_shape[0] * sequence_shape[1], -1)
+            ),
             expert_layer_callback=callback,
         )
         return losses, fast_states
@@ -466,9 +493,7 @@ class PI05TTTPytorch(PI05Pytorch):
         x_t = noise
         sequence_shape = (batch_size, 1)
         for step in range(num_steps):
-            time_tensor = torch.tensor(
-                1.0 + step * dt, dtype=torch.float32, device=device
-            ).expand(batch_size)
+            time_tensor = torch.tensor(1.0 + step * dt, dtype=torch.float32, device=device).expand(batch_size)
             callback = self._make_expert_layer_callback(
                 sequence_shape,
                 fast_states,
@@ -508,12 +533,23 @@ _CHECKPOINT_BASE_FIELDS = {
     "normalization_mapping",
 }
 
+_CHECKPOINT_TTT_FIELDS = {
+    "ttt_hidden_dim",
+    "ttt_base_inner_lr",
+    "ttt_effective_gate_init",
+    "ttt_rope_theta",
+    "ttt_second_order",
+    "ttt_start_layer",
+    "ttt_layer_indices",
+}
+
 
 class PI05TTTPolicy(PI05Policy):
     """Independent PI0.5-TTT policy; it does not import the legacy PI0-TTT policy."""
 
     config_class = PI05TTTConfig
     name = "pi05_ttt"
+    tbptt_loss_weighting = "valid_actions"
 
     def __init__(self, config: PI05TTTConfig, **kwargs) -> None:
         del kwargs
@@ -603,10 +639,19 @@ class PI05TTTPolicy(PI05Policy):
         elif isinstance(config, PI05TTTConfig):
             for field_name in _CHECKPOINT_BASE_FIELDS:
                 setattr(config, field_name, getattr(source_config, field_name))
+            if isinstance(source_config, PI05TTTConfig):
+                # A TTT checkpoint owns the architecture and numerical
+                # behavior of its serialized TTT tensors. Runtime cadence,
+                # selected-sequence/TBPTT lengths, and training stage remain
+                # explicit choices of the caller-provided config.
+                for field_name in _CHECKPOINT_TTT_FIELDS:
+                    setattr(config, field_name, getattr(source_config, field_name))
             config.gradient_checkpointing = False
             config.compile_model = False
         else:
             raise TypeError(f"Expected PI05TTTConfig, got {type(config).__name__}")
+        config.pretrained_path = Path(pretrained_name_or_path)
+        config.__post_init__()
 
         model = cls(config, **kwargs)
         resolved_file = cached_file(
@@ -630,13 +675,15 @@ class PI05TTTPolicy(PI05Policy):
             for key, value in fixed_state_dict.items()
         }
         missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
-        disallowed_missing_keys = [
-            key for key in missing_keys if not key.startswith("model.ttt_layers.")
-        ]
+        source_is_ttt = isinstance(source_config, PI05TTTConfig)
+        disallowed_missing_keys = (
+            list(missing_keys)
+            if source_is_ttt
+            else [key for key in missing_keys if not key.startswith("model.ttt_layers.")]
+        )
         if unexpected_keys or disallowed_missing_keys or (strict and missing_keys):
             raise RuntimeError(
-                "Incompatible PI0.5 checkpoint: "
-                f"missing={missing_keys}, unexpected={unexpected_keys}"
+                f"Incompatible PI0.5 checkpoint: missing={missing_keys}, unexpected={unexpected_keys}"
             )
         if missing_keys:
             logging.info(
@@ -651,9 +698,7 @@ class PI05TTTPolicy(PI05Policy):
         self._ttt_fast_states: TTTFastStates = {}
 
     @torch.no_grad()
-    def predict_action_chunk(
-        self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]
-    ) -> Tensor:
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         self.eval()
         images, img_masks = self._preprocess_images(batch)
         tokens = batch[OBS_LANGUAGE_TOKENS]
@@ -688,6 +733,25 @@ class PI05TTTPolicy(PI05Policy):
         tokens = batch[OBS_LANGUAGE_TOKENS]
         masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         actions = self.prepare_action(batch)
+        actions_is_pad = batch.get("action_is_pad")
+        update_mask = None
+        token_mask = None
+        if actions_is_pad is not None:
+            expected_mask_shape = (expected_flat_batch, self.config.chunk_size)
+            if not isinstance(actions_is_pad, Tensor) or actions_is_pad.shape != expected_mask_shape:
+                actual_shape = (
+                    tuple(actions_is_pad.shape)
+                    if isinstance(actions_is_pad, Tensor)
+                    else type(actions_is_pad).__name__
+                )
+                raise ValueError(f"action_is_pad must have shape {expected_mask_shape}, got {actual_shape}")
+            actions_is_pad = actions_is_pad.to(device=actions.device, dtype=torch.bool)
+            token_mask = (~actions_is_pad).reshape(
+                batch_size,
+                sequence_length,
+                self.config.chunk_size,
+            )
+            update_mask = token_mask.any(dim=-1)
         noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
         losses, fast_states = self.model.forward_with_state(
@@ -699,19 +763,34 @@ class PI05TTTPolicy(PI05Policy):
             noise,
             time,
             sequence_shape=sequence_shape,
+            update_mask=update_mask,
+            token_mask=token_mask,
             fast_states=fast_states,
         )
 
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
-        loss_dict = {"loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist()}
+        if actions_is_pad is None:
+            valid_actions = torch.ones(
+                losses.shape[:2],
+                dtype=torch.bool,
+                device=losses.device,
+            )
+        else:
+            valid_actions = ~actions_is_pad
+        losses = losses * valid_actions.unsqueeze(-1)
+        valid_steps = valid_actions.sum().clamp_min(1)
+        loss_per_dim = losses.sum(dim=(0, 1)) / valid_steps
+        loss_dict = {"loss_per_dim": loss_per_dim.detach().cpu().tolist()}
         if reduction == "none":
-            per_sample_loss = losses.mean(dim=(1, 2))
+            num_valid = (valid_actions.sum(dim=1) * losses.shape[-1]).clamp_min(1)
+            per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict, fast_states
         if reduction != "mean":
             raise ValueError(f"Unsupported reduction: {reduction}")
-        loss = losses.mean()
+        num_valid = (valid_actions.sum() * losses.shape[-1]).clamp_min(1)
+        loss = losses.sum() / num_valid
         loss_dict["loss"] = loss.item()
         return loss, loss_dict, fast_states
 

@@ -26,20 +26,26 @@ class PI05TTTConfig(PI05Config):
     """PI0.5 action expert with RoboTTT-style recurrent fast weights.
 
     ``ttt_only`` is the sequence-pretraining stage: the PI0.5 backbone is frozen,
-    the effective residual gate is fixed, and all other TTT parameters train.
+    and all TTT parameters, including the residual gate, train.
     ``action_head`` keeps training TTT and additionally fine-tunes the complete
     PI0.5 action expert plus its action/time projections while the VLM stays frozen.
     """
 
+    # Fast state advances once per action-chunk prediction. The default observes
+    # every environment step; larger values execute more queued actions before
+    # the next prediction and therefore before the next TTT update.
     n_action_steps: int = 1
 
+    # Every sampled episode-local window is an independent selected sequence.
+    # Each lane starts from the learned W0 and carries state only through its
+    # TBPTT segments; one global minibatch of such sequences is one outer step.
     sequence_length: int = 256
     sequence_stride: int = 256
     tbptt_segment_length: int = 4
 
     ttt_hidden_dim: int = 4096
     ttt_base_inner_lr: float = 0.1
-    ttt_effective_gate_init: float = 0.05
+    ttt_effective_gate_init: float = 0.001
     ttt_rope_theta: float = 10_000.0
     ttt_second_order: bool = True
     ttt_start_layer: int = 14
@@ -51,6 +57,8 @@ class PI05TTTConfig(PI05Config):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.n_action_steps <= 0:
+            raise ValueError("n_action_steps must be positive")
         if self.sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
         if self.sequence_stride <= 0:
@@ -72,11 +80,15 @@ class PI05TTTConfig(PI05Config):
         if self.ttt_training_stage not in {"ttt_only", "action_head"}:
             raise ValueError("ttt_training_stage must be 'ttt_only' or 'action_head'")
         if self.compile_model:
-            raise ValueError("pi05_ttt does not support torch.compile because its inner loop uses autograd.grad")
+            raise ValueError(
+                "pi05_ttt does not support torch.compile because its inner loop uses autograd.grad"
+            )
         if self.gradient_checkpointing:
             raise ValueError("pi05_ttt uses TBPTT and does not support gradient checkpointing")
         if self.rtc_config is not None and self.rtc_config.enabled:
-            raise ValueError("pi05_ttt does not support RTC because both methods update state during denoising")
+            raise ValueError(
+                "pi05_ttt does not support RTC because both methods update state during denoising"
+            )
 
         layer_indices = self.resolved_ttt_layer_indices
         if not layer_indices:
@@ -98,4 +110,5 @@ class PI05TTTConfig(PI05Config):
 
     @property
     def trains_gate(self) -> bool:
-        return self.ttt_training_stage == "action_head"
+        # RoboTTT learns the residual gate with the other slow TTT parameters.
+        return True
