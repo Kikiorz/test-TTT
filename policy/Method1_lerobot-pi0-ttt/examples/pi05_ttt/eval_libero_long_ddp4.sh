@@ -5,12 +5,22 @@ set -euo pipefail
 source /venv/main/bin/activate
 
 REPO_DIR="${PI05_TTT_REPO_DIR:-/workspace/test-TTT-eval-git/lib/lerobot-pi0-ttt}"
-POLICY_CHECKPOINT="${POLICY_CHECKPOINT:-/workspace/outputs/train/pi05_ttt_libero_long_c256_stage2_s6000_from_stage1_004000_seed1000/checkpoints/001000/pretrained_model}"
+POLICY_CHECKPOINT="${POLICY_CHECKPOINT:-/workspace/outputs/train/pi05_ttt_v2_gate001_libero_long_c256_stage2_s5000_seed1000/checkpoints/005000/pretrained_model}"
 EVAL_ROOT="${EVAL_ROOT:-/workspace/outputs/eval}"
-LABEL="${EVAL_LABEL:-pi05_ttt_libero_long_stage2_001000_seed1000}"
+LABEL="${EVAL_LABEL:-pi05_ttt_v2_gate001_libero_long_stage2_005000_seed1000}"
 LOG_ROOT="${LOG_ROOT:-/workspace/outputs/logs/${LABEL}}"
 START_SEED="${START_SEED:-1000}"
 N_EPISODES="${N_EPISODES:-10}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-10}"
+
+for integer_name in START_SEED N_EPISODES N_ACTION_STEPS; do
+  integer_value="${!integer_name}"
+  [[ "${integer_value}" =~ ^[0-9]+$ ]] \
+    || { echo "${integer_name} must be a non-negative integer" >&2; exit 2; }
+done
+(( N_EPISODES > 0 )) || { echo "N_EPISODES must be positive" >&2; exit 2; }
+(( N_ACTION_STEPS > 0 && N_ACTION_STEPS <= 50 )) \
+  || { echo "N_ACTION_STEPS must be in 1..50" >&2; exit 2; }
 
 cd "${REPO_DIR}"
 
@@ -25,6 +35,33 @@ export PYTHONPATH="${REPO_DIR}/src"
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 
+/venv/main/bin/python - "${POLICY_CHECKPOINT}" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+checkpoint = Path(sys.argv[1])
+for filename in ("config.json", "model.safetensors"):
+    path = checkpoint / filename
+    if not path.is_file() or path.stat().st_size == 0:
+        raise SystemExit(f"missing evaluation checkpoint file: {path}")
+config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+checks = {
+    "type": config.get("type") == "pi05_ttt",
+    "stage": config.get("ttt_training_stage") == "action_head",
+    "gate initialization": math.isclose(
+        float(config.get("ttt_effective_gate_init", -1.0)),
+        0.001,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ),
+}
+failed = [name for name, ok in checks.items() if not ok]
+if failed:
+    raise SystemExit(f"checkpoint is incompatible with the corrected PI0.5-TTT recipe: {failed}")
+PY
+
 mkdir -p "${EVAL_ROOT}" "${LOG_ROOT}"
 
 run_shard() {
@@ -38,7 +75,7 @@ run_shard() {
     --policy.path="${POLICY_CHECKPOINT}" \
     --policy.device=cuda \
     --policy.use_amp=false \
-    --policy.n_action_steps=10 \
+    --policy.n_action_steps="${N_ACTION_STEPS}" \
     --policy.compile_model=false \
     --policy.gradient_checkpointing=false \
     --env.type=libero \
